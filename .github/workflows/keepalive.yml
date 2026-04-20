@@ -1,0 +1,24 @@
+name: Keep Alive Bot
+
+on:
+  schedule:
+    # Run every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Ping Render App
+      run: |
+        echo "Pinging https://delta-vjnt.onrender.com/ping"
+        response=$(curl -s -o /dev/null -w "%{http_code}" "https://delta-vjnt.onrender.com/ping")
+        echo "Response code: $response"
+        
+        if [ "$response" = "200" ]; then
+          echo "Bot is alive and responding! "
+        else
+          echo "Bot might be sleeping... Response: $response"
+        fi

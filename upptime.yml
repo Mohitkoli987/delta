@@ -1,0 +1,26 @@
+# Upptime Configuration for Delta Trading Bot
+# Copy this to your Upptime repository
+
+sites:
+  - name: Delta Trading Bot
+    url: https://delta-vjnt.onrender.com/ping
+    method: GET
+    headers:
+      User-Agent: "Upptime Bot"
+    expectedStatusCodes:
+      - 200
+    
+assignees:
+  - Mohitkoli987
+
+status-website:
+  cname: delta-status.pages.dev
+  logo: https://i.imgur.com/dJskR9c.png
+  theme: ocean
+  introTitle: "Delta Trading Bot Status"
+  introMessage: "Real-time status of the automated trading bot"
+  navbar:
+    - title: Status
+      href: /
+    - title: Bot Dashboard
+      href: https://delta-vjnt.onrender.com
