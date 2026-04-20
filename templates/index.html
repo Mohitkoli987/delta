@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Delta Auto-Trader Pro</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+:root{
+--bg:#07080a;--surface:#0f1117;--card:#161b22;--border:#21262d;--border2:#30363d;
+--green:#00ff9d;--green2:#0ecb81;--red:#ff4757;--blue:#3b82f6;--blue2:#1d4ed8;
+--gold:#f59e0b;--text:#e6edf3;--muted:#7d8590;--dim:#484f58;
+--pill-h:48px;--r:12px;
+}
+body{background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+
+.app{display:grid;grid-template-rows:auto 1fr;min-height:100vh}
+
+/* ── TOP NAV ── */
+nav{background:var(--surface);border-bottom:1px solid var(--border);padding:0 16px;display:flex;align-items:center;justify-content:space-between;height:52px;position:sticky;top:0;z-index:100}
+.nav-brand{display:flex;align-items:center;gap:10px}
+.nav-logo{width:28px;height:28px;background:linear-gradient(135deg,var(--blue),var(--green2));border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff}
+.nav-title{font-size:15px;font-weight:600;letter-spacing:-.3px}
+.nav-sub{font-size:11px;color:var(--muted);margin-top:1px}
+.status-badge{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:600;letter-spacing:.5px;border:1px solid transparent}
+.badge-online{background:rgba(0,255,157,.08);border-color:rgba(0,255,157,.2);color:var(--green)}
+.badge-offline{background:rgba(255,71,87,.08);border-color:rgba(255,71,87,.2);color:var(--red)}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+.dot-pulse{animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ── MAIN LAYOUT ── */
+main{padding:16px;display:flex;flex-direction:column;gap:14px;max-width:680px;margin:0 auto;width:100%}
+
+/* ── CARDS ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.card-head{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.card-head-title{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+.card-body{padding:16px}
+
+/* ── EQUITY HERO ── */
+.equity-hero{padding:20px 16px 16px;text-align:center;position:relative;overflow:hidden}
+.equity-hero::before{content:'';position:absolute;top:-40px;left:50%;transform:translateX(-50%);width:200px;height:200px;background:radial-gradient(circle,rgba(0,255,157,.06) 0%,transparent 70%);pointer-events:none}
+.equity-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
+.equity-value{font-size:36px;font-weight:700;color:var(--green);letter-spacing:-1px;line-height:1}
+.equity-sub{font-size:12px;color:var(--muted);margin-top:6px}
+.equity-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--border);margin-top:16px;border-top:1px solid var(--border)}
+.equity-cell{background:var(--card);padding:12px 8px;text-align:center}
+.equity-cell-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.equity-cell-val{font-size:15px;font-weight:600}
+
+/* ── STREAK RING ── */
+.streak-section{display:flex;align-items:center;gap:16px;padding:16px}
+.streak-ring-wrap{flex-shrink:0}
+.streak-ring{position:relative;width:80px;height:80px}
+.streak-ring svg{width:80px;height:80px;transform:rotate(-90deg)}
+.streak-ring-inner{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.streak-num{font-size:22px;font-weight:700;color:var(--green);line-height:1}
+.streak-lbl{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.streak-info{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.sinfo-box{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.sinfo-lbl{font-size:10px;color:var(--muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px}
+.sinfo-val{font-size:15px;font-weight:600}
+.last-win{color:var(--green)}
+.last-loss{color:var(--red)}
+
+/* ── STAT GRID ── */
+.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:12px 16px 16px}
+.stat-item{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.stat-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
+.stat-val{font-size:15px;font-weight:600}
+
+/* ── SYSTEM INFO ── */
+.sys-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:16px}
+.sys-item{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.sys-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
+.sys-val{font-size:13px;font-weight:500;word-break:break-all}
+.sys-green{color:var(--green)}
+.sys-blue{color:var(--blue)}
+
+/* ── CONFIG ── */
+.cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:16px}
+.cfg-item{display:flex;flex-direction:column;gap:5px}
+.cfg-item.full{grid-column:1/-1}
+.cfg-label{font-size:11px;color:var(--muted);font-weight:500;text-transform:uppercase;letter-spacing:.4px}
+.cfg-input{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text);font-size:14px;width:100%;outline:none;transition:border-color .2s}
+.cfg-input:focus{border-color:var(--blue)}
+.cfg-input:disabled{opacity:.4;cursor:not-allowed}
+.cfg-hint{font-size:10px;color:var(--gold)}
+
+/* ── BUTTONS ── */
+.btn-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:0 16px 16px}
+.btn-full{grid-column:1/-1}
+.btn{padding:13px 16px;border-radius:9px;font-weight:600;font-size:14px;cursor:pointer;border:none;transition:all .15s;letter-spacing:.2px;min-height:46px;display:flex;align-items:center;justify-content:center;gap:7px}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-start{background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:#fff;box-shadow:0 2px 12px rgba(59,130,246,.3)}
+.btn-start:hover:not(:disabled){background:linear-gradient(135deg,#2563eb,#60a5fa);transform:translateY(-1px)}
+.btn-running{background:linear-gradient(135deg,#065f46,#059669);color:#fff;box-shadow:0 2px 12px rgba(5,150,105,.3)}
+.btn-stop{background:linear-gradient(135deg,#7f1d1d,#dc2626);color:#fff;box-shadow:0 2px 12px rgba(220,38,38,.2)}
+.btn-stop:hover:not(:disabled){background:linear-gradient(135deg,#991b1b,#ef4444);transform:translateY(-1px)}
+.btn-outline{background:var(--surface);border:1px solid var(--border2);color:var(--text)}
+.btn-outline:hover:not(:disabled){background:var(--card);border-color:var(--blue)}
+.btn-outline.active-mode{background:rgba(245,158,11,.08);border-color:rgba(245,158,11,.4);color:var(--gold)}
+
+/* ── TRADE TABLE ── */
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;font-size:12px;min-width:540px}
+th{padding:10px 10px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.5px;text-align:left;border-bottom:1px solid var(--border);font-weight:500;white-space:nowrap}
+td{padding:12px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+.side-buy{color:var(--green);font-weight:600}
+.side-sell{color:var(--red);font-weight:600}
+.pnl-pos{color:var(--green);font-weight:600}
+.pnl-neg{color:var(--red);font-weight:600}
+.pair-badge{background:rgba(59,130,246,.12);color:#93c5fd;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:500}
+
+/* ── PAGINATION ── */
+.pagi{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border)}
+.pagi-info{font-size:11px;color:var(--muted)}
+.pagi-btns{display:flex;gap:6px}
+.pagi-btn{padding:5px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;cursor:pointer;transition:all .15s}
+.pagi-btn:hover:not(:disabled){border-color:var(--blue);color:var(--blue)}
+.pagi-btn:disabled{opacity:.35;cursor:not-allowed}
+
+/* ── EMPTY STATE ── */
+.empty{text-align:center;padding:32px 16px;color:var(--muted)}
+.empty-icon{font-size:28px;margin-bottom:10px;opacity:.4}
+.empty-text{font-size:13px}
+
+/* ── PNL BANNER ── */
+.pnl-banner{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--surface);border-top:1px solid var(--border)}
+.pnl-left{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.pnl-right{font-size:18px;font-weight:700}
+.pnl-pos-big{color:var(--green)}
+.pnl-neg-big{color:var(--red)}
+
+@media(max-width:480px){
+.equity-value{font-size:28px}
+.streak-info{grid-template-columns:1fr 1fr}
+.cfg-grid{grid-template-columns:1fr}
+.cfg-item.full{grid-column:1}
+.stat-grid{grid-template-columns:1fr 1fr}
+.sys-grid{grid-template-columns:1fr 1fr}
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- NAV -->
+<nav>
+  <div class="nav-brand">
+    <div class="nav-logo">D</div>
+    <div>
+      <div class="nav-title">Delta Auto-Trader</div>
+      <div class="nav-sub">Execution Engine Pro</div>
+    </div>
+  </div>
+  <div id="statusBadge" class="status-badge badge-offline">
+    <div class="dot" id="statusDot"></div>
+    <span id="statusText">OFFLINE</span>
+  </div>
+</nav>
+
+<main>
+
+  <!-- EQUITY HERO CARD -->
+  <div class="card">
+    <div class="equity-hero">
+      <div class="equity-label">Total Equity (USD)</div>
+      <div class="equity-value" id="walletBalance">$0.00</div>
+      <div class="equity-sub">Delta Exchange Wallet</div>
+    </div>
+    <div class="equity-grid">
+      <div class="equity-cell">
+        <div class="equity-cell-label">Available</div>
+        <div class="equity-cell-val" id="availBalance" style="color:var(--green)">$0.00</div>
+      </div>
+      <div class="equity-cell">
+        <div class="equity-cell-label">Margin Used</div>
+        <div class="equity-cell-val" id="marginUsed" style="color:var(--gold)">$0.00</div>
+      </div>
+      <div class="equity-cell">
+        <div class="equity-cell-label">Session P&amp;L</div>
+        <div class="equity-cell-val pnl-pos" id="sessionPnl">$0.00</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STREAK / RECOVERY CARD -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-head-title">Recovery Progress</span>
+      <span id="lastResultBadge" style="font-size:12px;color:var(--muted)">—</span>
+    </div>
+    <div class="streak-section">
+      <div class="streak-ring-wrap">
+        <div class="streak-ring">
+          <svg viewBox="0 0 80 80">
+            <circle cx="40" cy="40" r="34" fill="none" stroke="#21262d" stroke-width="6"/>
+            <circle id="streakArc" cx="40" cy="40" r="34" fill="none" stroke="var(--green)" stroke-width="6" stroke-linecap="round" stroke-dasharray="213.6" stroke-dashoffset="213.6"/>
+          </svg>
+          <div class="streak-ring-inner">
+            <div class="streak-num" id="streakNum">0</div>
+            <div class="streak-lbl">Streak</div>
+          </div>
+        </div>
+      </div>
+      <div class="streak-info">
+        <div class="sinfo-box">
+          <div class="sinfo-lbl">Current Lot</div>
+          <div class="sinfo-val" id="currentLot">1</div>
+        </div>
+        <div class="sinfo-box">
+          <div class="sinfo-lbl">Lot Size</div>
+          <div class="sinfo-val" id="lotSize">10</div>
+        </div>
+        <div class="sinfo-box">
+          <div class="sinfo-lbl">Next Lot (Loss)</div>
+          <div class="sinfo-val" id="nextLot" style="color:var(--red)">2</div>
+        </div>
+        <div class="sinfo-box">
+          <div class="sinfo-lbl">Next Qty</div>
+          <div class="sinfo-val" id="nextQty">20</div>
+        </div>
+      </div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-item">
+        <div class="stat-lbl">Current Step</div>
+        <div class="stat-val" id="currentStep" style="color:var(--blue)">1</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-lbl">Last Result</div>
+        <div class="stat-val" id="lastResult">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SYSTEM INFO CARD -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-head-title">System Information</span>
+    </div>
+    <div class="sys-grid">
+      <div class="sys-item">
+        <div class="sys-lbl">Public IP</div>
+        <div class="sys-val sys-green" id="publicIP">Loading…</div>
+      </div>
+      <div class="sys-item">
+        <div class="sys-lbl">Local IP</div>
+        <div class="sys-val sys-blue" id="localIP">Loading…</div>
+      </div>
+      <div class="sys-item">
+        <div class="sys-lbl">Port</div>
+        <div class="sys-val" id="sysPort">8090</div>
+      </div>
+      <div class="sys-item">
+        <div class="sys-lbl">Access URL</div>
+        <div class="sys-val sys-green" id="accessURL" style="font-size:11px">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONFIG CARD -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-head-title">Bot Configuration</span>
+    </div>
+    <div class="cfg-grid">
+      <div class="cfg-item full">
+        <label class="cfg-label">Trading Pair</label>
+        <select id="symbol" class="cfg-input" onchange="updateSymbol()">
+          <option value="ADAUSD">ADAUSD</option>
+        </select>
+      </div>
+      <div class="cfg-item">
+        <label class="cfg-label">Base Quantity (Lots)</label>
+        <input type="number" id="baseLot" class="cfg-input" value="100">
+        <span class="cfg-hint">Stop bot to change</span>
+      </div>
+      <div class="cfg-item">
+        <label class="cfg-label">Leverage</label>
+        <input type="number" id="leverage" class="cfg-input" value="10">
+      </div>
+      <div class="cfg-item">
+        <label class="cfg-label">Take Profit (%)</label>
+        <input type="number" id="tpPercent" class="cfg-input" value="2.0" step="0.1">
+      </div>
+      <div class="cfg-item">
+        <label class="cfg-label">Stop Loss (%)</label>
+        <input type="number" id="slPercent" class="cfg-input" value="1.0" step="0.1">
+      </div>
+      <div class="cfg-item full">
+        <label class="cfg-label">Max Recovery Streak</label>
+        <input type="number" id="maxStreak" class="cfg-input" value="5">
+      </div>
+    </div>
+    <div class="btn-grid">
+      <div class="btn-full">
+        <button id="startBtn" class="btn btn-start" style="width:100%" onclick="startBot()">START ENGINE</button>
+      </div>
+      <button id="stopBtn" class="btn btn-stop" onclick="stopBot()">TERMINATE</button>
+      <button id="stopAtWinBtn" class="btn btn-outline" onclick="stopAtWin()" disabled>STOP AT WIN</button>
+      <button id="clearStuckBtn" class="btn btn-outline" onclick="clearStuckResult()" style="background: var(--orange); color: white;">🔧 CLEAR STUCK</button>
+      <button id="stopAtMaxBtn" class="btn btn-outline" onclick="stopAtMaxStreak()" disabled>STOP AT MAX STREAK</button>
+    </div>
+  </div>
+
+  <!-- TRADE LOG CARD -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-head-title">Live Execution Log</span>
+    </div>
+    <div class="pnl-banner">
+      <div class="pnl-left">Session P&L</div>
+      <div class="pnl-right pnl-pos-big" id="pnlBanner">+$0.00</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Entry</th>
+            <th>Exit</th>
+            <th>Pair</th>
+            <th>Side</th>
+            <th>Size</th>
+            <th>Entry $</th>
+            <th>Exit $</th>
+            <th>P&L</th>
+          </tr>
+        </thead>
+        <tbody id="tradeBody">
+          <tr>
+            <td colspan="8">
+              <div class="empty">
+                <div class="empty-icon">📊</div>
+                <div class="empty-text">Waiting for execution…</div>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="pagi">
+      <div class="pagi-info" id="pagiInfo">0 trades</div>
+      <div class="pagi-btns">
+        <button class="pagi-btn" id="prevBtn" onclick="loadPreviousTrades()" disabled>← Prev</button>
+        <button class="pagi-btn" id="nextBtn" onclick="loadNextTrades()" disabled>Next →</button>
+      </div>
+    </div>
+  </div>
+
+</main>
+</div>
+
+<script>
+let updateInterval,isEngineRunning=false,allTrades=[],currentTradePage=1,isUserTyping=false,currentPagination=null;
+const tradesPerPage=10;
+
+const $=id=>document.getElementById(id);
+
+document.addEventListener('DOMContentLoaded',()=>{
+  $('baseLot').addEventListener('focus',()=>isUserTyping=true);
+  $('baseLot').addEventListener('blur',()=>isUserTyping=false);
+  fetchSystemIP();
+  fetch('/api/bot-status')
+    .then(r=>r.json())
+    .then(d=>{
+      if(d.success&&d.status.base_lot&&!$('baseLot').value){$('baseLot').value=d.status.base_lot}
+      initState().then(()=>{updateUI();if(isEngineRunning)updateInterval=setInterval(updateUI,2000)});
+    }).catch(()=>initState().then(()=>updateUI()));
+});
+
+async function fetchSystemIP(){
+  try{
+    const r=await fetch('/api/system-ip');const d=await r.json();
+    if(d.success){
+      $('publicIP').textContent=d.public_ip;$('localIP').textContent=d.local_ip;
+      $('sysPort').textContent=d.port;$('accessURL').textContent=`http://${d.public_ip}:${d.port}`;
+    }else{['publicIP','localIP','accessURL'].forEach(id=>$(id).textContent='Error')}
+  }catch(e){['publicIP','localIP','accessURL'].forEach(id=>$(id).textContent='Failed')}
+}
+
+async function initState(){
+  try{
+    const r=await fetch('/api/bot-status');const d=await r.json();
+    if(d.success){isEngineRunning=d.status.running;localStorage.setItem('engineRunning',isEngineRunning)}
+    else{isEngineRunning=localStorage.getItem('engineRunning')==='true'}
+  }catch(e){isEngineRunning=localStorage.getItem('engineRunning')==='true'}
+  syncEngineUI();
+}
+
+function syncEngineUI(){
+  const sb=$('statusBadge'),dot=$('statusDot'),st=$('statusText'),btn=$('startBtn');
+  const saw=$('stopAtWinBtn'),sam=$('stopAtMaxBtn');
+  if(isEngineRunning){
+    sb.className='status-badge badge-online';dot.className='dot dot-pulse';st.textContent='ACTIVE';
+    btn.textContent='ENGINE RUNNING';btn.className='btn btn-running';btn.disabled=true;
+    saw.disabled=false;sam.disabled=false;
+  }else{
+    sb.className='status-badge badge-offline';dot.className='dot';st.textContent='OFFLINE';
+    btn.textContent='START ENGINE';btn.className='btn btn-start';btn.disabled=false;
+    saw.disabled=true;sam.disabled=true;
+  }
+}
+
+function saveState(running){
+  isEngineRunning=running;localStorage.setItem('engineRunning',running);syncEngineUI();
+}
+
+async function updateUI(){
+  try{
+    const [sr,wr,hr]=await Promise.all([fetch('/api/bot-status'),fetch('/api/wallet-balance'),fetch('/api/trade-history')]);
+    const s=await sr.json(),w=await wr.json(),h=await hr.json();
+
+    if(s.success){
+      if(s.status.running!==isEngineRunning)saveState(s.status.running);
+      const streak=s.status.current_streak||0,maxStrk=s.status.max_streak||5;
+      const pct=Math.min(streak/maxStrk,1);
+      const circ=213.6;
+      $('streakArc').style.strokeDashoffset=(circ*(1-pct)).toFixed(2);
+      $('streakArc').style.stroke=pct>0.7?'var(--red)':pct>0.4?'var(--gold)':'var(--green)';
+      $('streakNum').textContent=streak;
+      $('currentLot').textContent=s.status.current_lot||1;
+      $('lotSize').textContent=s.status.current_lot_size||10;
+      $('nextLot').textContent=s.status.next_lot_if_loss||2;
+      $('nextQty').textContent=s.status.next_lot_quantity||20;
+      $('currentStep').textContent=s.status.current_step||1;
+
+      const lr=s.status.last_result||'-',lrEl=$('lastResult'),lrBadge=$('lastResultBadge');
+      if(lr==='PROFIT'){lrEl.textContent='PROFIT ✓';lrEl.className='stat-val last-win';lrBadge.textContent='Last: PROFIT ✓';lrBadge.style.color='var(--green)'}
+      else if(lr==='LOSS'){lrEl.textContent='LOSS ✗';lrEl.className='stat-val last-loss';lrBadge.textContent='Last: LOSS ✗';lrBadge.style.color='var(--red)'}
+      else{lrEl.textContent='—';lrEl.className='stat-val';lrBadge.textContent='—';lrBadge.style.color='var(--muted)'}
+
+      const pnl=parseFloat(s.status.session_total_pnl||0);
+      const pnlStr=(pnl>=0?'+':'')+`$${Math.abs(pnl).toFixed(2)}`;
+      $('sessionPnl').textContent=pnlStr;
+      $('sessionPnl').style.color=pnl>=0?'var(--green)':'var(--red)';
+      $('pnlBanner').textContent=pnlStr;
+      $('pnlBanner').className='pnl-right '+(pnl>=0?'pnl-pos-big':'pnl-neg-big');
+
+      const bl=$('baseLot');
+      bl.disabled=s.status.running;bl.style.opacity=s.status.running?'0.4':'1';
+      if(!isUserTyping)bl.value=s.status.base_lot||1;
+
+      const sym=$('symbol');if(sym.value!==s.status.symbol&&s.status.symbol)sym.value=s.status.symbol;
+
+      const saw=$('stopAtWinBtn'),sam=$('stopAtMaxBtn');
+      if(s.status.stop_at_win){saw.textContent='STOP AT WIN ACTIVE';saw.className='btn btn-outline active-mode';saw.disabled=true;sam.textContent='STOP AT MAX STREAK';sam.className='btn btn-outline';sam.disabled=false}
+      else if(s.status.stop_at_max_streak){sam.textContent='STOP AT MAX STREAK ACTIVE';sam.className='btn btn-outline active-mode';sam.disabled=true;saw.textContent='STOP AT WIN';saw.className='btn btn-outline';saw.disabled=false}
+      else{saw.textContent='STOP AT WIN';sam.textContent='STOP AT MAX STREAK';saw.className='btn btn-outline';sam.className='btn btn-outline';if(isEngineRunning){saw.disabled=false;sam.disabled=false}}
+    }
+
+    if(w.success){
+      $('walletBalance').textContent=`$${parseFloat(w.balance).toFixed(2)}`;
+      $('availBalance').textContent=`$${parseFloat(w.available_balance).toFixed(2)}`;
+      $('marginUsed').textContent=`$${parseFloat(w.margin_used).toFixed(2)}`;
+    }
+
+    if(h&&h.trades&&h.trades.length>0){
+      allTrades=h.trades;
+      currentPagination=h.pagination;
+      renderTrades();
+    }
+    else{
+      allTrades=[];
+      currentPagination=null;
+      $('tradeBody').innerHTML='<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div><div class="empty-text">Waiting for execution</div></div></td></tr>';
+      $('pagiInfo').textContent='0 trades';
+      $('prevBtn').disabled=true;
+      $('nextBtn').disabled=true;
+    }
+  }catch(e){console.error('UI Error',e)}
+}
+
+function renderTrades(){
+  if(!currentPagination){
+    $('tradeBody').innerHTML='<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div><div class="empty-text">No trades to display</div></div></td></tr>';
+    return;
+  }
+  
+  const {current_page, per_page, total, total_pages, has_next, has_prev} = currentPagination;
+  const start = (current_page - 1) * per_page + 1;
+  const end = Math.min(current_page * per_page, total);
+  
+  $('pagiInfo').textContent = `${start}--${end} of ${total}`;
+  $('prevBtn').disabled = !has_prev;
+  $('nextBtn').disabled = !has_next;
+  
+  if(!allTrades.length){
+    $('tradeBody').innerHTML='<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div><div class="empty-text">No trades in this range</div></div></td></tr>';
+    return;
+  }
+  
+  $('tradeBody').innerHTML = allTrades.map(t => {
+    const ep = t.entry_time ? new Date(t.entry_time).toLocaleTimeString() : '';
+    const xp = t.exit_time ? new Date(t.exit_time).toLocaleTimeString() : '';
+    const pnlCls = t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const pnlStr = (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(5);
+    return `<tr>
+      <td style="color:var(--muted);font-size:11px">${ep}</td>
+      <td style="color:var(--muted);font-size:11px">${xp}</td>
+      <td><span class="pair-badge">${t.symbol}</span></td>
+      <td class="${t.side==='buy'?'side-buy':'side-sell'}">${t.side.toUpperCase()}</td>
+      <td>${t.quantity}</td>
+      <td style="font-size:11px">${t.entry_price}</td>
+      <td style="font-size:11px">${t.exit_price}</td>
+      <td class="${pnlCls}">${pnlStr}</td>
+    </tr>`
+  }).join('');
+}
+
+async function loadPreviousTrades(){
+  if(currentPagination && currentPagination.has_prev){
+    currentTradePage--;
+    await loadTradesPage(currentTradePage);
+  }
+}
+
+async function loadNextTrades(){
+  if(currentPagination && currentPagination.has_next){
+    currentTradePage++;
+    await loadTradesPage(currentTradePage);
+  }
+}
+
+async function loadTradesPage(page){
+  try{
+    const response = await fetch(`/api/trade-history?page=${page}&per_page=10`);
+    const data = await response.json();
+    if(data.trades){
+      allTrades = data.trades;
+      currentPagination = data.pagination;
+      currentTradePage = page;
+      renderTrades();
+    }
+  }catch(e){
+    console.error('Error loading trades page:', e);
+  }
+}
+
+async function startBot(){
+  try{
+    const r=await fetch('/api/start-bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value,base_lot:parseInt($('baseLot').value),leverage:parseInt($('leverage').value),tp_percent:parseFloat($('tpPercent').value),sl_percent:parseFloat($('slPercent').value),max_streak:parseInt($('maxStreak').value)})});
+    const d=await r.json();
+    if(d.success){saveState(true);clearInterval(updateInterval);updateInterval=setInterval(updateUI,2000);setTimeout(updateUI,500)}
+    else{alert(d.message.includes('Bot is running')?'Bot is running — stop it first to change base lot':'Failed: '+d.message)}
+  }catch(e){alert('Error: '+e.message)}
+}
+
+async function stopBot(){
+  try{
+    const r=await fetch('/api/stop-bot',{method:'POST',headers:{'Content-Type':'application/json'}});
+    const d=await r.json();
+    if(d.success){saveState(false);clearInterval(updateInterval);setTimeout(updateUI,500)}
+    else alert('Failed: '+d.message);
+  }catch(e){alert('Error: '+e.message)}
+}
+
+async function stopAtWin(){
+  try{
+    const r=await fetch('/api/stop-at-win',{method:'POST',headers:{'Content-Type':'application/json'}});
+    const d=await r.json();
+    if(d.success){$('stopAtWinBtn').textContent='STOP AT WIN ACTIVE';$('stopAtWinBtn').className='btn btn-outline active-mode';$('stopAtWinBtn').disabled=true;$('stopAtMaxBtn').textContent='STOP AT MAX STREAK';$('stopAtMaxBtn').disabled=false}
+    else alert('Failed: '+d.message);
+  }catch(e){alert('Error: '+e.message)}
+}
+
+async function stopAtMaxStreak(){
+  try{
+    const r=await fetch('/api/stop-at-max-streak',{method:'POST',headers:{'Content-Type':'application/json'}});
+    const d=await r.json();
+    if(d.success){$('stopAtMaxBtn').textContent='STOP AT MAX STREAK ACTIVE';$('stopAtMaxBtn').className='btn btn-outline active-mode';$('stopAtMaxBtn').disabled=true;$('stopAtWinBtn').textContent='STOP AT WIN';$('stopAtWinBtn').disabled=false}
+    else alert('Failed: '+d.message);
+  }catch(e){alert('Error: '+e.message)}
+}
+
+async function clearStuckResult(){
+  try{
+    const r=await fetch('/api/clear-stuck-result',{method:'POST',headers:{'Content-Type':'application/json'}});
+    const d=await r.json();
+    if(d.success){
+      alert('✅ Stuck trade result cleared! Bot will continue normally.');
+      // Update UI after a short delay to see the effect
+      setTimeout(updateUI, 1000);
+    }else{
+      alert('Failed: '+d.message);
+    }
+  }catch(e){
+    alert('Error: '+e.message);
+  }
+}
+
+async function updateSymbol(){
+  try{
+    const r=await fetch('/api/update-symbol',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value})});
+    const d=await r.json();if(!d.success){alert('Failed: '+d.message);updateUI()}
+  }catch(e){alert('Error: '+e.message)}
+}
+</script>
+</body>
+</html>

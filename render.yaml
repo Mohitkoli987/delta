@@ -1,0 +1,30 @@
+services:
+  # Web Service
+  - type: web
+    name: auto-trading-bot
+    env: docker
+    repo: https://github.com/yourusername/auto-trading-bot.git
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /ping
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9
+      - key: MYSQL_HOST
+        value: bmh1rsh5f0sjmncv6ydc-mysql.services.clever-cloud.com
+      - key: MYSQL_PORT
+        value: 3306
+      - key: MYSQL_USER
+        value: ujokhsx1defubkot
+      - key: MYSQL_PASSWORD
+        value: hILZGFpJ60exq4oGj2hv
+      - key: MYSQL_DB
+        value: bmh1rsh5f0sjmncv6ydc
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+    disk:
+      name: auto-trading-disk
+      mountPath: /app/logs
+      sizeGB: 1
