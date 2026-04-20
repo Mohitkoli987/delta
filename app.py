@@ -1492,6 +1492,16 @@ def reconcile_stuck_trades_from_database():
 def index():
     return render_template('index.html')
 
+@app.route('/ping')
+def ping():
+    """Health check endpoint for keepalive services"""
+    return jsonify({
+        'status': 'alive',
+        'timestamp': datetime.now().isoformat(),
+        'service': 'delta-trading-bot',
+        'uptime': 'running'
+    })
+
 @app.route('/api/system-ip', methods=['GET'])
 def get_system_ip():
     """Get current system IP address"""
