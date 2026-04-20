@@ -1626,7 +1626,7 @@ def stop_at_max_streak():
         BOT_STATE['force_stop'] = False  # Clear force stop if set
         BOT_STATE['stop_at_win'] = False  # Clear stop at win if set
         print(f"⚠️ STOP AT MAX STREAK ACTIVATED - Bot will stop at {BOT_STATE['max_streak']} losses in a row")
-        return jsonify({'success': True, 'message': f'Stop at max streak ({BOT_STATE['max_streak']}) activated'})
+        return jsonify({'success': True, 'message': f"Stop at max streak ({BOT_STATE['max_streak']}) activated"})
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
 
