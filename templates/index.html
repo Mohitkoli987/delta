@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Delta Auto-Trader Pro</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
 :root{
@@ -135,6 +136,13 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .pnl-pos-big{color:var(--green)}
 .pnl-neg-big{color:var(--red)}
 
+/* ── PNL GRAPH ── */
+.pnl-graph-container{padding:16px;height:200px;background:var(--card);position:relative}
+.pnl-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border);border-top:1px solid var(--border)}
+.pnl-stat-item{background:var(--card);padding:12px 8px;text-align:center}
+.pnl-stat-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.pnl-stat-value{font-size:15px;font-weight:600}
+
 @media(max-width:480px){
 .equity-value{font-size:28px}
 .streak-info{grid-template-columns:1fr 1fr}
@@ -234,6 +242,31 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <div class="stat-item">
         <div class="stat-lbl">Last Result</div>
         <div class="stat-val" id="lastResult">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- P&L GRAPH CARD -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-head-title">Live P&L Tracking</span>
+      <span id="pnlGraphInfo" style="font-size:12px;color:var(--muted)">Starting...</span>
+    </div>
+    <div class="pnl-graph-container">
+      <canvas id="pnlChart" width="400" height="200"></canvas>
+    </div>
+    <div class="pnl-stats">
+      <div class="pnl-stat-item">
+        <div class="pnl-stat-label">Current P&L</div>
+        <div class="pnl-stat-value" id="currentPnlValue">$0.00</div>
+      </div>
+      <div class="pnl-stat-item">
+        <div class="pnl-stat-label">Total Trades</div>
+        <div class="pnl-stat-value" id="totalTradesValue">0</div>
+      </div>
+      <div class="pnl-stat-item">
+        <div class="pnl-stat-label">Win Rate</div>
+        <div class="pnl-stat-value" id="winRateValue">0%</div>
       </div>
     </div>
   </div>
@@ -359,12 +392,170 @@ tr:hover td{background:rgba(255,255,255,.02)}
 let updateInterval,isEngineRunning=false,allTrades=[],currentTradePage=1,isUserTyping=false,currentPagination=null,isManualPagination=false;
 const tradesPerPage=10;
 
+// P&L Tracking Variables
+let cumulativePnL = 0;
+let pnlHistory = [];
+let tradeCount = 0;
+let winCount = 0;
+let pnlChart = null;
+let lastProcessedPnL = null;
+
 const $=id=>document.getElementById(id);
+
+// P&L Chart Functions
+function initializePnLChart() {
+  const ctx = document.getElementById('pnlChart').getContext('2d');
+  pnlChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'Cumulative P&L',
+        data: [],
+        borderColor: 'rgb(0, 255, 157)',
+        backgroundColor: 'rgba(0, 255, 157, 0.1)',
+        borderWidth: 2,
+        tension: 0.1,
+        pointRadius: 3,
+        pointBackgroundColor: 'rgb(0, 255, 157)',
+        pointBorderColor: '#fff',
+        pointBorderWidth: 1
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: {
+        intersect: false,
+        mode: 'index'
+      },
+      plugins: {
+        legend: {
+          display: false
+        },
+        tooltip: {
+          backgroundColor: 'rgba(0, 0, 0, 0.8)',
+          titleColor: '#fff',
+          bodyColor: '#fff',
+          borderColor: 'rgb(0, 255, 157)',
+          borderWidth: 1,
+          displayColors: false,
+          callbacks: {
+            label: function(context) {
+              return `P&L: $${context.parsed.y.toFixed(2)}`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: {
+            color: 'rgba(255, 255, 255, 0.05)',
+            drawBorder: false
+          },
+          ticks: {
+            color: '#7d8590',
+            font: {
+              size: 10
+            }
+          }
+        },
+        y: {
+          grid: {
+            color: 'rgba(255, 255, 255, 0.05)',
+            drawBorder: false
+          },
+          ticks: {
+            color: '#7d8590',
+            font: {
+              size: 10
+            },
+            callback: function(value) {
+              return '$' + value.toFixed(0);
+            }
+          }
+        }
+      }
+    }
+  });
+}
+
+function updatePnLChart(tradeNumber, pnl) {
+  if (!pnlChart) return;
+  
+  // Add new data point
+  pnlChart.data.labels.push(`#${tradeNumber}`);
+  pnlChart.data.datasets[0].data.push(pnl);
+  
+  // Keep only last 50 points for performance
+  if (pnlChart.data.labels.length > 50) {
+    pnlChart.data.labels.shift();
+    pnlChart.data.datasets[0].data.shift();
+  }
+  
+  // Update line color based on current P&L
+  const lineColor = pnl >= 0 ? 'rgb(0, 255, 157)' : 'rgb(255, 71, 87)';
+  const pointColor = pnl >= 0 ? 'rgb(0, 255, 157)' : 'rgb(255, 71, 87)';
+  const bgColor = pnl >= 0 ? 'rgba(0, 255, 157, 0.1)' : 'rgba(255, 71, 87, 0.1)';
+  
+  pnlChart.data.datasets[0].borderColor = lineColor;
+  pnlChart.data.datasets[0].pointBackgroundColor = pointColor;
+  pnlChart.data.datasets[0].backgroundColor = bgColor;
+  
+  // Update chart
+  pnlChart.update('none'); // No animation for live updates
+  
+  // Update P&L stats
+  updatePnLStats(pnl);
+}
+
+function updatePnLStats(currentPnl) {
+  // Update current P&L display
+  const pnlElement = $('currentPnlValue');
+  pnlElement.textContent = `$${currentPnl.toFixed(2)}`;
+  pnlElement.style.color = currentPnl >= 0 ? 'var(--green)' : 'var(--red)';
+  
+  // Update total trades
+  $('totalTradesValue').textContent = tradeCount;
+  
+  // Update win rate
+  const winRate = tradeCount > 0 ? ((winCount / tradeCount) * 100).toFixed(1) : 0;
+  $('winRateValue').textContent = `${winRate}%`;
+  
+  // Update graph info
+  const status = currentPnl >= 0 ? 'PROFIT' : 'LOSS';
+  const statusColor = currentPnl >= 0 ? 'var(--green)' : 'var(--red)';
+  $('pnlGraphInfo').textContent = `Current: ${status}`;
+  $('pnlGraphInfo').style.color = statusColor;
+}
+
+function processTradeResult(trade) {
+  // Only process if we haven't already processed this trade
+  if (trade.pnl === lastProcessedPnL) return;
+  
+  tradeCount++;
+  const pnl = parseFloat(trade.pnl);
+  
+  if (pnl > 0) {
+    winCount++;
+  }
+  
+  cumulativePnL += pnl;
+  pnlHistory.push({
+    tradeNumber: tradeCount,
+    pnl: cumulativePnL,
+    timestamp: new Date().toISOString()
+  });
+  
+  updatePnLChart(tradeCount, cumulativePnL);
+  lastProcessedPnL = trade.pnl;
+}
 
 document.addEventListener('DOMContentLoaded',()=>{
   $('baseLot').addEventListener('focus',()=>isUserTyping=true);
   $('baseLot').addEventListener('blur',()=>isUserTyping=false);
   fetchSystemIP();
+  initializePnLChart(); // Initialize P&L chart
   fetch('/api/bot-status')
     .then(r=>r.json())
     .then(d=>{
@@ -466,6 +657,11 @@ async function updateUI(){
         currentTradePage = h.pagination ? h.pagination.current_page : 1;
       }
       renderTrades();
+      
+      // Process latest trade for P&L tracking
+      if(h.trades.length > 0 && h.trades[0].pnl !== undefined) {
+        processTradeResult(h.trades[0]);
+      }
     }
     else{
       allTrades=[];
