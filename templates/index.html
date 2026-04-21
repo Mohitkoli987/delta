@@ -250,7 +250,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
   <div class="card">
     <div class="card-head">
       <span class="card-head-title">Live P&L Tracking</span>
-      <span id="pnlGraphInfo" style="font-size:12px;color:var(--muted)">Starting...</span>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button id="resetPnlBtn" class="btn btn-outline" style="padding:4px 8px;font-size:11px;height:auto;" onclick="resetPnLGraph()">Reset Graph</button>
+        <span id="pnlGraphInfo" style="font-size:12px;color:var(--muted)">Starting...</span>
+      </div>
     </div>
     <div class="pnl-graph-container">
       <canvas id="pnlChart" width="400" height="200"></canvas>
@@ -400,6 +403,10 @@ let winCount = 0;
 let pnlChart = null;
 let lastProcessedPnL = null;
 
+// P&L Persistence Keys
+const PNL_STORAGE_KEY = 'delta_trading_pnl_data';
+const PNL_RESET_KEY = 'delta_trading_pnl_reset_timestamp';
+
 const $=id=>document.getElementById(id);
 
 // P&L Chart Functions
@@ -529,6 +536,65 @@ function updatePnLStats(currentPnl) {
   $('pnlGraphInfo').style.color = statusColor;
 }
 
+function savePnLData() {
+  const pnlData = {
+    cumulativePnL,
+    pnlHistory,
+    tradeCount,
+    winCount,
+    lastProcessedPnL,
+    timestamp: new Date().toISOString()
+  };
+  localStorage.setItem(PNL_STORAGE_KEY, JSON.stringify(pnlData));
+}
+
+function loadPnLData() {
+  try {
+    const saved = localStorage.getItem(PNL_STORAGE_KEY);
+    if (saved) {
+      const data = JSON.parse(saved);
+      cumulativePnL = data.cumulativePnL || 0;
+      pnlHistory = data.pnlHistory || [];
+      tradeCount = data.tradeCount || 0;
+      winCount = data.winCount || 0;
+      lastProcessedPnL = data.lastProcessedPnL || null;
+      return true;
+    }
+  } catch (e) {
+    console.error('Error loading P&L data:', e);
+  }
+  return false;
+}
+
+function resetPnLGraph() {
+  if (confirm('Are you sure you want to reset the P&L graph? This will clear all tracking data and start from 0.')) {
+    // Clear frontend data
+    cumulativePnL = 0;
+    pnlHistory = [];
+    tradeCount = 0;
+    winCount = 0;
+    lastProcessedPnL = null;
+    
+    // Clear localStorage
+    localStorage.removeItem(PNL_STORAGE_KEY);
+    localStorage.setItem(PNL_RESET_KEY, new Date().toISOString());
+    
+    // Reset chart
+    if (pnlChart) {
+      pnlChart.data.labels = [];
+      pnlChart.data.datasets[0].data = [];
+      pnlChart.update();
+    }
+    
+    // Update display
+    updatePnLStats(0);
+    $('pnlGraphInfo').textContent = 'Reset - Starting fresh';
+    $('pnlGraphInfo').style.color = 'var(--muted)';
+    
+    console.log('P&L graph reset successfully');
+  }
+}
+
 function processTradeResult(trade) {
   // Only process if we haven't already processed this trade
   if (trade.pnl === lastProcessedPnL) return;
@@ -548,7 +614,77 @@ function processTradeResult(trade) {
   });
   
   updatePnLChart(tradeCount, cumulativePnL);
+  savePnLData(); // Save to localStorage
   lastProcessedPnL = trade.pnl;
+}
+
+async function recoverPnLFromMySQL() {
+  try {
+    const response = await fetch('/api/trade-history?per_page=1000');
+    const data = await response.json();
+    
+    if (data.trades && data.trades.length > 0) {
+      let hasData = loadPnLData(); // Try to load from localStorage first
+      
+      if (!hasData) {
+        // If no localStorage data, rebuild from MySQL trades
+        cumulativePnL = 0;
+        tradeCount = 0;
+        winCount = 0;
+        pnlHistory = [];
+        
+        // Process trades in order (oldest first for accurate cumulative calculation)
+        const sortedTrades = data.trades.reverse();
+        
+        for (const trade of sortedTrades) {
+          if (trade.pnl !== undefined && trade.pnl !== null) {
+            tradeCount++;
+            const pnl = parseFloat(trade.pnl);
+            
+            if (pnl > 0) {
+              winCount++;
+            }
+            
+            cumulativePnL += pnl;
+            pnlHistory.push({
+              tradeNumber: tradeCount,
+              pnl: cumulativePnL,
+              timestamp: trade.exit_time || new Date().toISOString()
+            });
+          }
+        }
+        
+        lastProcessedPnL = data.trades[0]?.pnl || null;
+        savePnLData(); // Save recovered data to localStorage
+        
+        // Update chart with recovered data
+        if (pnlChart && pnlHistory.length > 0) {
+          // Show only last 50 trades for performance
+          const recentHistory = pnlHistory.slice(-50);
+          
+          pnlChart.data.labels = recentHistory.map(h => `#${h.tradeNumber}`);
+          pnlChart.data.datasets[0].data = recentHistory.map(h => h.pnl);
+          
+          // Set color based on final P&L
+          const finalPnL = recentHistory[recentHistory.length - 1]?.pnl || 0;
+          const lineColor = finalPnL >= 0 ? 'rgb(0, 255, 157)' : 'rgb(255, 71, 87)';
+          const pointColor = finalPnL >= 0 ? 'rgb(0, 255, 157)' : 'rgb(255, 71, 87)';
+          const bgColor = finalPnL >= 0 ? 'rgba(0, 255, 157, 0.1)' : 'rgba(255, 71, 87, 0.1)';
+          
+          pnlChart.data.datasets[0].borderColor = lineColor;
+          pnlChart.data.datasets[0].pointBackgroundColor = pointColor;
+          pnlChart.data.datasets[0].backgroundColor = bgColor;
+          
+          pnlChart.update('none');
+        }
+        
+        updatePnLStats(cumulativePnL);
+        console.log(`Recovered P&L data from ${tradeCount} trades`);
+      }
+    }
+  } catch (e) {
+    console.error('Error recovering P&L data:', e);
+  }
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
@@ -556,12 +692,16 @@ document.addEventListener('DOMContentLoaded',()=>{
   $('baseLot').addEventListener('blur',()=>isUserTyping=false);
   fetchSystemIP();
   initializePnLChart(); // Initialize P&L chart
-  fetch('/api/bot-status')
-    .then(r=>r.json())
-    .then(d=>{
-      if(d.success&&d.status.base_lot&&!$('baseLot').value){$('baseLot').value=d.status.base_lot}
-      initState().then(()=>{updateUI();if(isEngineRunning)updateInterval=setInterval(updateUI,2000)});
-    }).catch(()=>initState().then(()=>updateUI()));
+  
+  // Recover P&L data from MySQL/localStorage
+  recoverPnLFromMySQL().then(() => {
+    fetch('/api/bot-status')
+      .then(r=>r.json())
+      .then(d=>{
+        if(d.success&&d.status.base_lot&&!$('baseLot').value){$('baseLot').value=d.status.base_lot}
+        initState().then(()=>{updateUI();if(isEngineRunning)updateInterval=setInterval(updateUI,2000)});
+      }).catch(()=>initState().then(()=>updateUI()));
+  });
 });
 
 async function fetchSystemIP(){

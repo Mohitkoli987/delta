@@ -135,8 +135,8 @@ def cleanup_old_trades(target_size_mb=8.5):
         return False
 
 # API Configuration
-BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-# BASE_URL = "https://api.india.delta.exchange"
+# BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+BASE_URL = "https://api.india.delta.exchange"
 
 WS_URL = "wss://socket.india.delta.exchange"
 
@@ -1018,7 +1018,7 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
     try:
         # ── 1. PRODUCT CONFIG ──────────────────────────────────────
         PRODUCT_CONFIG = {
-            "ADAUSD": {"id": 101760, "tick": Decimal("0.0001")},  # Fixed: 101760 → 16614
+            "ADAUSD": {"id": 16614, "tick": Decimal("0.0001")},  # Fixed: 101760 → 16614
             "BTCUSD": {"id": 84,     "tick": Decimal("0.5")},
             "ETHUSD": {"id": 1320,   "tick": Decimal("0.05")},
         }
