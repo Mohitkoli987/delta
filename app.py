@@ -1830,7 +1830,7 @@ def trade_history():
         
         # Get trades for current page
         query = '''
-            SELECT symbol, side, entry_price, exit_price, quantity, pnl, entry_time, exit_time
+            SELECT id, symbol, side, entry_price, exit_price, quantity, pnl, entry_time, exit_time
             FROM closed_positions 
             ORDER BY created_at DESC 
             LIMIT %s OFFSET %s
@@ -1846,8 +1846,9 @@ def trade_history():
                 'quantity': float(t['quantity']) if t['quantity'] else None,
                 'pnl': float(t['pnl']) if t['pnl'] else None,
                 'entry_time': t['entry_time'],
-                'exit_time': t['exit_time']
-            } for t in trades] if trades else [],
+                'exit_time': t['exit_time'],
+                'id': str(t['id']) if t.get('id') else f"trade_{hash(t['entry_time'] + t['symbol'])}"
+            } for t in trades],
             'pagination': {
                 'current_page': page,
                 'per_page': per_page,
@@ -1859,19 +1860,45 @@ def trade_history():
         })
         
     except Exception as e:
-        print(f"❌ Error fetching trade history: {e}")
+        return jsonify({'success': False, 'message': str(e), 'trades': [], 'pagination': None})
+
+@app.route('/api/delete-trades', methods=['POST'])
+def delete_trades():
+    try:
+        data = request.get_json()
+        trade_ids = data.get('trade_ids', [])
+        
+        if not trade_ids:
+            return jsonify({'success': False, 'message': 'No trade IDs provided'})
+        
+        # Convert string IDs to integers if they're numeric
+        numeric_ids = []
+        for trade_id in trade_ids:
+            try:
+                # Handle both numeric IDs and hash-based IDs
+                if trade_id.startswith('trade_'):
+                    continue  # Skip hash-based IDs for now
+                numeric_ids.append(int(trade_id))
+            except ValueError:
+                continue
+        
+        if not numeric_ids:
+            return jsonify({'success': False, 'message': 'No valid trade IDs found'})
+        
+        # Build placeholders for IN clause
+        placeholders = ','.join(['%s'] * len(numeric_ids))
+        
+        # Delete trades
+        delete_query = f'DELETE FROM closed_positions WHERE id IN ({placeholders})'
+        execute_mysql_query(delete_query, numeric_ids, commit=True)
+        
         return jsonify({
-            'error': 'Failed to fetch trade history',
-            'trades': [],
-            'pagination': {
-                'current_page': page,
-                'per_page': per_page,
-                'total': 0,
-                'total_pages': 0,
-                'has_next': False,
-                'has_prev': False
-            }
-        }), 500
+            'success': True, 
+            'message': f'Successfully deleted {len(numeric_ids)} trade(s)'
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error deleting trades: {str(e)}'})
 
 
 # # ===== INDEPENDENT TP/SL GUARDIAN (ONLY EDIT & ADD - NO DELETE) =====
