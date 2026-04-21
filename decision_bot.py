@@ -84,8 +84,8 @@ def mark_exit_consumed():
         print(f"[DECISION-BOT] Could not mark exit consumed: {e}")
 
 def main():
-    print("[DECISION-BOT] Random Signal Bot Started")
-    print("[DECISION-BOT] TRUE 50/50 - Zero Bias - Only generates after position closes")
+    print("[DECISION-BOT] Continuous Random Signal Bot Started")
+    print("[DECISION-BOT] TRUE 50/50 - Zero Bias - Generates signals every 5 seconds")
     print(f"[DECISION-BOT] Signal file : {SIGNAL_FILE}")
     print(f"[DECISION-BOT] Exit file   : {EXIT_FILE}")
 
@@ -93,9 +93,14 @@ def main():
     write_signal(reason="startup")
 
     last_processed_ts = None
+    signal_counter = 0
+    last_signal_time = time.time()
 
     while True:
         try:
+            current_time = time.time()
+            
+            # Check for trade exits (bonus signals when trades close)
             exit_data = read_exit_result()
 
             if exit_data:
@@ -116,6 +121,13 @@ def main():
 
                     mark_exit_consumed()
                     last_processed_ts = ts
+
+            # Generate continuous signals every 5 seconds
+            if current_time - last_signal_time >= 5:
+                signal_counter += 1
+                reason = f"continuous_signal_{signal_counter}"
+                write_signal(reason=reason)
+                last_signal_time = current_time
 
             # Poll every 100ms
             time.sleep(0.1)
