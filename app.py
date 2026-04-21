@@ -35,7 +35,8 @@ def get_mysql_connection():
             database=os.getenv('MYSQL_DB', 'bmh1rsh5f0sjmncv6ydc'),
             charset='utf8mb4',
             cursorclass=pymysql.cursors.DictCursor,
-            autocommit=False
+            autocommit=False,
+            ssl={}  # ✅ Yeh add karo
         )
         return connection
     except Exception as e:
@@ -134,8 +135,8 @@ def cleanup_old_trades(target_size_mb=8.5):
         return False
 
 # API Configuration
-# BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-BASE_URL = "https://api.india.delta.exchange"
+BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+# BASE_URL = "https://api.india.delta.exchange"
 
 WS_URL = "wss://socket.india.delta.exchange"
 
@@ -213,16 +214,48 @@ BOT_PROCESS = None
 bot_process_lock = Lock()
 
 # ========== DATABASE ==========
-def init_database():
-    """Initialize MySQL database for trade storage"""
-    try:
-        # Drop existing table to ensure fresh start
-        execute_mysql_query("DROP TABLE IF EXISTS closed_positions", commit=True)
-        print("🗑️ Dropped existing closed_positions table")
+# def init_database():
+#     """Initialize MySQL database for trade storage"""
+#     try:
+#         # Drop existing table to ensure fresh start
+#         execute_mysql_query("DROP TABLE IF EXISTS closed_positions", commit=True)
+#         print("🗑️ Dropped existing closed_positions table")
         
-        # Create new table with MySQL syntax
+#         # Create new table with MySQL syntax
+#         create_table_query = '''
+#             CREATE TABLE closed_positions (
+#                 id INT AUTO_INCREMENT PRIMARY KEY,
+#                 symbol VARCHAR(50) NOT NULL,
+#                 side VARCHAR(10) NOT NULL,
+#                 entry_price DECIMAL(20, 8) NOT NULL,
+#                 exit_price DECIMAL(20, 8),
+#                 quantity DECIMAL(20, 8) NOT NULL,
+#                 pnl DECIMAL(20, 8),
+#                 entry_time VARCHAR(50) NOT NULL,
+#                 exit_time VARCHAR(50),
+#                 is_latest TINYINT(1) DEFAULT 0,
+#                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+#                 INDEX idx_symbol (symbol),
+#                 INDEX idx_created_at (created_at),
+#                 INDEX idx_is_latest (is_latest)
+#             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+#         '''
+        
+#         execute_mysql_query(create_table_query, commit=True)
+#         print("✅ MySQL table 'closed_positions' created successfully")
+        
+#     except Exception as e:
+#         print(f"❌ Failed to initialize MySQL database: {e}")
+#         raise
+
+
+
+def init_database():
+    """Initialize MySQL database - preserves existing data"""
+    try:
+        # ✅ DROP TABLE HATAO - sirf CREATE IF NOT EXISTS rakho
         create_table_query = '''
-            CREATE TABLE closed_positions (
+            CREATE TABLE IF NOT EXISTS closed_positions (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 symbol VARCHAR(50) NOT NULL,
                 side VARCHAR(10) NOT NULL,
@@ -239,10 +272,9 @@ def init_database():
                 INDEX idx_is_latest (is_latest)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         '''
-        
         execute_mysql_query(create_table_query, commit=True)
-        print("✅ MySQL table 'closed_positions' created successfully")
-        
+        print("✅ MySQL table ready (existing data preserved)")
+
     except Exception as e:
         print(f"❌ Failed to initialize MySQL database: {e}")
         raise
@@ -986,7 +1018,7 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
     try:
         # ── 1. PRODUCT CONFIG ──────────────────────────────────────
         PRODUCT_CONFIG = {
-            "ADAUSD": {"id": 16614, "tick": Decimal("0.0001")},  # Fixed: 101760 → 16614
+            "ADAUSD": {"id": 101760, "tick": Decimal("0.0001")},  # Fixed: 101760 → 16614
             "BTCUSD": {"id": 84,     "tick": Decimal("0.5")},
             "ETHUSD": {"id": 1320,   "tick": Decimal("0.05")},
         }

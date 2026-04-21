@@ -1,16 +1,16 @@
 {
   "signal": "BUY",
-  "timestamp": "2026-04-20T09:39:58.267578",
+  "timestamp": "2026-04-21T14:38:41.440058",
   "confidence": 50,
   "layer": "RANDOM",
   "score": 0,
   "source": "random_generator",
-  "reason": "Random unbiased decision after after_sl_pnl=-0.0240",
+  "reason": "Random unbiased decision after startup",
   "decision_ready": true,
   "decision_confidence": 0.5,
   "position_analysis": {
     "has_position": false
   },
   "backtest_results": {},
-  "last_trade_result": "after_sl_pnl=-0.0240"
+  "last_trade_result": "startup"
 }

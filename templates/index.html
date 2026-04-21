@@ -356,7 +356,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
 </div>
 
 <script>
-let updateInterval,isEngineRunning=false,allTrades=[],currentTradePage=1,isUserTyping=false,currentPagination=null;
+let updateInterval,isEngineRunning=false,allTrades=[],currentTradePage=1,isUserTyping=false,currentPagination=null,isManualPagination=false;
 const tradesPerPage=10;
 
 const $=id=>document.getElementById(id);
@@ -460,8 +460,11 @@ async function updateUI(){
     }
 
     if(h&&h.trades&&h.trades.length>0){
-      allTrades=h.trades;
-      currentPagination=h.pagination;
+      if(!isManualPagination){
+        allTrades=h.trades;
+        currentPagination=h.pagination;
+        currentTradePage = h.pagination ? h.pagination.current_page : 1;
+      }
       renderTrades();
     }
     else{
@@ -514,15 +517,19 @@ function renderTrades(){
 
 async function loadPreviousTrades(){
   if(currentPagination && currentPagination.has_prev){
+    isManualPagination = true;
     currentTradePage--;
     await loadTradesPage(currentTradePage);
+    setTimeout(() => { isManualPagination = false; }, 3000);
   }
 }
 
 async function loadNextTrades(){
   if(currentPagination && currentPagination.has_next){
+    isManualPagination = true;
     currentTradePage++;
     await loadTradesPage(currentTradePage);
+    setTimeout(() => { isManualPagination = false; }, 3000);
   }
 }
 
@@ -538,6 +545,7 @@ async function loadTradesPage(page){
     }
   }catch(e){
     console.error('Error loading trades page:', e);
+    isManualPagination = false;
   }
 }
 
