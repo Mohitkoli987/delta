@@ -348,6 +348,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
   <div class="card">
     <div class="card-head">
       <span class="card-head-title">Live Execution Log</span>
+      <button id="deleteSelectedBtn" class="btn btn-outline" style="padding:4px 8px;font-size:11px;height:auto;" onclick="deleteSelectedTrades()" disabled> Delete Selected</button>
     </div>
     <div class="pnl-banner">
       <div class="pnl-left">Session P&L</div>
@@ -357,6 +358,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
       <table>
         <thead>
           <tr>
+            <th><input type="checkbox" id="selectAllTrades" onchange="toggleAllTrades()" style="cursor:pointer"></th>
             <th>Entry</th>
             <th>Exit</th>
             <th>Pair</th>
@@ -369,10 +371,10 @@ tr:hover td{background:rgba(255,255,255,.02)}
         </thead>
         <tbody id="tradeBody">
           <tr>
-            <td colspan="8">
+            <td colspan="9">
               <div class="empty">
-                <div class="empty-icon">📊</div>
-                <div class="empty-text">Waiting for execution…</div>
+                <div class="empty-icon">?</div>
+                <div class="empty-text">Waiting for execution?</div>
               </div>
             </td>
           </tr>
@@ -816,7 +818,7 @@ async function updateUI(){
 
 function renderTrades(){
   if(!currentPagination){
-    $('tradeBody').innerHTML='<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div><div class="empty-text">No trades to display</div></div></td></tr>';
+    $('tradeBody').innerHTML='<tr><td colspan="9"><div class="empty"><div class="empty-icon"></div><div class="empty-text">No trades to display</div></div></td></tr>';
     return;
   }
   
@@ -829,7 +831,7 @@ function renderTrades(){
   $('nextBtn').disabled = !has_next;
   
   if(!allTrades.length){
-    $('tradeBody').innerHTML='<tr><td colspan="8"><div class="empty"><div class="empty-icon"></div><div class="empty-text">No trades in this range</div></div></td></tr>';
+    $('tradeBody').innerHTML='<tr><td colspan="9"><div class="empty"><div class="empty-icon"></div><div class="empty-text">No trades in this range</div></div></td></tr>';
     return;
   }
   
@@ -837,16 +839,18 @@ function renderTrades(){
     const ep = t.entry_time ? new Date(t.entry_time).toLocaleTimeString() : '';
     const xp = t.exit_time ? new Date(t.exit_time).toLocaleTimeString() : '';
     const pnlCls = t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-    const pnlStr = (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(5);
-    return `<tr>
-      <td style="color:var(--muted);font-size:11px">${ep}</td>
-      <td style="color:var(--muted);font-size:11px">${xp}</td>
-      <td><span class="pair-badge">${t.symbol}</span></td>
-      <td class="${t.side==='buy'?'side-buy':'side-sell'}">${t.side.toUpperCase()}</td>
-      <td>${t.quantity}</td>
-      <td style="font-size:11px">${t.entry_price}</td>
-      <td style="font-size:11px">${t.exit_price}</td>
-      <td class="${pnlCls}">${pnlStr}</td>
+    const pnlStr = (t.pnl >= 0 ? '+' : '') + '$' + Math.abs(t.pnl).toFixed(2);
+    return `
+      <tr>
+        <td><input type="checkbox" class="trade-checkbox" data-trade-id="${t.id}" onchange="updateDeleteButton()"></td>
+        <td style="color:var(--muted);font-size:11px">${ep}</td>
+        <td style="color:var(--muted);font-size:11px">${xp}</td>
+        <td><span class="pair-badge">${t.symbol}</span></td>
+        <td class="${t.side==='buy'?'side-buy':'side-sell'}">${t.side.toUpperCase()}</td>
+        <td>${t.quantity}</td>
+        <td style="font-size:11px">${t.entry_price}</td>
+        <td style="font-size:11px">${t.exit_price}</td>
+        <td class="${pnlCls}">${pnlStr}</td>
     </tr>`
   }).join('');
 }
@@ -942,6 +946,69 @@ async function updateSymbol(){
     const r=await fetch('/api/update-symbol',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value})});
     const d=await r.json();if(!d.success){alert('Failed: '+d.message);updateUI()}
   }catch(e){alert('Error: '+e.message)}
+}
+
+// Trade selection and delete functions
+function toggleAllTrades() {
+  const selectAll = $('selectAllTrades');
+  const checkboxes = document.querySelectorAll('.trade-checkbox');
+  
+  checkboxes.forEach(checkbox => {
+    checkbox.checked = selectAll.checked;
+  });
+  
+  updateDeleteButton();
+}
+
+function updateDeleteButton() {
+  const checkboxes = document.querySelectorAll('.trade-checkbox:checked');
+  const deleteBtn = $('deleteSelectedBtn');
+  
+  if (checkboxes.length > 0) {
+    deleteBtn.disabled = false;
+    deleteBtn.textContent = ` Delete Selected (${checkboxes.length})`;
+  } else {
+    deleteBtn.disabled = true;
+    deleteBtn.textContent = ' Delete Selected';
+  }
+}
+
+async function deleteSelectedTrades() {
+  const checkboxes = document.querySelectorAll('.trade-checkbox:checked');
+  
+  if (checkboxes.length === 0) {
+    alert('No trades selected for deletion');
+    return;
+  }
+  
+  if (!confirm(`Are you sure you want to delete ${checkboxes.length} trade(s)? This action cannot be undone.`)) {
+    return;
+  }
+  
+  const tradeIds = Array.from(checkboxes).map(cb => cb.dataset.tradeId);
+  
+  try {
+    const response = await fetch('/api/delete-trades', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trade_ids: tradeIds })
+    });
+    
+    const result = await response.json();
+    
+    if (result.success) {
+      alert(`Successfully deleted ${checkboxes.length} trade(s)`);
+      // Refresh the trade list
+      await loadTradesPage(currentTradePage);
+      // Reset checkboxes
+      $('selectAllTrades').checked = false;
+      updateDeleteButton();
+    } else {
+      alert('Failed to delete trades: ' + result.message);
+    }
+  } catch (error) {
+    alert('Error deleting trades: ' + error.message);
+  }
 }
 </script>
 </body>
