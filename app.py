@@ -144,8 +144,8 @@ DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
 # ---------- LIVE POSITION TP/SL CONFIGURATION ----------
-LIVE_TP_PERCENTAGE = 1   # 0.5% Take Profit
-LIVE_SL_PERCENTAGE = 0.5  # 0.25% Stop Loss
+LIVE_TP_PERCENTAGE = 2   # 0.5% Take Profit
+LIVE_SL_PERCENTAGE = 1  # 0.25% Stop Loss
 
 processing_lock = threading.Lock()
 last_processed = {}
@@ -156,10 +156,10 @@ BOT_STATE = {
     'thread': None,
     'current_lot': 1,
     'base_lot': 1,  # Integer for size parameter
-    'leverage': 10,
+    'leverage': 100,
     'tp_percent': 2.0,
     'sl_percent': 1.0,
-    'max_streak': 5,
+    'max_streak': 10,
     'current_streak': 0,
     'last_result': None,
     'symbol': 'ADAUSD',
@@ -279,74 +279,45 @@ def init_database():
         print(f"❌ Failed to initialize MySQL database: {e}")
         raise
 
-# ========== BOT PROCESS MANAGEMENT ==========
-def start_signal_bot():
-    """Start decision bot as a subprocess"""
-    global BOT_PROCESS
+# ========== SIGNAL GENERATION ==========
+def generate_random_signal(reason="trade_result"):
+    """Generate completely random unbiased buy/sell signal - TRUE 50/50"""
+    import random
+    from datetime import datetime
     
-    with bot_process_lock:
-        if BOT_PROCESS and BOT_PROCESS.poll() is None:
-            print("⚠️ Decision bot is already running")
-            return False
-        
-        try:
-            # Get the directory of this script
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            bot_script = os.path.join(script_dir, "decision_bot.py")
-            
-            # Start decision_bot.py as subprocess
-            BOT_PROCESS = subprocess.Popen(
-                ['python3', bot_script],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1
-            )
-            
-            print(f"✅ Decision bot started with PID: {BOT_PROCESS.pid}")
-            
-            # Start a thread to monitor bot output
-            def monitor_bot_output():
-                for line in iter(BOT_PROCESS.stdout.readline, ''):
-                    if line.strip():
-                        print(f"[DECISION-BOT] {line.strip()}")
-                BOT_PROCESS.stdout.close()
-            
-            monitor_thread = threading.Thread(target=monitor_bot_output, daemon=True)
-            monitor_thread.start()
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Failed to start decision bot: {e}")
-            return False
+    signal = random.choice(['BUY', 'SELL'])
+    signal_data = {
+        'signal': signal,
+        'timestamp': datetime.now().isoformat(),
+        'confidence': 50,
+        'layer': 'RANDOM',
+        'score': 0,
+        'source': 'random_generator',
+        'reason': f'Random unbiased decision after {reason}',
+        'decision_ready': True,
+        'decision_confidence': 0.5,
+        'position_analysis': {'has_position': False},
+        'backtest_results': {},
+        'last_trade_result': reason,
+    }
+    return signal_data
 
-def stop_signal_bot():
-    """Stop the decision bot subprocess"""
-    global BOT_PROCESS
-    
-    with bot_process_lock:
-        if not BOT_PROCESS or BOT_PROCESS.poll() is not None:
-            print("⚠️ Decision bot is not running")
-            return False
+def write_signal(reason="trade_result"):
+    """Atomically write new signal to signal.json"""
+    try:
+        signal_data = generate_random_signal(reason)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        signal_file = os.path.join(script_dir, 'signal.json')
+        tmp = signal_file + ".tmp"
         
-        try:
-            BOT_PROCESS.terminate()
-            BOT_PROCESS.wait(timeout=5)
-            print(f"✅ Decision bot stopped")
-            BOT_PROCESS = None
-            return True
-            
-        except subprocess.TimeoutExpired:
-            print("⚠️ Decision bot did not stop gracefully, killing...")
-            BOT_PROCESS.kill()
-            BOT_PROCESS.wait()
-            BOT_PROCESS = None
-            return True
-            
-        except Exception as e:
-            print(f"❌ Failed to stop decision bot: {e}")
-            return False
+        with open(tmp, 'w') as f:
+            json.dump(signal_data, f, indent=2)
+        os.replace(tmp, signal_file)
+        print(f"[SIGNAL] Generated: {signal_data['signal']} | Reason: {reason}")
+        return True
+    except Exception as e:
+        print(f"[SIGNAL] Error writing signal: {e}")
+        return False
 
 def save_closed_position(trade_data):
     """Save closed trade to MySQL database with thread safety and size management"""
@@ -666,21 +637,13 @@ def check_position_and_detect_closure():
             print(f"     PnL: {pnl:.5f}")
             print(f"     Result: {'PROFIT ' if pnl > 0 else 'LOSS '}{' ' if pnl > 0 else ' '}")
             
-            # Exit type detection for decision bot
-            entry_exit_data = get_entry_exit_from_fills()
-            exit_type = "UNKNOWN"
+            # Generate new random signal only after trade result
+            result_type = "PROFIT" if pnl > 0 else "LOSS"
+            reason = f"after_{result_type.lower()}_pnl={pnl:.5f}"
             
-            if entry_exit_data and pnl != 0:
-                if pnl > 0:
-                    exit_type = "TP"   # Profit = TP hit
-                else:
-                    exit_type = "SL"   # Loss = SL hit
-                
-                # Write exit result for decision bot
-                _write_exit_result(exit_type, pnl, entry_exit_data)
-                print(f"     Exit Type: {exit_type} (written to decision bot)")
-            else:
-                print(f"     Exit Type: UNKNOWN (no entry/exit data)")     
+            # Generate new random signal
+            write_signal(reason=reason)
+            print(f"     Generated new signal after {result_type}")     
             LAST_TRADE_RESULT['profit_loss'] = pnl
             LAST_TRADE_RESULT['timestamp'] = datetime.now().isoformat()
             LAST_TRADE_RESULT['lot_used'] = LAST_POSITION_STATE['size']
@@ -836,40 +799,9 @@ def get_entry_exit_from_fills():
         print(f"❌ Error getting entry/exit from fills: {e}")
         return None
 
-# ========== DECISION BOT BRIDGE ==========
-
-def _write_exit_result(exit_type, pnl, entry_data):
-    """
-    Decision bot ke liye exit result likhta hai.
-    Decision bot sirf READ karega, kabhi TP/SL SET nahi karega.
-    """
-    try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        result_file = os.path.join(script_dir, "last_exit.json")
-        tmp = result_file + ".tmp"
-        
-        payload = {
-            "exit_type":   exit_type,          # "TP" ya "SL"
-            "pnl":         pnl,
-            "timestamp":   datetime.now().isoformat(),
-            "entry_price": entry_data.get('entry_price', 0) if entry_data else 0,
-            "exit_price":  entry_data.get('exit_price', 0)  if entry_data else 0,
-            "side":        entry_data.get('side', '')        if entry_data else '',
-            "consumed":    False   # Decision bot isko True karega jab padh le
-        }
-        
-        with open(tmp, 'w') as f:
-            json.dump(payload, f)
-        os.replace(tmp, result_file)
-        
-        print(f"     Exit result written: {exit_type} | PnL={pnl:.5f}")
-        
-    except Exception as e:
-        print(f"     Error writing exit result: {e}")
-
 # ========== TRADING LOGIC ==========
 def get_trading_signal():
-    """Read enhanced decision signal from shared signal.json file"""
+    """Read trading signal from signal.json file"""
     try:
         # Get the directory of this script
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -877,50 +809,34 @@ def get_trading_signal():
         
         # Check if signal file exists
         if not os.path.exists(signal_file):
-            print("⚠️ Signal file not found, defaulting to BUY")
-            return 'buy', {}
+            print("Signal file not found, generating initial signal...")
+            write_signal(reason="startup")
         
-        # Read signal from file
+        # Read signal file
         with open(signal_file, 'r') as f:
             signal_data = json.load(f)
         
-        signal = signal_data.get('signal', 'BUY')
-        timestamp = signal_data.get('timestamp', '')
-        layer = signal_data.get('layer', 'UNKNOWN')
-        score = signal_data.get('score', 0)
+        signal = signal_data.get('signal', '')
+        confidence = signal_data.get('confidence', 0)
+        last_trade_result = signal_data.get('last_trade_result', '')
         
-        # Enhanced data from decision_bot.py
-        position_analysis = signal_data.get('position_analysis', {})
-        decision_ready = signal_data.get('decision_ready', False)
-        decision_confidence = signal_data.get('decision_confidence', 0.0)
-        backtest_results = signal_data.get('backtest_results', {})
-        last_trade_result = signal_data.get('last_trade_result', None)
+        # Print signal info
+        print(f"Signal: {signal}")
+        print(f"Confidence: {confidence}%")
+        print(f"Last Trade Result: {last_trade_result}")
         
-        # Log enhanced decision info
-        if position_analysis.get('has_position'):
-            pnl = position_analysis.get('pnl', 0)
-            side = position_analysis.get('side', '')
-            print(f"📊 Decision: {signal} [{layer}] | Position: {side} | PnL: {pnl:.2f} | Confidence: {decision_confidence:.2f} | Ready: {decision_ready}")
-        else:
-            print(f"📊 Decision: {signal} [{layer}] | No Position | Confidence: {decision_confidence:.2f} | Ready: {decision_ready}")
-            if last_trade_result:
-                print(f"📈 Last Trade Result: {last_trade_result}")
-        
-        if backtest_results:
-            accuracy = backtest_results.get('accuracy_percentage', 0.0)
-            print(f"🎯 Backtest Accuracy: {accuracy:.1f}%")
-        
-        # � Return decision bot signal directly
+        # Return signal directly
         if signal.upper() == "BUY":
             return 'buy', signal_data
         elif signal.upper() == "SELL":
             return 'sell', signal_data
         else:
-            return None, signal_data  # No default signal
+            print(f"Unknown signal: {signal}")
+            return None, signal_data
             
     except Exception as e:
-        print(f"❌ Error reading signal file: {e}")
-        return None, {}
+        print(f"Error reading signal: {e}")
+        return None, None
 
 def calculate_next_lot():
     """Calculate next lot size based on last trade result with step-based progression"""
