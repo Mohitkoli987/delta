@@ -302,23 +302,6 @@ def generate_random_signal(reason="trade_result"):
     }
     return signal_data
 
-def write_signal(reason="trade_result"):
-    """Atomically write new signal to signal.json"""
-    try:
-        signal_data = generate_random_signal(reason)
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        signal_file = os.path.join(script_dir, 'signal.json')
-        tmp = signal_file + ".tmp"
-        
-        with open(tmp, 'w') as f:
-            json.dump(signal_data, f, indent=2)
-        os.replace(tmp, signal_file)
-        print(f"[SIGNAL] Generated: {signal_data['signal']} | Reason: {reason}")
-        return True
-    except Exception as e:
-        print(f"[SIGNAL] Error writing signal: {e}")
-        return False
-
 def save_closed_position(trade_data):
     """Save closed trade to MySQL database with thread safety and size management"""
     print(f"💾 Saving trade to MySQL database: {trade_data}")
@@ -641,9 +624,10 @@ def check_position_and_detect_closure():
             result_type = "PROFIT" if pnl > 0 else "LOSS"
             reason = f"after_{result_type.lower()}_pnl={pnl:.5f}"
             
-            # Generate new random signal
-            write_signal(reason=reason)
-            print(f"     Generated new signal after {result_type}")     
+            # Generate new random signal and update global variable
+            global CURRENT_SIGNAL
+            CURRENT_SIGNAL = generate_random_signal(reason=reason)
+            print(f"     Generated new signal: {CURRENT_SIGNAL['signal']} after {result_type}")     
             LAST_TRADE_RESULT['profit_loss'] = pnl
             LAST_TRADE_RESULT['timestamp'] = datetime.now().isoformat()
             LAST_TRADE_RESULT['lot_used'] = LAST_POSITION_STATE['size']
@@ -800,25 +784,22 @@ def get_entry_exit_from_fills():
         return None
 
 # ========== TRADING LOGIC ==========
+# Global current signal storage
+CURRENT_SIGNAL = None
+
 def get_trading_signal():
-    """Read trading signal from signal.json file"""
+    """Get current trading signal or generate new one if needed"""
+    global CURRENT_SIGNAL
+    
     try:
-        # Get the directory of this script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        signal_file = os.path.join(script_dir, "signal.json")
+        # If no signal exists, generate initial one
+        if CURRENT_SIGNAL is None:
+            CURRENT_SIGNAL = generate_random_signal(reason="startup")
+            print(f"[SIGNAL] Generated initial signal: {CURRENT_SIGNAL['signal']}")
         
-        # Check if signal file exists
-        if not os.path.exists(signal_file):
-            print("Signal file not found, generating initial signal...")
-            write_signal(reason="startup")
-        
-        # Read signal file
-        with open(signal_file, 'r') as f:
-            signal_data = json.load(f)
-        
-        signal = signal_data.get('signal', '')
-        confidence = signal_data.get('confidence', 0)
-        last_trade_result = signal_data.get('last_trade_result', '')
+        signal = CURRENT_SIGNAL.get('signal', '')
+        confidence = CURRENT_SIGNAL.get('confidence', 0)
+        last_trade_result = CURRENT_SIGNAL.get('last_trade_result', '')
         
         # Print signal info
         print(f"Signal: {signal}")
@@ -827,15 +808,15 @@ def get_trading_signal():
         
         # Return signal directly
         if signal.upper() == "BUY":
-            return 'buy', signal_data
+            return 'buy', CURRENT_SIGNAL
         elif signal.upper() == "SELL":
-            return 'sell', signal_data
+            return 'sell', CURRENT_SIGNAL
         else:
             print(f"Unknown signal: {signal}")
-            return None, signal_data
+            return None, CURRENT_SIGNAL
             
     except Exception as e:
-        print(f"Error reading signal: {e}")
+        print(f"Error getting signal: {e}")
         return None, None
 
 def calculate_next_lot():
