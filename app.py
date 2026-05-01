@@ -144,8 +144,8 @@ DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
 # ---------- LIVE POSITION TP/SL CONFIGURATION ----------
-LIVE_TP_PERCENTAGE = 2   # 0.5% Take Profit
-LIVE_SL_PERCENTAGE = 1  # 0.25% Stop Loss
+LIVE_TP_PERCENTAGE = 1   # 0.5% Take Profit
+LIVE_SL_PERCENTAGE = 0.4  # 0.25% Stop Loss
 
 processing_lock = threading.Lock()
 last_processed = {}
@@ -157,8 +157,8 @@ BOT_STATE = {
     'current_lot': 1,
     'base_lot': 1,  # Integer for size parameter
     'leverage': 100,
-    'tp_percent': 2.0,
-    'sl_percent': 1.0,
+    'tp_percent': 1,
+    'sl_percent': 0.4,
     'max_streak': 10,
     'current_streak': 0,
     'last_result': None,
