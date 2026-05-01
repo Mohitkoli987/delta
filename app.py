@@ -144,8 +144,8 @@ DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
 # ---------- LIVE POSITION TP/SL CONFIGURATION ----------
-LIVE_TP_PERCENTAGE = 2   # 0.5% Take Profit
-LIVE_SL_PERCENTAGE = 1  # 0.25% Stop Loss
+LIVE_TP_PERCENTAGE = 1  # 0.5% Take Profit
+LIVE_SL_PERCENTAGE = 0.4  # 0.25% Stop Loss
 
 processing_lock = threading.Lock()
 last_processed = {}
@@ -157,9 +157,9 @@ BOT_STATE = {
     'current_lot': 1,
     'base_lot': 1,  # Integer for size parameter
     'leverage': 100,
-    'tp_percent': 2.0,
-    'sl_percent': 1.0,
-    'max_streak': 10,
+    'tp_percent': 1,
+    'sl_percent': 0.4,
+    'max_streak': 11,
     'current_streak': 0,
     'last_result': None,
     'symbol': 'ADAUSD',
@@ -818,6 +818,31 @@ def get_trading_signal():
     except Exception as e:
         print(f"Error getting signal: {e}")
         return None, None
+
+# Signal Bot Management
+def start_signal_bot():
+    """Start the signal bot for continuous signal generation"""
+    try:
+        print("🤖 Signal bot starting...")
+        # Generate initial signal
+        global CURRENT_SIGNAL
+        CURRENT_SIGNAL = generate_random_signal(reason="startup")
+        print(f"Initial signal generated: {CURRENT_SIGNAL['signal']}")
+        return True
+    except Exception as e:
+        print(f"❌ Error starting signal bot: {e}")
+        return False
+
+def stop_signal_bot():
+    """Stop the signal bot"""
+    try:
+        print("🛑 Signal bot stopping...")
+        # Clean up signal state if needed
+        global CURRENT_SIGNAL
+        CURRENT_SIGNAL = None
+        print("Signal bot stopped")
+    except Exception as e:
+        print(f"❌ Error stopping signal bot: {e}")
 
 def calculate_next_lot():
     """Calculate next lot size based on last trade result with step-based progression"""
