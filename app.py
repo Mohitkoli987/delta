@@ -788,23 +788,21 @@ def get_entry_exit_from_fills():
 CURRENT_SIGNAL = None
 
 def get_trading_signal():
-    """Get current trading signal or generate new one if needed"""
+    """Generate completely new unbiased trading signal on every call"""
     global CURRENT_SIGNAL
     
     try:
-        # If no signal exists, generate initial one
-        if CURRENT_SIGNAL is None:
-            CURRENT_SIGNAL = generate_random_signal(reason="startup")
-            print(f"[SIGNAL] Generated initial signal: {CURRENT_SIGNAL['signal']}")
+        # ALWAYS generate a new random signal - no reuse
+        CURRENT_SIGNAL = generate_random_signal(reason="trade_decision")
+        print(f"[SIGNAL] Generated new unbiased signal: {CURRENT_SIGNAL['signal']}")
         
         signal = CURRENT_SIGNAL.get('signal', '')
         confidence = CURRENT_SIGNAL.get('confidence', 0)
-        last_trade_result = CURRENT_SIGNAL.get('last_trade_result', '')
         
         # Print signal info
-        print(f"Signal: {signal}")
-        print(f"Confidence: {confidence}%")
-        print(f"Last Trade Result: {last_trade_result}")
+        print(f"🎲 Random Signal: {signal}")
+        print(f"📊 Confidence: {confidence}% (unbiased 50/50)")
+        print(f"🔄 Fresh decision - no bias from previous trades")
         
         # Return signal directly
         if signal.upper() == "BUY":
@@ -821,13 +819,10 @@ def get_trading_signal():
 
 # Signal Bot Management
 def start_signal_bot():
-    """Start the signal bot for continuous signal generation"""
+    """Start the signal bot - no continuous generation, only on-demand"""
     try:
-        print("🤖 Signal bot starting...")
-        # Generate initial signal
-        global CURRENT_SIGNAL
-        CURRENT_SIGNAL = generate_random_signal(reason="startup")
-        print(f"Initial signal generated: {CURRENT_SIGNAL['signal']}")
+        print("🤖 Signal bot ready - will generate unbiased random signals on demand")
+        print("🎲 No continuous generation - fresh 50/50 decisions when needed")
         return True
     except Exception as e:
         print(f"❌ Error starting signal bot: {e}")
@@ -836,11 +831,7 @@ def start_signal_bot():
 def stop_signal_bot():
     """Stop the signal bot"""
     try:
-        print("🛑 Signal bot stopping...")
-        # Clean up signal state if needed
-        global CURRENT_SIGNAL
-        CURRENT_SIGNAL = None
-        print("Signal bot stopped")
+        print("🛑 Signal bot stopped")
     except Exception as e:
         print(f"❌ Error stopping signal bot: {e}")
 
