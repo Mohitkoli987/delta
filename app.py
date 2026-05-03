@@ -1172,7 +1172,7 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
 
     try:
         PRODUCT_CONFIG = {
-            "ADAUSD": {"id": 16614, "tick": Decimal("0.0001")},  # Fixed: 101760 → 16614
+            "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},  # Fixed: 101760 → 16614
             "BTCUSD": {"id": 84,     "tick": Decimal("0.5")},
             "ETHUSD": {"id": 1320,   "tick": Decimal("0.05")},
         }
