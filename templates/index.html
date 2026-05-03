@@ -211,37 +211,37 @@ tr:hover td{background:rgba(255,255,255,.02)}
           </svg>
           <div class="streak-ring-inner">
             <div class="streak-num" id="streakNum">0</div>
-            <div class="streak-lbl">Streak</div>
+            <div class="streak-lbl">Step</div>
           </div>
         </div>
       </div>
       <div class="streak-info">
         <div class="sinfo-box">
+          <div class="sinfo-lbl">Current Step</div>
+          <div class="sinfo-val" id="currentStep" style="color:var(--blue)">1</div>
+        </div>
+        <div class="sinfo-box">
           <div class="sinfo-lbl">Current Lot</div>
           <div class="sinfo-val" id="currentLot">1</div>
         </div>
         <div class="sinfo-box">
-          <div class="sinfo-lbl">Lot Size</div>
-          <div class="sinfo-val" id="lotSize">10</div>
+          <div class="sinfo-lbl">Next Step</div>
+          <div class="sinfo-val" id="nextStep" style="color:var(--gold)">2</div>
         </div>
         <div class="sinfo-box">
-          <div class="sinfo-lbl">Next Lot (Loss)</div>
+          <div class="sinfo-lbl">Next Lot</div>
           <div class="sinfo-val" id="nextLot" style="color:var(--red)">2</div>
-        </div>
-        <div class="sinfo-box">
-          <div class="sinfo-lbl">Next Qty</div>
-          <div class="sinfo-val" id="nextQty">20</div>
         </div>
       </div>
     </div>
     <div class="stat-grid">
       <div class="stat-item">
-        <div class="stat-lbl">Current Step</div>
-        <div class="stat-val" id="currentStep" style="color:var(--blue)">1</div>
-      </div>
-      <div class="stat-item">
         <div class="stat-lbl">Last Result</div>
         <div class="stat-val" id="lastResult">—</div>
+      </div>
+      <div class="stat-item" id="runningStatusItem" style="display:none;">
+        <div class="stat-lbl">🔥 RUNNING</div>
+        <div class="stat-val" id="runningStatus" style="color:var(--green);font-weight:bold;">Step 1 - Lot 1</div>
       </div>
     </div>
   </div>
@@ -311,12 +311,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
           <option value="ADAUSD">ADAUSD</option>
         </select>
       </div>
-      <div class="cfg-item">
-        <label class="cfg-label">Base Quantity (Lots)</label>
-        <input type="number" id="baseLot" class="cfg-input" value="1">
-        <span class="cfg-hint">Stop bot to change</span>
-      </div>
-      <div class="cfg-item">
+            <div class="cfg-item">
         <label class="cfg-label">Leverage</label>
         <input type="number" id="leverage" class="cfg-input" value="100">
       </div>
@@ -328,11 +323,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
         <label class="cfg-label">Stop Loss (%)</label>
         <input type="number" id="slPercent" class="cfg-input" value="1.0" step="0.1">
       </div>
-      <div class="cfg-item full">
-        <label class="cfg-label">Max Recovery Streak</label>
-        <input type="number" id="maxStreak" class="cfg-input" value="10">
-      </div>
-    </div>
+          </div>
     <div class="btn-grid">
       <div class="btn-full">
         <button id="startBtn" class="btn btn-start" style="width:100%" onclick="startBot()">START ENGINE</button>
@@ -690,9 +681,7 @@ async function recoverPnLFromMySQL() {
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
-  $('baseLot').addEventListener('focus',()=>isUserTyping=true);
-  $('baseLot').addEventListener('blur',()=>isUserTyping=false);
-  fetchSystemIP();
+    fetchSystemIP();
   initializePnLChart(); // Initialize P&L chart
   
   // Recover P&L data from MySQL/localStorage
@@ -700,8 +689,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     fetch('/api/bot-status')
       .then(r=>r.json())
       .then(d=>{
-        if(d.success&&d.status.base_lot&&!$('baseLot').value){$('baseLot').value=d.status.base_lot}
-        initState().then(()=>{updateUI();if(isEngineRunning)updateInterval=setInterval(updateUI,2000)});
+                initState().then(()=>{updateUI();if(isEngineRunning)updateInterval=setInterval(updateUI,2000)});
       }).catch(()=>initState().then(()=>updateUI()));
   });
 });
@@ -729,13 +717,28 @@ function syncEngineUI(){
   const sb=$('statusBadge'),dot=$('statusDot'),st=$('statusText'),btn=$('startBtn');
   const saw=$('stopAtWinBtn'),sam=$('stopAtMaxBtn');
   if(isEngineRunning){
-    sb.className='status-badge badge-online';dot.className='dot dot-pulse';st.textContent='ACTIVE';
+    sb.className='status-badge badge-online';dot.className='dot dot-pulse';
+    // Update status to show current step and lot
+    updateStatusBadge();
     btn.textContent='ENGINE RUNNING';btn.className='btn btn-running';btn.disabled=true;
     saw.disabled=false;sam.disabled=false;
   }else{
     sb.className='status-badge badge-offline';dot.className='dot';st.textContent='OFFLINE';
     btn.textContent='START ENGINE';btn.className='btn btn-start';btn.disabled=false;
     saw.disabled=true;sam.disabled=true;
+  }
+}
+
+function updateStatusBadge(){
+  if(!isEngineRunning) return;
+  
+  // Get current step and lot from the UI elements
+  const currentStep = $('currentStep').textContent || '1';
+  const currentLot = $('currentLot').textContent || '1';
+  const statusText = $('statusText');
+  
+  if(statusText){
+    statusText.textContent = `Step ${currentStep} - Lot ${currentLot}`;
   }
 }
 
@@ -750,17 +753,34 @@ async function updateUI(){
 
     if(s.success){
       if(s.status.running!==isEngineRunning)saveState(s.status.running);
-      const streak=s.status.current_streak||0,maxStrk=s.status.max_streak||5;
-      const pct=Math.min(streak/maxStrk,1);
+      const currentStep=s.status.current_step||1,maxSteps=s.status.max_steps||11;
+      const pct=Math.min((currentStep-1)/(maxSteps-1),1);
       const circ=213.6;
       $('streakArc').style.strokeDashoffset=(circ*(1-pct)).toFixed(2);
       $('streakArc').style.stroke=pct>0.7?'var(--red)':pct>0.4?'var(--gold)':'var(--green)';
-      $('streakNum').textContent=streak;
-      $('currentLot').textContent=s.status.current_lot||1;
-      $('lotSize').textContent=s.status.current_lot_size||10;
-      $('nextLot').textContent=s.status.next_lot_if_loss||2;
-      $('nextQty').textContent=s.status.next_lot_quantity||20;
+      $('streakNum').textContent=currentStep;
+      // Ensure lot sizes are always positive (use absolute value)
       $('currentStep').textContent=s.status.current_step||1;
+      $('currentLot').textContent=Math.abs(s.status.current_lot||1);
+      $('nextStep').textContent=s.status.next_step||2;
+      $('nextLot').textContent=Math.abs(s.status.next_lot||2);
+
+      // Show prominent running status when engine is running
+      const runningStatusItem=$('runningStatusItem');
+      const runningStatus=$('runningStatus');
+      if(s.status.running){
+        runningStatusItem.style.display='block';
+        runningStatus.textContent=`Step ${s.status.current_step||1} - Lot ${Math.abs(s.status.current_lot||1)}`;
+        runningStatus.style.color='var(--green)';
+        
+        // Also update the status badge in navigation
+        const statusText=$('statusText');
+        if(statusText){
+          statusText.textContent=`Step ${s.status.current_step||1} - Lot ${Math.abs(s.status.current_lot||1)}`;
+        }
+      }else{
+        runningStatusItem.style.display='none';
+      }
 
       const lr=s.status.last_result||'-',lrEl=$('lastResult'),lrBadge=$('lastResultBadge');
       if(lr==='PROFIT'){lrEl.textContent='PROFIT ✓';lrEl.className='stat-val last-win';lrBadge.textContent='Last: PROFIT ✓';lrBadge.style.color='var(--green)'}
@@ -774,10 +794,7 @@ async function updateUI(){
       $('pnlBanner').textContent=pnlStr;
       $('pnlBanner').className='pnl-right '+(pnl>=0?'pnl-pos-big':'pnl-neg-big');
 
-      const bl=$('baseLot');
-      bl.disabled=s.status.running;bl.style.opacity=s.status.running?'0.4':'1';
-      if(!isUserTyping)bl.value=s.status.base_lot||1;
-
+      
       const sym=$('symbol');if(sym.value!==s.status.symbol&&s.status.symbol)sym.value=s.status.symbol;
 
       const saw=$('stopAtWinBtn'),sam=$('stopAtMaxBtn');
@@ -891,9 +908,51 @@ async function loadTradesPage(page){
 
 async function startBot(){
   try{
-    const r=await fetch('/api/start-bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value,base_lot:parseInt($('baseLot').value),leverage:parseInt($('leverage').value),tp_percent:parseFloat($('tpPercent').value),sl_percent:parseFloat($('slPercent').value),max_streak:parseInt($('maxStreak').value)})});
+    const r=await fetch('/api/start-bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value,leverage:parseInt($('leverage').value),tp_percent:parseFloat($('tpPercent').value),sl_percent:parseFloat($('slPercent').value)})});
     const d=await r.json();
-    if(d.success){saveState(true);clearInterval(updateInterval);updateInterval=setInterval(updateUI,2000);setTimeout(updateUI,500)}
+    if(d.success){
+      saveState(true);
+      clearInterval(updateInterval);
+      updateInterval=setInterval(updateUI,2000);
+      
+      // Update UI immediately with step info from start response
+      if(d.current_step && d.current_lot){
+        // Ensure lot sizes are always positive
+        const currentLot = Math.abs(d.current_lot);
+        
+        $('currentStep').textContent = d.current_step;
+        $('currentLot').textContent = currentLot;
+        
+        // Calculate next step and lot
+        const maxSteps = 11; // Will be dynamic from backend later
+        const nextStep = d.current_step + 1 > maxSteps ? 1 : d.current_step + 1;
+        $('nextStep').textContent = nextStep;
+        
+        // Calculate next lot based on step progression (2^(step-1))
+        const nextLot = nextStep === 1 ? 1 : Math.pow(2, nextStep - 1);
+        $('nextLot').textContent = nextLot;
+        
+        // Update running status immediately
+        const runningStatusItem=$('runningStatusItem');
+        const runningStatus=$('runningStatus');
+        runningStatusItem.style.display='block';
+        runningStatus.textContent=`Step ${d.current_step} - Lot ${currentLot}`;
+        runningStatus.style.color='var(--green)';
+        
+        // Update status badge immediately
+        const statusText=$('statusText');
+        if(statusText){
+          statusText.textContent=`Step ${d.current_step} - Lot ${currentLot}`;
+        }
+        
+        // Update step number in progress ring
+        $('streakNum').textContent = d.current_step;
+        
+        console.log(`🎯 Immediate UI Update: Step ${d.current_step} - Lot ${currentLot} (Existing: ${d.has_existing_position})`);
+      }
+      
+      setTimeout(updateUI,500);
+    }
     else{alert(d.message.includes('Bot is running')?'Bot is running — stop it first to change base lot':'Failed: '+d.message)}
   }catch(e){alert('Error: '+e.message)}
 }
