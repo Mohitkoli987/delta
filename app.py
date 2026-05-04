@@ -1998,6 +1998,7 @@ def delete_trades():
         return jsonify({'success': False, 'message': f'Error deleting trades: {str(e)}'})
 
 
+
 # ========== TP/SL GUARDIAN ==========
 def auto_tp_sl_guardian():
     """
@@ -2008,12 +2009,6 @@ def auto_tp_sl_guardian():
     - Uses Tolerance to avoid constant editing
     """
     print("🛡️ SAFE TP/SL GUARDIAN STARTED (EDIT ONLY)...")
-
-    SYMBOL_TICK = {
-        "ADAUSD": Decimal("0.00001"),
-        "BTCUSD": Decimal("0.5"),
-        "ETHUSD": Decimal("0.05"),
-    }
 
     while True:
         try:
@@ -2029,7 +2024,7 @@ def auto_tp_sl_guardian():
 
             active_positions = [
                 p for p in positions_response.get('result', [])
-                if abs(float(p.get('size', 0))) >= 1                          # FIX 1: was > 0.0001
+                if abs(float(p.get('size', 0))) > 0.0001
             ]
 
             if not active_positions:
@@ -2038,29 +2033,13 @@ def auto_tp_sl_guardian():
 
             for pos in active_positions:
                 try:
-                    symbol     = pos.get("product_symbol") or pos.get("symbol")
-                    size       = float(pos.get("size", 0))
-                    entry      = float(pos.get("entry_price", 0))
+                    symbol = pos.get("product_symbol") or pos.get("symbol")
+                    size = float(pos.get("size", 0))
+                    entry = float(pos.get("entry_price", 0))
                     product_id = pos.get("product_id")
 
-                    if not all([symbol, product_id]) or abs(size) < 1 or entry <= 0:  # FIX 1: was < 0.0001
+                    if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
                         continue
-
-                    # FIX 2: Per-symbol tick config
-                    tick = SYMBOL_TICK.get(symbol)
-                    if not tick:
-                        print(f"   ❌ No tick config for {symbol}, skipping")
-                        continue
-
-                    def to_tick(val):
-                        d = Decimal(str(val))
-                        return (d / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
-
-                    def snap_str(val):
-                        snapped  = to_tick(val)
-                        tick_str = format(tick, 'f').rstrip('0')
-                        decimals = len(tick_str.split('.')[-1]) if '.' in tick_str else 0
-                        return format(snapped, f'.{decimals}f'), snapped
 
                     print(f"\n📍 [GUARDIAN] {symbol} | Size: {size} | Entry: {entry}")
 
@@ -2071,33 +2050,25 @@ def auto_tp_sl_guardian():
                         expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
 
-                    # FIX 2: Snap to tick before use
-                    tp_price_str, tp_dec = snap_str(expected_tp)
-                    sl_price_str, sl_dec = snap_str(expected_sl)
-
-                    # FIX 3: Use snapped values for tolerance comparison
-                    expected_tp_snapped = float(tp_dec)
-                    expected_sl_snapped = float(sl_dec)
-
-                    dynamic_tolerance = entry * 0.0005
-                    print(f"   💡 Expected TP: {tp_price_str} | Expected SL: {sl_price_str} | Tolerance: {dynamic_tolerance:.6f}")
+                    dynamic_tolerance = entry * 0.0005 
+                    print(f"   💡 Expected TP: {expected_tp:.6f} | Expected SL: {expected_sl:.6f} | Tolerance: {dynamic_tolerance:.6f}")
 
                     orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
                     if not orders_response or not orders_response.get('success'):
                         continue
-
-                    orders    = orders_response.get("result", [])
+                    
+                    orders = orders_response.get("result", [])
                     tp_orders = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "take_profit_order"]
                     sl_orders = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
 
-                    tp_valid        = False
-                    sl_valid        = False
+                    tp_valid = False
+                    sl_valid = False
                     wrong_tp_orders = []
                     wrong_sl_orders = []
 
                     for tp_order in tp_orders:
                         stop_price = float(tp_order.get("stop_price", 0))
-                        if abs(stop_price - expected_tp_snapped) < dynamic_tolerance:  # FIX 3
+                        if abs(stop_price - expected_tp) < dynamic_tolerance:
                             tp_valid = True
                             print(f"   ✅ TP Order {tp_order.get('id')} is CORRECT")
                         else:
@@ -2105,7 +2076,7 @@ def auto_tp_sl_guardian():
 
                     for sl_order in sl_orders:
                         stop_price = float(sl_order.get("stop_price", 0))
-                        if abs(stop_price - expected_sl_snapped) < dynamic_tolerance:  # FIX 3
+                        if abs(stop_price - expected_sl) < dynamic_tolerance:
                             sl_valid = True
                             print(f"   ✅ SL Order {sl_order.get('id')} is CORRECT")
                         else:
@@ -2113,76 +2084,48 @@ def auto_tp_sl_guardian():
 
                     tp_edited = False
                     sl_edited = False
-
+                    
                     if wrong_tp_orders and not tp_valid:
                         for tp_order in wrong_tp_orders:
                             order_id = tp_order.get("id")
                             print(f"   🔧 EDITING TP order {order_id}...")
-                            edit_payload = {
-                                "id"        : order_id,
-                                "product_id": int(product_id),
-                                "stop_price": tp_price_str,       # FIX 2: tick-snapped, removed invalid order_type
-                                "size"      : abs(round(size))    # FIX: round not int
-                            }
+                            edit_payload = {"id": order_id, "product_id": int(product_id), "order_type": "market_order", "stop_price": "{:.6f}".format(expected_tp), "size": abs(int(size))}
                             edit_body = json.dumps(edit_payload)
                             try:
-                                edit_res = requests.put(
-                                    BASE_URL + "/v2/orders",
-                                    headers=sign_request("PUT", "/v2/orders", edit_body),
-                                    data=edit_body,
-                                    timeout=10
-                                )
+                                edit_res = requests.put(BASE_URL + "/v2/orders", headers=sign_request("PUT", "/v2/orders", edit_body), data=edit_body, timeout=10)
                                 if edit_res.status_code == 200:
                                     print(f"   ✅ TP EDITED successfully")
                                     tp_edited = True
                                     break
-                                else:
-                                    print(f"   ❌ TP edit failed: {edit_res.status_code} | {edit_res.text}")  # FIX 4
-                            except Exception as e:
-                                print(f"   ❌ TP edit exception: {e}")                                        # FIX 4
-
+                            except: pass
+                    
                     if wrong_sl_orders and not sl_valid:
                         for sl_order in wrong_sl_orders:
                             order_id = sl_order.get("id")
                             print(f"   🔧 EDITING SL order {order_id}...")
-                            edit_payload = {
-                                "id"        : order_id,
-                                "product_id": int(product_id),
-                                "stop_price": sl_price_str,       # FIX 2: tick-snapped, removed invalid order_type
-                                "size"      : abs(round(size))    # FIX: round not int
-                            }
+                            edit_payload = {"id": order_id, "product_id": int(product_id), "order_type": "market_order", "stop_price": "{:.6f}".format(expected_sl), "size": abs(int(size))}
                             edit_body = json.dumps(edit_payload)
                             try:
-                                edit_res = requests.put(
-                                    BASE_URL + "/v2/orders",
-                                    headers=sign_request("PUT", "/v2/orders", edit_body),
-                                    data=edit_body,
-                                    timeout=10
-                                )
+                                edit_res = requests.put(BASE_URL + "/v2/orders", headers=sign_request("PUT", "/v2/orders", edit_body), data=edit_body, timeout=10)
                                 if edit_res.status_code == 200:
                                     print(f"   ✅ SL EDITED successfully")
                                     sl_edited = True
                                     break
-                                else:
-                                    print(f"   ❌ SL edit failed: {edit_res.status_code} | {edit_res.text}")  # FIX 4
-                            except Exception as e:
-                                print(f"   ❌ SL edit exception: {e}")                                        # FIX 4
+                            except: pass
 
                     need_tp = not tp_valid and not tp_edited
                     need_sl = not sl_valid and not sl_edited
-
+                    
                     if need_tp or need_sl:
                         ticker = make_api_request('GET', f'/tickers/{symbol}')
                         if ticker:
                             curr_price = float(ticker['result']['close'])
-                            is_safe    = True
+                            is_safe = True
                             if size > 0:
-                                if expected_tp_snapped <= curr_price or expected_sl_snapped >= curr_price:  # FIX 3
-                                    is_safe = False
+                                if expected_tp <= curr_price or expected_sl >= curr_price: is_safe = False
                             else:
-                                if expected_tp_snapped >= curr_price or expected_sl_snapped <= curr_price:  # FIX 3
-                                    is_safe = False
-
+                                if expected_tp >= curr_price or expected_sl <= curr_price: is_safe = False
+                            
                             if not is_safe:
                                 print(f"   ⚠️ Price too close to TP/SL. Skipping placement to avoid error.")
                                 continue
@@ -2190,31 +2133,16 @@ def auto_tp_sl_guardian():
                         print(f"   📤 Placing missing TP/SL...")
                         payload = {
                             "product_id": int(product_id),
-                            "take_profit_order": {
-                                "order_type": "market_order",
-                                "stop_price": tp_price_str        # FIX 2: tick-snapped string
-                            },
-                            "stop_loss_order": {
-                                "order_type": "market_order",
-                                "stop_price": sl_price_str        # FIX 2: tick-snapped string
-                            },
-                            "bracket_stop_trigger_method": "mark_price"
+                            "take_profit_order": {"order_type": "market_order", "stop_price": "{:.6f}".format(expected_tp)},
+                            "stop_loss_order": {"order_type": "market_order", "stop_price": "{:.6f}".format(expected_sl)}
                         }
                         body = json.dumps(payload)
                         try:
-                            res = requests.post(
-                                BASE_URL + "/v2/orders/bracket",
-                                headers=sign_request("POST", "/v2/orders/bracket", body),
-                                data=body,
-                                timeout=10
-                            )
+                            res = requests.post(BASE_URL + "/v2/orders/bracket", headers=sign_request("POST", "/v2/orders/bracket", body), data=body, timeout=10)
                             if res.status_code == 200:
                                 print(f"   ✅ Bracket placed successfully")
-                            else:
-                                print(f"   ❌ Bracket placement failed: {res.status_code} | {res.text}")  # FIX 4
-                        except Exception as e:
-                            print(f"   ❌ Bracket placement exception: {e}")                              # FIX 4
-
+                        except: pass
+                    
                     time.sleep(0.3)
 
                 except Exception as e:
@@ -2223,6 +2151,7 @@ def auto_tp_sl_guardian():
         except Exception as e:
             print(f"❌ Guardian error: {e}")
             time.sleep(2)
+
 
 
 # ========== MAIN ==========
