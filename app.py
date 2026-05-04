@@ -140,8 +140,8 @@ DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
 # ---------- LIVE POSITION TP/SL CONFIGURATION ----------
-LIVE_TP_PERCENTAGE = 0.35  # 1% Take Profit
-LIVE_SL_PERCENTAGE = 0.1  # 0.4% Stop Loss
+LIVE_TP_PERCENTAGE = 0.1  # 1% Take Profit
+LIVE_SL_PERCENTAGE = 0.4  # 0.4% Stop Loss
 
 processing_lock = threading.Lock()
 last_processed = {}
