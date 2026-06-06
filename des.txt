@@ -1,0 +1,545 @@
+
+# ========== SIGNAL GENERATION ==========
+def _ema(prices, period):
+    """Exponential Moving Average"""
+    if len(prices) < period:
+        return None
+    k = 2.0 / (period + 1)
+    val = sum(prices[:period]) / period
+    for p in prices[period:]:
+        val = p * k + val * (1 - k)
+    return val
+
+
+def _sma(prices, period):
+    if len(prices) < period:
+        return None
+    return sum(prices[-period:]) / period
+
+
+def _rsi(closes, period=14):
+    """Wilder RSI"""
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag = sum(gains) / period
+    al = sum(losses) / period
+    for i in range(period + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        ag = (ag * (period - 1) + max(d, 0)) / period
+        al = (al * (period - 1) + max(-d, 0)) / period
+    if al == 0:
+        return 100.0
+    return 100 - (100 / (1 + ag / al))
+
+
+def _macd(closes, fast=12, slow=26, signal=9):
+    """MACD line, signal line, histogram"""
+    if len(closes) < slow + signal:
+        return None, None, None
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    if ema_fast is None or ema_slow is None:
+        return None, None, None
+    macd_line = ema_fast - ema_slow
+
+    macd_series = []
+    for i in range(slow - 1, len(closes)):
+        ef = _ema(closes[:i + 1], fast)
+        es = _ema(closes[:i + 1], slow)
+        if ef and es:
+            macd_series.append(ef - es)
+
+    if len(macd_series) < signal:
+        return macd_line, None, None
+
+    signal_line = _ema(macd_series, signal)
+    histogram = macd_line - signal_line if signal_line else None
+    return macd_line, signal_line, histogram
+
+
+def _bollinger(closes, period=20, std_dev=2.0):
+    """Bollinger Bands: upper, middle (SMA), lower"""
+    if len(closes) < period:
+        return None, None, None
+    recent = closes[-period:]
+    mid = sum(recent) / period
+    variance = sum((x - mid) ** 2 for x in recent) / period
+    std = variance ** 0.5
+    return mid + std_dev * std, mid, mid - std_dev * std
+
+
+def _atr(candles, period=14):
+    """Average True Range"""
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        high = candles[i]['high']
+        low  = candles[i]['low']
+        prev_close = candles[i - 1]['close']
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def _candle_strength(candles, lookback=5):
+    """
+    Measures momentum strength from last N candles.
+    lookback=5 (upgraded from 3 — better momentum detection)
+    Returns: +1 (bullish), -1 (bearish), 0 (neutral)
+    """
+    if len(candles) < lookback:
+        return 0
+    recent = candles[-lookback:]
+    bull = sum(1 for c in recent if c['close'] > c['open'])
+    bear = sum(1 for c in recent if c['close'] < c['open'])
+    last = candles[-1]
+    rng  = last['high'] - last['low']
+    body = abs(last['close'] - last['open'])
+    body_pct = (body / rng) if rng > 0 else 0
+
+    if bull >= 3 and body_pct > 0.5 and last['close'] > last['open']:
+        return 1
+    if bear >= 3 and body_pct > 0.5 and last['close'] < last['open']:
+        return -1
+    return 0
+
+
+# ──────────────────────────────────────────────
+#  TIMEFRAME BIAS SCORER
+# ──────────────────────────────────────────────
+
+def _score_timeframe(candles, label=""):
+    """
+    Score a single timeframe for directional bias.
+    Returns dict with bias, score, details.
+    """
+    if len(candles) < 30:
+        return {'bias': 'NEUTRAL', 'score': 0, 'details': ['Not enough candles']}
+
+    closes = [c['close'] for c in candles]
+    score_buy  = 0
+    score_sell = 0
+    details    = []
+
+    # ── EMA 9 vs 21 (short trend)
+    ema9  = _ema(closes, 9)
+    ema21 = _ema(closes, 21)
+    if ema9 and ema21:
+        if ema9 > ema21:
+            score_buy += 2
+            details.append(f"[{label}] EMA9>EMA21 → BUY +2")
+        else:
+            score_sell += 2
+            details.append(f"[{label}] EMA9<EMA21 → SELL +2")
+
+    # ── EMA 21 vs 50 (medium trend)
+    ema50 = _ema(closes, 50) if len(closes) >= 50 else None
+    if ema21 and ema50:
+        if ema21 > ema50:
+            score_buy += 1
+            details.append(f"[{label}] EMA21>EMA50 → BUY +1")
+        else:
+            score_sell += 1
+            details.append(f"[{label}] EMA21<EMA50 → SELL +1")
+
+    # ── RSI filter
+    rsi = _rsi(closes, 14)
+    if rsi < 35:
+        score_buy += 2
+        details.append(f"[{label}] RSI={rsi:.1f} OVERSOLD → BUY +2")
+    elif rsi > 65:
+        score_sell += 2
+        details.append(f"[{label}] RSI={rsi:.1f} OVERBOUGHT → SELL +2")
+    elif rsi < 50:
+        score_buy += 1
+        details.append(f"[{label}] RSI={rsi:.1f} below 50 → BUY +1")
+    else:
+        score_sell += 1
+        details.append(f"[{label}] RSI={rsi:.1f} above 50 → SELL +1")
+
+    # ── MACD histogram direction
+    macd_line, signal_line, histogram = _macd(closes)
+    if histogram is not None:
+        # ── FIX: Weak histogram (near zero) ko ignore karo
+        histogram_threshold = abs(closes[-1]) * 0.00005  # 0.005% of price
+        if abs(histogram) > histogram_threshold:
+            if histogram > 0:
+                score_buy += 2
+                details.append(f"[{label}] MACD histogram positive → BUY +2")
+            else:
+                score_sell += 2
+                details.append(f"[{label}] MACD histogram negative → SELL +2")
+        else:
+            details.append(f"[{label}] MACD histogram too weak — SKIP")
+
+        if macd_line and signal_line:
+            if macd_line > signal_line:
+                score_buy += 1
+                details.append(f"[{label}] MACD above signal → BUY +1")
+            else:
+                score_sell += 1
+                details.append(f"[{label}] MACD below signal → SELL +1")
+
+    # ── Bollinger Bands position
+    bb_upper, bb_mid, bb_lower = _bollinger(closes)
+    if bb_upper and bb_lower:
+        price = closes[-1]
+        bb_range = bb_upper - bb_lower
+        if bb_range > 0:
+            bb_pos = (price - bb_lower) / bb_range
+            if bb_pos < 0.25:
+                score_buy += 1
+                details.append(f"[{label}] Price near BB lower → BUY +1")
+            elif bb_pos > 0.75:
+                score_sell += 1
+                details.append(f"[{label}] Price near BB upper → SELL +1")
+
+    # ── Candle momentum (lookback=5 now)
+    pattern = _candle_strength(candles, lookback=5)
+    if pattern == 1:
+        score_buy += 1
+        details.append(f"[{label}] Bullish candle momentum → BUY +1")
+    elif pattern == -1:
+        score_sell += 1
+        details.append(f"[{label}] Bearish candle momentum → SELL +1")
+
+    net = score_buy - score_sell
+    if net > 0:
+        bias = 'BUY'
+        score = score_buy
+    elif net < 0:
+        bias = 'SELL'
+        score = score_sell
+    else:
+        bias = 'NEUTRAL'
+        score = 0
+
+    return {
+        'bias': bias,
+        'score': score,
+        'score_buy': score_buy,
+        'score_sell': score_sell,
+        'net': net,
+        'rsi': rsi,
+        'ema9': ema9,
+        'ema21': ema21,
+        'ema50': ema50,
+        'details': details
+    }
+
+
+# ──────────────────────────────────────────────
+#  CANDLE FETCHER
+# ──────────────────────────────────────────────
+
+def _fetch_candles(symbol, resolution, num_candles):
+    try:
+        res_seconds = {
+            '1m': 60, '3m': 180, '5m': 300,
+            '15m': 900, '30m': 1800,
+            '1h': 3600, '4h': 14400, '1d': 86400
+        }
+        sec = res_seconds.get(resolution, 300)
+        end_time   = int(_time.time())
+        start_time = end_time - (num_candles * sec)
+
+        response = make_api_request(
+            'GET',
+            f'/history/candles?resolution={resolution}&symbol={symbol}&start={start_time}&end={end_time}'
+        )
+        if not response or not response.get('result'):
+            print(f"⚠️ No candles for {symbol} @ {resolution}")
+            return []
+
+        parsed = []
+        for c in response['result']:
+            try:
+                parsed.append({
+                    'open':  float(c.get('open', 0)),
+                    'high':  float(c.get('high', 0)),
+                    'low':   float(c.get('low', 0)),
+                    'close': float(c.get('close', 0)),
+                    'time':  c.get('time', 0)
+                })
+            except Exception:
+                continue
+
+        parsed.sort(key=lambda x: x['time'])
+        print(f"📊 {symbol} @ {resolution}: {len(parsed)} candles fetched")
+        return parsed
+
+    except Exception as e:
+        print(f"❌ Error fetching {resolution} candles: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────
+#  ATR MARKET FILTER
+# ──────────────────────────────────────────────
+
+def _is_market_tradeable(candles_15m):
+    if len(candles_15m) < 15:
+        return True
+
+    atr_val = _atr(candles_15m, 14)
+    closes  = [c['close'] for c in candles_15m]
+    price   = closes[-1]
+
+    if atr_val is None or price <= 0:
+        return True
+
+    atr_pct = (atr_val / price) * 100
+
+    if atr_pct < 0.02:
+        print(f"⚠️ Market too flat: ATR={atr_pct:.4f}% — SKIPPING signal")
+        return False
+
+    print(f"✅ Market volatility OK: ATR={atr_pct:.4f}%")
+    return True
+
+
+# ──────────────────────────────────────────────
+#  MAIN SIGNAL FUNCTION — v3 (FASTER + TP/SL REF)
+# ──────────────────────────────────────────────
+
+def generate_smart_signal(reason="trade_decision"):
+    """
+    SIGNAL ENGINE v3 — Multi-Timeframe Confluence + TP/SL Reference
+
+    KEY CHANGES vs v2:
+    - 4H is ADVISORY only (not blocking) — fixes "signal bahut der" issue
+    - MIN_15M_NET reduced: 4 → 3 (faster signal generation)
+    - NEUTRAL on 4H is allowed — only 1H+15M must agree
+    - Weak MACD histogram ignored (near-zero filter)
+    - ref_entry, ref_sl, ref_tp added to signal (reading only, bot handles real SL/TP)
+    - Candle lookback upgraded 3 → 5
+
+    Logic:
+    1. Fetch 4h, 1h, 15m candles
+    2. Score each timeframe (0-10)
+    3. 1H + 15M MUST agree (required)
+    4. 4H is bonus — if agrees, confidence boost; if neutral/conflicts, warning only
+    5. 15m net score >= 3 required
+    6. ATR filter (skip flat markets)
+    7. Add ref_entry/ref_sl/ref_tp for display purposes only
+    """
+
+    symbol = BOT_STATE.get('symbol', 'ETHUSD')
+    print(f"\n{'='*60}")
+    print(f"🧠 SIGNAL ENGINE v3 — {symbol} — {datetime.now().strftime('%H:%M:%S')}")
+    print(f"{'='*60}")
+
+    # ── Step 1: Fetch candles ────────────────────────────────
+    candles_4h  = _fetch_candles(symbol, '4h',  60)
+    candles_1h  = _fetch_candles(symbol, '1h',  80)
+    candles_15m = _fetch_candles(symbol, '15m', 80)
+
+    if len(candles_4h) < 20:
+        print(f"⚠️ Not enough 4h candles ({len(candles_4h)}) — 4H will be advisory only")
+        candles_4h = None
+
+    if len(candles_1h) < 20 or len(candles_15m) < 20:
+        print(f"⚠️ Insufficient 1H/15M candle data — random fallback")
+        direction = random.choice(['BUY', 'SELL'])
+        return _make_signal(direction, 50, 'RANDOM_FALLBACK', 0, reason,
+                            {}, {}, {}, candles_15m or [])
+
+    # ── Step 2: ATR volatility filter ───────────────────────
+    if not _is_market_tradeable(candles_15m):
+        return _make_wait_signal(reason, "Market too flat (low ATR)")
+
+    # ── Step 3: Score each timeframe ────────────────────────
+    result_4h  = _score_timeframe(candles_4h,  '4H') if candles_4h else None
+    result_1h  = _score_timeframe(candles_1h,  '1H')
+    result_15m = _score_timeframe(candles_15m, '15M')
+
+    print(f"\n📊 TIMEFRAME SCORES:")
+    if result_4h:
+        print(f"   4H  → {result_4h['bias']:7s} | BUY={result_4h['score_buy']} SELL={result_4h['score_sell']} | Net={result_4h['net']} [ADVISORY]")
+    print(f"   1H  → {result_1h['bias']:7s} | BUY={result_1h['score_buy']} SELL={result_1h['score_sell']} | Net={result_1h['net']} [REQUIRED]")
+    print(f"   15M → {result_15m['bias']:7s} | BUY={result_15m['score_buy']} SELL={result_15m['score_sell']} | Net={result_15m['net']} [REQUIRED]")
+
+    bias_1h  = result_1h['bias']
+    bias_15m = result_15m['bias']
+    bias_4h  = result_4h['bias'] if result_4h else 'NEUTRAL'
+
+    # ── Step 4: Core confluence — 1H + 15M MUST agree ───────
+    # (4H is now advisory — neutral/conflict on 4H only lowers confidence)
+    if bias_1h == 'NEUTRAL' or bias_15m == 'NEUTRAL':
+        print(f"⚖️ 1H or 15M is NEUTRAL — WAIT")
+        return _make_wait_signal(reason, f"Neutral TF: 1H={bias_1h} 15M={bias_15m}")
+
+    if bias_1h != bias_15m:
+        print(f"⚡ 1H vs 15M CONFLICT — 1H={bias_1h} 15M={bias_15m} — WAIT")
+        return _make_wait_signal(reason, f"1H/15M conflict: 1H={bias_1h} 15M={bias_15m}")
+
+    # ── Step 5: Entry quality filter ────────────────────────
+    # Reduced from 4 → 3 for faster signal generation
+    MIN_15M_NET = 3
+
+    if abs(result_15m['net']) < MIN_15M_NET:
+        print(f"📉 15M signal too weak (net={result_15m['net']}, need >={MIN_15M_NET}) — WAIT")
+        return _make_wait_signal(reason,
+            f"15M weak signal: net={result_15m['net']} (need >={MIN_15M_NET})")
+
+    # ── Step 6: All checks passed → CONFIRMED ───────────────
+    direction = bias_15m
+
+    # Confidence calculation
+    # 4H agreement = full weight; 4H neutral = half weight; 4H conflict = no weight
+    w1  = 0.45
+    w15 = 0.55
+    score_1h_val  = result_1h['score']
+    score_15m_val = result_15m['score']
+    max_possible  = 10.0
+
+    conf_raw = (score_1h_val * w1 + score_15m_val * w15) / max_possible
+
+    # 4H bonus/penalty
+    if result_4h:
+        if bias_4h == direction:
+            conf_raw = min(conf_raw * 1.15, 1.0)   # +15% boost
+            print(f"   ✅ 4H AGREES ({bias_4h}) — confidence boosted")
+        elif bias_4h == 'NEUTRAL':
+            conf_raw = conf_raw * 0.95              # -5% minor penalty
+            print(f"   ⚠️ 4H NEUTRAL — slight confidence reduction")
+        else:
+            conf_raw = conf_raw * 0.85              # -15% penalty (4H disagrees)
+            print(f"   ⚠️ 4H DISAGREES ({bias_4h} vs {direction}) — confidence reduced")
+
+    confidence = int(min(50 + conf_raw * 50, 95))
+
+    layer = 'STRONG_BUY' if direction == 'BUY' else 'STRONG_SELL'
+    if result_15m['score'] < 7:
+        layer = 'MODERATE_BUY' if direction == 'BUY' else 'MODERATE_SELL'
+
+    # 4H agrees = upgrade to STRONG
+    if result_4h and bias_4h == direction and result_15m['score'] >= 5:
+        layer = 'STRONG_BUY' if direction == 'BUY' else 'STRONG_SELL'
+
+    print(f"\n✅ CONFIRMED SIGNAL: {direction}")
+    print(f"   1H={bias_1h} 15M={bias_15m} 4H={bias_4h}(advisory)")
+    print(f"   15M net score: {result_15m['net']} / max ~10")
+    print(f"   Confidence: {confidence}%  Layer: {layer}")
+
+    all_details = []
+    if result_4h: all_details += result_4h['details']
+    all_details += result_1h['details']
+    all_details += result_15m['details']
+    for d in all_details:
+        print(f"   {d}")
+
+    return _make_signal(
+        direction, confidence, layer,
+        result_15m['net'], reason,
+        result_4h or {}, result_1h, result_15m,
+        candles_15m
+    )
+
+
+# ──────────────────────────────────────────────
+#  SIGNAL BUILDER HELPERS
+# ──────────────────────────────────────────────
+
+def _make_signal(direction, confidence, layer, net_score, reason,
+                 r4h, r1h, r15m, candles_15m):
+    """
+    Build the standard signal dict.
+    ref_entry / ref_sl / ref_tp = READING ONLY (bot uses its own SL/TP logic)
+    """
+    price   = candles_15m[-1]['close'] if candles_15m else 0
+    atr_val = _atr(candles_15m, 14) if candles_15m else None
+
+    # Reference levels — display/log only, NOT used by order placement
+    if atr_val and price:
+        if direction == 'BUY':
+            ref_sl = round(price - 1.5 * atr_val, 4)
+            ref_tp = round(price + 3.0 * atr_val, 4)
+        else:
+            ref_sl = round(price + 1.5 * atr_val, 4)
+            ref_tp = round(price - 3.0 * atr_val, 4)
+    else:
+        ref_sl = None
+        ref_tp = None
+
+    print(f"   📍 Entry={price} | ref_SL={ref_sl} | ref_TP={ref_tp} (display only)")
+
+    return {
+        'signal':    direction,
+        'timestamp': datetime.now().isoformat(),
+        'confidence': confidence,
+        'layer':     layer,
+        'score':     net_score,
+        'score_buy':  r15m.get('score_buy', 0),
+        'score_sell': r15m.get('score_sell', 0),
+        'source':    'smart_signal_v3',
+
+        # ── Reference levels (READ ONLY — bot does NOT use these for orders) ──
+        'entry_price': price,    # current market price at signal time
+        'ref_sl':      ref_sl,   # ATR-based reference SL (1.5x ATR)
+        'ref_tp':      ref_tp,   # ATR-based reference TP (3.0x ATR = 2:1 RR)
+
+        'reason': (
+            f"MTF confluence: "
+            f"4H={r4h.get('bias','?')}(advisory) "
+            f"1H={r1h.get('bias','?')} "
+            f"15M={r15m.get('bias','?')} | "
+            f"Net15m={net_score}"
+        ),
+        'decision_ready':      True,
+        'decision_confidence': confidence / 100,
+        'wait':                False,
+        'position_analysis':   {'has_position': False},
+        'backtest_results': {
+            'ema9':     r15m.get('ema9'),
+            'ema21':    r15m.get('ema21'),
+            'ema50':    r15m.get('ema50'),
+            'rsi':      r15m.get('rsi'),
+            'price':    price,
+            'ref_sl':   ref_sl,
+            'ref_tp':   ref_tp,
+            'factors':  r15m.get('details', []),
+            '4h_bias':  r4h.get('bias', '?'),
+            '1h_bias':  r1h.get('bias', '?'),
+            '15m_bias': r15m.get('bias', '?'),
+        },
+        'last_trade_result': reason,
+    }
+
+
+def _make_wait_signal(reason, why):
+    """Return a WAIT signal — bot will sleep and retry"""
+    print(f"⏸️ WAIT: {why}")
+    return {
+        'signal':      'WAIT',
+        'timestamp':   datetime.now().isoformat(),
+        'confidence':  0,
+        'layer':       'WAIT',
+        'score':       0,
+        'score_buy':   0,
+        'score_sell':  0,
+        'source':      'smart_signal_v3',
+        'reason':      why,
+        'entry_price': None,
+        'ref_sl':      None,
+        'ref_tp':      None,
+        'decision_ready':      False,
+        'decision_confidence': 0,
+        'wait':                True,
+        'position_analysis':   {'has_position': False},
+        'backtest_results':    {},
+        'last_trade_result':   reason,
+    }
+ 
+

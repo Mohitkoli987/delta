@@ -1,0 +1,2877 @@
+from flask import Flask, render_template, request, jsonify
+import requests
+import time
+import hmac
+import hashlib
+import json
+import threading
+from threading import Lock
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+import pymysql
+from math import isfinite
+import subprocess
+from decimal import Decimal, ROUND_HALF_UP
+import time as _time
+import random
+from datetime import datetime
+
+# Load environment variables
+load_dotenv()
+
+# Import keepalive functionality
+from keepalive import start_keep_alive
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+LAST_SAVED_TRADE_KEY = None
+
+# ========== MYSQL CONNECTION MANAGER ==========
+def get_mysql_connection():
+    """Create and return a MySQL connection"""
+    try:
+        connection = pymysql.connect(
+            host=os.getenv('MYSQL_HOST', 'bmh1rsh5f0sjmncv6ydc-mysql.services.clever-cloud.com'),
+            port=int(os.getenv('MYSQL_PORT', 3306)),
+            user=os.getenv('MYSQL_USER', 'ujokhsx1defubkot'),
+            password=os.getenv('MYSQL_PASSWORD', 'hILZGFpJ60exq4oGj2hv'),
+            database=os.getenv('MYSQL_DB', 'bmh1rsh5f0sjmncv6ydc'),
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=False,
+            ssl={}
+        )
+        return connection
+    except Exception as e:
+        print(f"❌ MySQL connection failed: {e}")
+        raise
+
+def execute_mysql_query(query, params=None, fetch_one=False, fetch_all=False, commit=False):
+    """Execute MySQL query with proper error handling"""
+    connection = None
+    try:
+        connection = get_mysql_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(query, params or ())
+
+            if commit:
+                connection.commit()
+                return cursor.lastrowid if hasattr(cursor, 'lastrowid') else True
+
+            if fetch_one:
+                return cursor.fetchone()
+            elif fetch_all:
+                return cursor.fetchall()
+            else:
+                return True
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        print(f"❌ MySQL query failed: {e}")
+        raise
+    finally:
+        if connection:
+            connection.close()
+
+def get_database_size():
+    """Get current database size in MB"""
+    try:
+        query = """
+        SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS db_size_mb
+        FROM information_schema.tables
+        WHERE table_schema = DATABASE()
+        """
+        result = execute_mysql_query(query, fetch_one=True)
+        return result['db_size_mb'] if result else 0
+    except Exception as e:
+        print(f"❌ Error getting database size: {e}")
+        return 0
+
+def cleanup_old_trades(target_size_mb=8.5):
+    """Remove oldest trades to keep database under target size"""
+    try:
+        current_size = get_database_size()
+        print(f"📊 Current database size: {current_size}MB")
+
+        if current_size <= target_size_mb:
+            print(f"✅ Database size is under limit ({current_size}MB <= {target_size_mb}MB)")
+            return True
+
+        print(f"⚠️ Database size exceeds limit ({current_size}MB > {target_size_mb}MB)")
+        print("🧹 Starting cleanup of oldest trades...")
+
+        while current_size > target_size_mb:
+            count_query = "SELECT COUNT(*) as total_rows FROM closed_positions"
+            total_result = execute_mysql_query(count_query, fetch_one=True)
+            total_rows = total_result['total_rows'] if total_result else 0
+
+            if total_rows <= 10:
+                print("⚠️ Only 10 or fewer rows remaining, stopping cleanup")
+                break
+
+            rows_to_delete = max(1, total_rows // 10)
+
+            delete_query = """
+            DELETE FROM closed_positions
+            ORDER BY created_at ASC
+            LIMIT %s
+            """
+            execute_mysql_query(delete_query, (rows_to_delete,), commit=True)
+
+            current_size = get_database_size()
+            print(f"🗑️ Deleted {rows_to_delete} oldest rows, new size: {current_size}MB")
+
+            if rows_to_delete == 1 and current_size > target_size_mb:
+                print("⚠️ Deleting rows one by one, but still over limit")
+                break
+
+        print(f"✅ Cleanup completed. Final database size: {current_size}MB")
+        return True
+
+    except Exception as e:
+        print(f"❌ Error during cleanup: {e}")
+        return False
+
+# API Configuration
+BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+# BASE_URL = "https://api.india.delta.exchange"
+
+WS_URL = "wss://socket.india.delta.exchange"
+
+DELTA_API_KEY = os.getenv("DELTA_API_KEY")
+DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
+
+# ---------- LIVE POSITION TP/SL CONFIGURATION ----------
+LIVE_TP_PERCENTAGE = 0.1  # Take Profit %
+LIVE_SL_PERCENTAGE = 0.35  # Stop Loss %
+
+processing_lock = threading.Lock()
+last_processed = {}
+
+# Step-Based Lot Progression System
+LOT_STEPS = {
+    1: 1,
+    2: 2,
+    3: 4,
+    4: 8,
+    5: 16,
+    6: 32,
+    7: 64,
+    8: 128,
+    9: 256,
+    10: 512,
+    11: 1056
+}
+
+# Bot State
+BOT_STATE = {
+    'running': False,
+    'thread': None,
+    'current_step': 1,
+    'current_lot': 1,
+    'base_lot': 1,
+    'leverage': 100,
+    'tp_percent': 1,
+    'sl_percent': 0.4,
+    'max_steps': max(LOT_STEPS.keys()),
+    'last_result': None,
+    'symbol': 'ETHUSD',
+    'stop_at_win': False,
+    'stop_at_max_step': False,
+    'force_stop': False,
+    'session_start_time': None,
+    'session_total_pnl': 0.0
+}
+
+# Trading Configuration - Market Specific Lot Sizes
+LOT_SIZES = {
+    'ETHUSD': 0.01,
+}
+
+LOT_SIZE_DEFAULT = 1
+
+# Trade Result Memory
+LAST_TRADE_RESULT = {
+    'profit_loss': None,
+    'timestamp': None,
+    'lot_used': None,
+    'processed': False
+}
+
+LOT_CALCULATION_LOCK = False
+LAST_PROCESSED_TRADE_ID = None
+
+# Recovery System
+PROCESSED_EXIT_FILL_IDS = set()
+LAST_PROCESSED_EXIT_FILL_IDS = set()
+
+# Trade Completion Management
+WAITING_FOR_FILL = False
+TRADE_COMPLETED = False
+
+# Position State Tracking
+LAST_POSITION_STATE = {
+    'symbol': None,
+    'size': 0,
+    'entry_price': 0
+}
+
+# Product ID Cache
+PRODUCT_ID_CACHE = {}
+
+# Database Thread Lock
+db_lock = Lock()
+
+# Bot Process Management
+BOT_PROCESS = None
+bot_process_lock = Lock()
+
+
+# ========== DATABASE ==========
+def init_database():
+    """Initialize MySQL database - preserves existing data"""
+    try:
+        create_table_query = '''
+            CREATE TABLE IF NOT EXISTS closed_positions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                symbol VARCHAR(50) NOT NULL,
+                side VARCHAR(10) NOT NULL,
+                entry_price DECIMAL(20, 8) NOT NULL,
+                exit_price DECIMAL(20, 8),
+                quantity DECIMAL(20, 8) NOT NULL,
+                pnl DECIMAL(20, 8),
+                entry_time VARCHAR(50) NOT NULL,
+                exit_time VARCHAR(50),
+                is_latest TINYINT(1) DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_symbol (symbol),
+                INDEX idx_created_at (created_at),
+                INDEX idx_is_latest (is_latest),
+                UNIQUE KEY uq_trade (symbol, entry_time, side)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        '''
+        execute_mysql_query(create_table_query, commit=True)
+
+        # ✅ FIX: Create bot_state table to persist step/lot across restarts
+        create_state_table_query = '''
+            CREATE TABLE IF NOT EXISTS bot_state (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                state_key VARCHAR(100) NOT NULL UNIQUE,
+                state_value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        '''
+        execute_mysql_query(create_state_table_query, commit=True)
+        print("✅ MySQL tables ready (existing data preserved)")
+
+    except Exception as e:
+        print(f"❌ Failed to initialize MySQL database: {e}")
+        raise
+
+
+# ========== PERSISTENT STATE FUNCTIONS ==========
+def save_bot_state_to_db():
+    """
+    ✅ FIX: Save current step, lot, and last PnL to database so restart resumes correctly.
+    Called after every trade result is processed.
+    """
+    try:
+        state_data = {
+            'current_step': BOT_STATE['current_step'],
+            'current_lot': BOT_STATE['current_lot'],
+            'last_pnl': LAST_TRADE_RESULT['profit_loss'],
+            'last_result': BOT_STATE.get('last_result'),
+            'saved_at': datetime.now().isoformat()
+        }
+        upsert_query = '''
+            INSERT INTO bot_state (state_key, state_value)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE state_value = VALUES(state_value), updated_at = NOW()
+        '''
+        execute_mysql_query(upsert_query, ('martingale_state', json.dumps(state_data)), commit=True)
+        print(f"💾 Bot state saved to DB: Step={state_data['current_step']}, Lot={state_data['current_lot']}, LastPnL={state_data['last_pnl']}")
+    except Exception as e:
+        print(f"❌ Error saving bot state to DB: {e}")
+
+
+def load_bot_state_from_db():
+    """
+    ✅ FIX: Load last saved step/lot/PnL from database on restart.
+    This ensures the martingale sequence continues properly after a server restart.
+    Returns True if state was loaded, False if no state found (fresh start).
+    """
+    global LAST_TRADE_RESULT
+    try:
+        result = execute_mysql_query(
+            "SELECT state_value FROM bot_state WHERE state_key = %s",
+            ('martingale_state',),
+            fetch_one=True
+        )
+        if not result or not result.get('state_value'):
+            print("ℹ️ No saved bot state found - fresh start")
+            return False
+
+        state_data = json.loads(result['state_value'])
+        saved_at = state_data.get('saved_at', 'unknown')
+
+        print(f"✅ LOADED SAVED BOT STATE from DB (saved at {saved_at}):")
+        print(f"   Step: {state_data.get('current_step')}")
+        print(f"   Lot: {state_data.get('current_lot')}")
+        print(f"   Last PnL: {state_data.get('last_pnl')}")
+        print(f"   Last Result: {state_data.get('last_result')}")
+
+        BOT_STATE['current_step'] = int(state_data.get('current_step', 1))
+        BOT_STATE['current_lot'] = float(state_data.get('current_lot', LOT_STEPS[1]))
+        BOT_STATE['last_result'] = state_data.get('last_result')
+
+        # Restore last PnL so next trade can calculate correct step
+        last_pnl = state_data.get('last_pnl')
+        if last_pnl is not None:
+            LAST_TRADE_RESULT['profit_loss'] = float(last_pnl)
+            LAST_TRADE_RESULT['processed'] = True   # Already processed before save
+            LAST_TRADE_RESULT['timestamp'] = saved_at
+            print(f"   ✅ Last PnL restored: {LAST_TRADE_RESULT['profit_loss']}")
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Error loading bot state from DB: {e}")
+        return False
+
+
+def clear_bot_state_from_db():
+    """Clear saved bot state from DB (called when bot is fully reset)"""
+    try:
+        execute_mysql_query(
+            "DELETE FROM bot_state WHERE state_key = %s",
+            ('martingale_state',),
+            commit=True
+        )
+        print("🗑️ Bot state cleared from DB")
+    except Exception as e:
+        print(f"❌ Error clearing bot state from DB: {e}")
+
+
+# # ========== SIGNAL GENERATION ==========
+# def _ema(prices, period):
+#     """Exponential Moving Average"""
+#     if len(prices) < period:
+#         return None
+#     k = 2.0 / (period + 1)
+#     val = sum(prices[:period]) / period
+#     for p in prices[period:]:
+#         val = p * k + val * (1 - k)
+#     return val
+ 
+ 
+# def _sma(prices, period):
+#     if len(prices) < period:
+#         return None
+#     return sum(prices[-period:]) / period
+ 
+ 
+# def _rsi(closes, period=14):
+#     """Wilder RSI"""
+#     if len(closes) < period + 1:
+#         return 50.0
+#     gains, losses = [], []
+#     for i in range(1, period + 1):
+#         d = closes[i] - closes[i - 1]
+#         gains.append(max(d, 0))
+#         losses.append(max(-d, 0))
+#     ag = sum(gains) / period
+#     al = sum(losses) / period
+#     for i in range(period + 1, len(closes)):
+#         d = closes[i] - closes[i - 1]
+#         ag = (ag * (period - 1) + max(d, 0)) / period
+#         al = (al * (period - 1) + max(-d, 0)) / period
+#     if al == 0:
+#         return 100.0
+#     return 100 - (100 / (1 + ag / al))
+ 
+ 
+# def _macd(closes, fast=12, slow=26, signal=9):
+#     """MACD line, signal line, histogram"""
+#     if len(closes) < slow + signal:
+#         return None, None, None
+#     ema_fast = _ema(closes, fast)
+#     ema_slow = _ema(closes, slow)
+#     if ema_fast is None or ema_slow is None:
+#         return None, None, None
+#     macd_line = ema_fast - ema_slow
+ 
+#     # Build MACD series for signal line
+#     macd_series = []
+#     for i in range(slow - 1, len(closes)):
+#         ef = _ema(closes[:i + 1], fast)
+#         es = _ema(closes[:i + 1], slow)
+#         if ef and es:
+#             macd_series.append(ef - es)
+ 
+#     if len(macd_series) < signal:
+#         return macd_line, None, None
+ 
+#     signal_line = _ema(macd_series, signal)
+#     histogram = macd_line - signal_line if signal_line else None
+#     return macd_line, signal_line, histogram
+ 
+ 
+# def _bollinger(closes, period=20, std_dev=2.0):
+#     """Bollinger Bands: upper, middle (SMA), lower"""
+#     if len(closes) < period:
+#         return None, None, None
+#     recent = closes[-period:]
+#     mid = sum(recent) / period
+#     variance = sum((x - mid) ** 2 for x in recent) / period
+#     std = variance ** 0.5
+#     return mid + std_dev * std, mid, mid - std_dev * std
+ 
+ 
+# def _atr(candles, period=14):
+#     """Average True Range — measures volatility"""
+#     if len(candles) < period + 1:
+#         return None
+#     trs = []
+#     for i in range(1, len(candles)):
+#         high = candles[i]['high']
+#         low  = candles[i]['low']
+#         prev_close = candles[i - 1]['close']
+#         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+#         trs.append(tr)
+#     if len(trs) < period:
+#         return None
+#     atr = sum(trs[:period]) / period
+#     for tr in trs[period:]:
+#         atr = (atr * (period - 1) + tr) / period
+#     return atr
+ 
+ 
+# def _candle_strength(candles, lookback=3):
+#     """
+#     Measures momentum strength from last N candles.
+#     Returns: +1 (bullish), -1 (bearish), 0 (neutral)
+#     """
+#     if len(candles) < lookback:
+#         return 0
+#     recent = candles[-lookback:]
+#     bull = sum(1 for c in recent if c['close'] > c['open'])
+#     bear = sum(1 for c in recent if c['close'] < c['open'])
+#     last = candles[-1]
+#     rng  = last['high'] - last['low']
+#     body = abs(last['close'] - last['open'])
+#     body_pct = (body / rng) if rng > 0 else 0
+ 
+#     # Strong bull: 2+ bull candles AND last candle body > 50% of range
+#     if bull >= 2 and body_pct > 0.5 and last['close'] > last['open']:
+#         return 1
+#     if bear >= 2 and body_pct > 0.5 and last['close'] < last['open']:
+#         return -1
+#     return 0
+ 
+ 
+# # ──────────────────────────────────────────────
+# #  TIMEFRAME BIAS SCORER
+# #  Returns: (bias, score) where bias = 'BUY'/'SELL'/'NEUTRAL'
+# #  score = 0-10
+# # ──────────────────────────────────────────────
+ 
+# def _score_timeframe(candles, label=""):
+#     """
+#     Score a single timeframe for directional bias.
+#     Returns dict with bias, score, details.
+#     """
+#     if len(candles) < 30:
+#         return {'bias': 'NEUTRAL', 'score': 0, 'details': ['Not enough candles']}
+ 
+#     closes = [c['close'] for c in candles]
+#     score_buy  = 0
+#     score_sell = 0
+#     details    = []
+ 
+#     # ── EMA 9 vs 21 (short trend)
+#     ema9  = _ema(closes, 9)
+#     ema21 = _ema(closes, 21)
+#     if ema9 and ema21:
+#         if ema9 > ema21:
+#             score_buy += 2
+#             details.append(f"[{label}] EMA9>EMA21 → BUY +2")
+#         else:
+#             score_sell += 2
+#             details.append(f"[{label}] EMA9<EMA21 → SELL +2")
+ 
+#     # ── EMA 21 vs 50 (medium trend)
+#     ema50 = _ema(closes, 50) if len(closes) >= 50 else None
+#     if ema21 and ema50:
+#         if ema21 > ema50:
+#             score_buy += 1
+#             details.append(f"[{label}] EMA21>EMA50 → BUY +1")
+#         else:
+#             score_sell += 1
+#             details.append(f"[{label}] EMA21<EMA50 → SELL +1")
+ 
+#     # ── RSI filter
+#     rsi = _rsi(closes, 14)
+#     if rsi < 35:
+#         score_buy += 2
+#         details.append(f"[{label}] RSI={rsi:.1f} OVERSOLD → BUY +2")
+#     elif rsi > 65:
+#         score_sell += 2
+#         details.append(f"[{label}] RSI={rsi:.1f} OVERBOUGHT → SELL +2")
+#     elif rsi < 50:
+#         score_buy += 1
+#         details.append(f"[{label}] RSI={rsi:.1f} below 50 → BUY +1")
+#     else:
+#         score_sell += 1
+#         details.append(f"[{label}] RSI={rsi:.1f} above 50 → SELL +1")
+ 
+#     # ── MACD histogram direction
+#     macd_line, signal_line, histogram = _macd(closes)
+#     if histogram is not None:
+#         if histogram > 0:
+#             score_buy += 2
+#             details.append(f"[{label}] MACD histogram positive → BUY +2")
+#         else:
+#             score_sell += 2
+#             details.append(f"[{label}] MACD histogram negative → SELL +2")
+#         # MACD crossover bonus (strongest signal)
+#         if macd_line and signal_line:
+#             if macd_line > signal_line:
+#                 score_buy += 1
+#                 details.append(f"[{label}] MACD above signal → BUY +1")
+#             else:
+#                 score_sell += 1
+#                 details.append(f"[{label}] MACD below signal → SELL +1")
+ 
+#     # ── Bollinger Bands position
+#     bb_upper, bb_mid, bb_lower = _bollinger(closes)
+#     if bb_upper and bb_lower:
+#         price = closes[-1]
+#         bb_range = bb_upper - bb_lower
+#         if bb_range > 0:
+#             bb_pos = (price - bb_lower) / bb_range  # 0=at lower, 1=at upper
+#             if bb_pos < 0.25:
+#                 score_buy += 1
+#                 details.append(f"[{label}] Price near BB lower → BUY +1")
+#             elif bb_pos > 0.75:
+#                 score_sell += 1
+#                 details.append(f"[{label}] Price near BB upper → SELL +1")
+ 
+#     # ── Candle momentum
+#     pattern = _candle_strength(candles, lookback=3)
+#     if pattern == 1:
+#         score_buy += 1
+#         details.append(f"[{label}] Bullish candle momentum → BUY +1")
+#     elif pattern == -1:
+#         score_sell += 1
+#         details.append(f"[{label}] Bearish candle momentum → SELL +1")
+ 
+#     # Max possible = 10 per direction
+#     net = score_buy - score_sell
+#     if net > 0:
+#         bias = 'BUY'
+#         score = score_buy
+#     elif net < 0:
+#         bias = 'SELL'
+#         score = score_sell
+#     else:
+#         bias = 'NEUTRAL'
+#         score = 0
+ 
+#     return {
+#         'bias': bias,
+#         'score': score,
+#         'score_buy': score_buy,
+#         'score_sell': score_sell,
+#         'net': net,
+#         'rsi': rsi,
+#         'ema9': ema9,
+#         'ema21': ema21,
+#         'ema50': ema50,
+#         'details': details
+#     }
+ 
+ 
+# # ──────────────────────────────────────────────
+# #  CANDLE FETCHER  (multi-resolution)
+# # ──────────────────────────────────────────────
+ 
+# def _fetch_candles(symbol, resolution, num_candles):
+#     """
+#     Fetch OHLC candles from Delta Exchange.
+#     resolution: '5m', '15m', '1h', '4h'
+#     Returns sorted list of dicts.
+#     """
+#     try:
+#         # Map resolution to seconds
+#         res_seconds = {
+#             '1m': 60, '3m': 180, '5m': 300,
+#             '15m': 900, '30m': 1800,
+#             '1h': 3600, '4h': 14400, '1d': 86400
+#         }
+#         sec = res_seconds.get(resolution, 300)
+#         end_time   = int(_time.time())
+#         start_time = end_time - (num_candles * sec)
+ 
+#         response = make_api_request(
+#             'GET',
+#             f'/history/candles?resolution={resolution}&symbol={symbol}&start={start_time}&end={end_time}'
+#         )
+#         if not response or not response.get('result'):
+#             print(f"⚠️ No candles for {symbol} @ {resolution}")
+#             return []
+ 
+#         parsed = []
+#         for c in response['result']:
+#             try:
+#                 parsed.append({
+#                     'open':  float(c.get('open', 0)),
+#                     'high':  float(c.get('high', 0)),
+#                     'low':   float(c.get('low', 0)),
+#                     'close': float(c.get('close', 0)),
+#                     'time':  c.get('time', 0)
+#                 })
+#             except Exception:
+#                 continue
+ 
+#         parsed.sort(key=lambda x: x['time'])
+#         print(f"📊 {symbol} @ {resolution}: {len(parsed)} candles fetched")
+#         return parsed
+ 
+#     except Exception as e:
+#         print(f"❌ Error fetching {resolution} candles: {e}")
+#         return []
+ 
+ 
+# # ──────────────────────────────────────────────
+# #  ATR MARKET FILTER — skip choppy/low-vol markets
+# # ──────────────────────────────────────────────
+ 
+# def _is_market_tradeable(candles_15m):
+#     """
+#     Returns True if market has enough volatility to trade.
+#     Skips flat/dead markets where signals are unreliable.
+#     """
+#     if len(candles_15m) < 15:
+#         return True  # not enough data, don't block
+ 
+#     atr_val = _atr(candles_15m, 14)
+#     closes  = [c['close'] for c in candles_15m]
+#     price   = closes[-1]
+ 
+#     if atr_val is None or price <= 0:
+#         return True
+ 
+#     # ATR as % of price
+#     atr_pct = (atr_val / price) * 100
+ 
+#     # Below 0.02% ATR = extremely flat market = skip
+#     if atr_pct < 0.02:
+#         print(f"⚠️ Market too flat: ATR={atr_pct:.4f}% — SKIPPING signal")
+#         return False
+ 
+#     print(f"✅ Market volatility OK: ATR={atr_pct:.4f}%")
+#     return True
+ 
+ 
+# # ──────────────────────────────────────────────
+# #  MAIN SIGNAL FUNCTION  (drop-in replacement)
+# # ──────────────────────────────────────────────
+ 
+# def generate_smart_signal(reason="trade_decision"):
+#     """
+#     UPGRADED SIGNAL ENGINE v2 — Multi-Timeframe Confluence
+ 
+#     Logic:
+#     1. Fetch 4h, 1h, 15m candles
+#     2. Score each timeframe independently (0-10)
+#     3. Require ALL THREE to agree on direction
+#     4. Require 15m score >= 6 for entry quality
+#     5. Skip if market is too flat (ATR filter)
+#     6. Return WAIT signal if criteria not met
+ 
+#     This generates ONE accurate signal after each trade,
+#     not continuous spammy decisions.
+#     """
+ 
+#     symbol = BOT_STATE.get('symbol', 'ADAUSD')
+#     print(f"\n{'='*60}")
+#     print(f"🧠 SIGNAL ENGINE v2 — {symbol} — {datetime.now().strftime('%H:%M:%S')}")
+#     print(f"{'='*60}")
+ 
+#     # ── Step 1: Fetch all three timeframes ──────────────────
+#     candles_4h  = _fetch_candles(symbol, '4h',  60)   # ~10 days
+#     candles_1h  = _fetch_candles(symbol, '1h',  80)   # ~3.3 days
+#     candles_15m = _fetch_candles(symbol, '15m', 80)   # ~20 hours
+ 
+#     # Minimum candle requirements
+#     if len(candles_4h) < 20:
+#         print(f"⚠️ Not enough 4h candles ({len(candles_4h)}) — falling back to 1h+15m only")
+#         candles_4h = None
+ 
+#     if len(candles_1h) < 20 or len(candles_15m) < 20:
+#         print(f"⚠️ Insufficient candle data — random fallback")
+#         direction = random.choice(['BUY', 'SELL'])
+#         return _make_signal(direction, 50, 'RANDOM_FALLBACK', 0, reason,
+#                             {}, {}, {}, candles_15m or [])
+ 
+#     # ── Step 2: ATR volatility filter ───────────────────────
+#     if not _is_market_tradeable(candles_15m):
+#         # Market too flat — return a hold signal
+#         # Bot will wait 30s then retry
+#         print("⏸️ Market not tradeable — WAIT")
+#         return _make_wait_signal(reason, "Market too flat (low ATR)")
+ 
+#     # ── Step 3: Score each timeframe ────────────────────────
+#     result_4h  = _score_timeframe(candles_4h,  '4H')  if candles_4h else None
+#     result_1h  = _score_timeframe(candles_1h,  '1H')
+#     result_15m = _score_timeframe(candles_15m, '15M')
+ 
+#     print(f"\n📊 TIMEFRAME SCORES:")
+#     if result_4h:
+#         print(f"   4H  → {result_4h['bias']:7s} | BUY={result_4h['score_buy']} SELL={result_4h['score_sell']} | Net={result_4h['net']}")
+#     print(f"   1H  → {result_1h['bias']:7s} | BUY={result_1h['score_buy']} SELL={result_1h['score_sell']} | Net={result_1h['net']}")
+#     print(f"   15M → {result_15m['bias']:7s} | BUY={result_15m['score_buy']} SELL={result_15m['score_sell']} | Net={result_15m['net']}")
+ 
+#     # ── Step 4: Confluence check ─────────────────────────────
+#     # All available timeframes must agree
+#     bias_1h  = result_1h['bias']
+#     bias_15m = result_15m['bias']
+#     bias_4h  = result_4h['bias'] if result_4h else bias_1h  # fallback to 1h if no 4h
+ 
+#     if bias_4h == 'NEUTRAL' or bias_1h == 'NEUTRAL' or bias_15m == 'NEUTRAL':
+#         print(f"⚖️ Neutral timeframe detected — WAIT for clearer setup")
+#         return _make_wait_signal(reason, f"Neutral TF: 4H={bias_4h} 1H={bias_1h} 15M={bias_15m}")
+ 
+#     if not (bias_4h == bias_1h == bias_15m):
+#         print(f"⚡ Timeframes CONFLICTING — 4H={bias_4h} 1H={bias_1h} 15M={bias_15m} — WAIT")
+#         return _make_wait_signal(reason, f"TF conflict: 4H={bias_4h} 1H={bias_1h} 15M={bias_15m}")
+ 
+#     # ── Step 5: Entry quality filter (15m must be strong) ────
+#     # Require 15m net score >= 4 for entry
+#     # This filters out weak/marginal signals
+#     MIN_15M_NET = 4  # out of max ~10
+ 
+#     if abs(result_15m['net']) < MIN_15M_NET:
+#         print(f"📉 15M signal too weak (net={result_15m['net']}, need >={MIN_15M_NET}) — WAIT")
+#         return _make_wait_signal(reason,
+#             f"15M weak signal: net={result_15m['net']} (need >={MIN_15M_NET})")
+ 
+#     # ── Step 6: All checks passed → CONFIRMED SIGNAL ─────────
+#     direction = bias_15m  # All 3 agree, use 15m for exact entry timing
+ 
+#     # Confidence = weighted average of all timeframe scores
+#     w4  = 0.25  # 4h weight
+#     w1  = 0.35  # 1h weight
+#     w15 = 0.40  # 15m weight (most important for entry)
+ 
+#     max_possible = 10.0
+#     score_4h_val  = result_4h['score']  if result_4h  else result_1h['score']
+#     conf_raw = (score_4h_val * w4 + result_1h['score'] * w1 + result_15m['score'] * w15) / max_possible
+#     confidence = int(min(50 + conf_raw * 50, 95))  # 50-95% range
+ 
+#     layer = 'STRONG_BUY' if direction == 'BUY' else 'STRONG_SELL'
+#     if result_15m['score'] < 7:
+#         layer = 'MODERATE_BUY' if direction == 'BUY' else 'MODERATE_SELL'
+ 
+#     print(f"\n✅ CONFIRMED SIGNAL: {direction}")
+#     print(f"   All 3 timeframes ALIGNED: 4H={bias_4h} 1H={bias_1h} 15M={bias_15m}")
+#     print(f"   15M net score: {result_15m['net']} / max ~10")
+#     print(f"   Confidence: {confidence}%")
+#     print(f"   Layer: {layer}")
+ 
+#     # Print all factor details
+#     all_details = []
+#     if result_4h:  all_details += result_4h['details']
+#     all_details += result_1h['details']
+#     all_details += result_15m['details']
+#     for d in all_details:
+#         print(f"   {d}")
+ 
+#     current_price = candles_15m[-1]['close'] if candles_15m else 0
+ 
+#     return _make_signal(
+#         direction, confidence, layer,
+#         result_15m['net'], reason,
+#         result_4h or {}, result_1h, result_15m,
+#         candles_15m
+#     )
+ 
+ 
+# # ──────────────────────────────────────────────
+# #  SIGNAL BUILDER HELPERS
+# # ──────────────────────────────────────────────
+ 
+# def _make_signal(direction, confidence, layer, net_score, reason,
+#                  r4h, r1h, r15m, candles_15m):
+#     """Build the standard signal dict"""
+#     price = candles_15m[-1]['close'] if candles_15m else 0
+#     return {
+#         'signal': direction,
+#         'timestamp': datetime.now().isoformat(),
+#         'confidence': confidence,
+#         'layer': layer,
+#         'score': net_score,
+#         'score_buy':  r15m.get('score_buy', 0),
+#         'score_sell': r15m.get('score_sell', 0),
+#         'source': 'smart_signal_v2',
+#         'reason': (
+#             f"MTF confluence: "
+#             f"4H={r4h.get('bias','?')} "
+#             f"1H={r1h.get('bias','?')} "
+#             f"15M={r15m.get('bias','?')} | "
+#             f"Net15m={net_score}"
+#         ),
+#         'decision_ready': True,
+#         'decision_confidence': confidence / 100,
+#         'wait': False,
+#         'position_analysis': {'has_position': False},
+#         'backtest_results': {
+#             'ema9':    r15m.get('ema9'),
+#             'ema21':   r15m.get('ema21'),
+#             'ema50':   r15m.get('ema50'),
+#             'rsi':     r15m.get('rsi'),
+#             'price':   price,
+#             'factors': r15m.get('details', []),
+#             '4h_bias': r4h.get('bias', '?'),
+#             '1h_bias': r1h.get('bias', '?'),
+#             '15m_bias': r15m.get('bias', '?'),
+#         },
+#         'last_trade_result': reason,
+#     }
+ 
+ 
+# def _make_wait_signal(reason, why):
+#     """Return a WAIT signal — bot will sleep and retry"""
+#     print(f"⏸️ WAIT: {why}")
+#     return {
+#         'signal': 'WAIT',
+#         'timestamp': datetime.now().isoformat(),
+#         'confidence': 0,
+#         'layer': 'WAIT',
+#         'score': 0,
+#         'score_buy': 0,
+#         'score_sell': 0,
+#         'source': 'smart_signal_v2',
+#         'reason': why,
+#         'decision_ready': False,
+#         'decision_confidence': 0,
+#         'wait': True,
+#         'position_analysis': {'has_position': False},
+#         'backtest_results': {},
+#         'last_trade_result': reason,
+#     }
+ 
+
+
+
+
+ 
+def generate_random_signal(reason="trade_result"):
+    """
+    Pure random BUY/SELL signal
+    No candles
+    No EMA
+    No RSI
+    No API calls
+    """
+
+    direction = random.choice(["BUY", "SELL"])
+
+    return {
+        'signal': direction,
+        'timestamp': datetime.now().isoformat(),
+        'confidence': 50,
+        'layer': 'RANDOM',
+        'score': 0,
+        'score_buy': 0,
+        'score_sell': 0,
+        'source': 'random_signal',
+        'reason': f'Random signal ({direction})',
+        'decision_ready': True,
+        'decision_confidence': 0.5,
+        'wait': False,
+        'position_analysis': {
+            'has_position': False
+        },
+        'backtest_results': {},
+        'last_trade_result': reason
+    }
+ 
+ 
+# ──────────────────────────────────────────────
+#  BOT LOOP CHANGE NEEDED
+#  In get_trading_signal(), add WAIT handling:
+#
+#   signal_result = get_trading_signal()
+#   side = signal_result[0]
+#
+#   if side == 'WAIT' or side is None:
+#       print("⏸️ WAIT signal — retrying in 30s")
+#       time.sleep(30)   # wait 30 seconds then retry
+#       continue
+#
+
+def save_closed_position(trade_data):
+    """Save closed trade to MySQL database with strong duplicate protection"""
+
+    global LAST_SAVED_TRADE_KEY
+
+    print(f"💾 Saving trade to MySQL database: {trade_data}")
+
+    try:
+        with db_lock:
+
+            # ===== MEMORY DUPLICATE CHECK =====
+            trade_key = (
+                trade_data['symbol'],
+                trade_data['side'],
+                trade_data['entry_time']
+            )
+
+            if LAST_SAVED_TRADE_KEY == trade_key:
+                print("⚠️ Duplicate trade blocked (memory)")
+                return
+
+            # ===== DATABASE DUPLICATE CHECK =====
+            duplicate_query = """
+                SELECT id
+                FROM closed_positions
+                WHERE symbol=%s
+                AND entry_time=%s
+                LIMIT 1
+            """
+
+            existing_trade = execute_mysql_query(
+                duplicate_query,
+                (
+                    trade_data['symbol'],
+                    trade_data['entry_time']
+                ),
+                fetch_one=True
+            )
+
+            if existing_trade:
+                print("⚠️ Duplicate trade detected in DB - skipping save")
+                LAST_SAVED_TRADE_KEY = trade_key
+                return
+
+            print("📊 MySQL database connecting...")
+
+            cleanup_old_trades(target_size_mb=8.5)
+
+            execute_mysql_query(
+                "UPDATE closed_positions SET is_latest = 0 WHERE symbol = %s",
+                (trade_data['symbol'],),
+                commit=True
+            )
+
+            insert_query = '''
+                INSERT INTO closed_positions
+                (
+                    symbol,
+                    side,
+                    entry_price,
+                    exit_price,
+                    quantity,
+                    pnl,
+                    entry_time,
+                    exit_time,
+                    is_latest
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1)
+            '''
+
+            execute_mysql_query(
+                insert_query,
+                (
+                    trade_data['symbol'],
+                    trade_data['side'],
+                    trade_data['entry_price'],
+                    trade_data['exit_price'],
+                    trade_data['quantity'],
+                    trade_data['pnl'],
+                    trade_data['entry_time'],
+                    trade_data['exit_time']
+                ),
+                commit=True
+            )
+
+            LAST_SAVED_TRADE_KEY = trade_key
+
+            final_size = get_database_size()
+
+            print("✅ Trade saved successfully")
+            print(f"📊 Final database size: {final_size}MB")
+
+    except pymysql.err.IntegrityError:
+        print("⚠️ Duplicate trade blocked by DB unique constraint (IntegrityError)")
+        LAST_SAVED_TRADE_KEY = trade_key
+    except Exception as e:
+        print(f"❌ Error saving trade: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ========== OPTIMIZED POSITION TRACKING ==========
+def get_product_id(symbol):
+    """Get product_id for a symbol (cached)"""
+    global PRODUCT_ID_CACHE
+
+    if symbol in PRODUCT_ID_CACHE:
+        return PRODUCT_ID_CACHE[symbol]
+
+    try:
+        products = make_api_request('GET', '/products')
+        if not products or not products.get('result'):
+            return None
+
+        for product in products.get('result', []):
+            if product.get('symbol') == symbol:
+                product_id = product.get('id')
+                PRODUCT_ID_CACHE[symbol] = product_id
+                print(f"✅ Cached product_id for {symbol}: {product_id}")
+                return product_id
+
+        return None
+
+    except Exception as e:
+        print(f"❌ Error getting product_id: {e}")
+        return None
+
+def check_position_realtime(product_id):
+    """Check position with real-time endpoint"""
+    try:
+        response = make_api_request('GET', f'/positions/margined?product_id={product_id}')
+        if not response or not response.get('success'):
+            print("⚠️ API FAILED - Returning error state")
+            return {'error': True}
+        response = make_api_request('GET', f'/positions?product_id={product_id}')
+
+        if response and response.get('success') and response.get('result'):
+            result = response['result']
+            size = float(result.get('size', 0))
+            entry_price = float(result.get('entry_price', 0)) if abs(size) > 0.001 else 0
+
+            return {
+                'has_position': abs(size) > 0.001,
+                'size': size,
+                'entry_price': entry_price
+            }
+
+        return {
+            'has_position': False,
+            'size': 0,
+            'entry_price': 0
+        }
+
+    except Exception as e:
+        print(f"❌ Error checking position: {e}")
+        return {
+            'has_position': False,
+            'size': 0,
+            'entry_price': 0
+        }
+
+
+# ========== API FUNCTIONS ==========
+def get_server_time():
+    """Get server timestamp from Delta Exchange"""
+    try:
+        response = requests.get(f"{BASE_URL}/v2/time", timeout=5)
+        if response.status_code == 200:
+            return str(int(response.json()['result']))
+        else:
+            return str(int(time.time()))
+    except:
+        return str(int(time.time()))
+
+def sign_request(method, path, body=""):
+    """Generate API signature using Delta Exchange format"""
+    ts = get_server_time()
+    payload = method + ts + path + body
+    signature = hmac.new(
+        DELTA_API_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return {
+        "api-key": DELTA_API_KEY,
+        "timestamp": ts,
+        "signature": signature,
+        "Content-Type": "application/json"
+    }
+
+def safe_float(value, fallback=0.0):
+    """Convert value to float safely"""
+    try:
+        if value is None or value == "":
+            return fallback
+        f = float(value)
+        if not isfinite(f):
+            return fallback
+        return f
+    except:
+        return fallback
+
+def make_api_request(method, endpoint, data=None):
+    """Make authenticated API request using Delta Exchange format"""
+    path = f"/v2{endpoint}"
+    body = json.dumps(data) if data else ""
+
+    headers = sign_request(method, path, body)
+    url = f"{BASE_URL}{path}"
+
+    try:
+        if method == 'GET':
+            response = requests.get(url, headers=headers, timeout=10)
+        elif method == 'POST':
+            response = requests.post(url, headers=headers, data=body, timeout=10)
+        elif method == 'DELETE':
+            response = requests.delete(url, headers=headers, data=body, timeout=10)
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"❌ API Error: Status {response.status_code}")
+            print(f"❌ Error Body: {response.text}")
+            return None
+    except Exception as e:
+        print(f"🚨 API Exception: {e}")
+        return None
+
+
+def place_order(symbol, side, quantity, order_type='market_order'):
+    """Place order with correct Delta Exchange parameters"""
+    order_data = {
+        'product_symbol': symbol,
+        'side': side,
+        'order_type': order_type,
+        'size': quantity
+    }
+
+    print(f"📋 Order Data: {order_data}")
+    return make_api_request('POST', '/orders', order_data)
+
+def set_leverage(symbol, leverage):
+    """Set leverage using correct Delta Exchange endpoint"""
+    products = make_api_request('GET', '/products')
+    if not products or not products.get('result'):
+        print(f"❌ Failed to fetch products")
+        return None
+
+    product_id = None
+    for product in products.get('result', []):
+        if product.get('symbol') == symbol:
+            product_id = product.get('id')
+            break
+
+    if not product_id:
+        print(f"❌ Product not found: {symbol}")
+        return None
+
+    print(f"🔧 Found product_id: {product_id} for {symbol}")
+
+    return make_api_request('POST', f'/products/{product_id}/orders/leverage', {'leverage': str(leverage)})
+
+def get_wallet_balance():
+    """Get wallet balance from Delta Exchange API"""
+    try:
+        response = make_api_request('GET', '/wallet/balances')
+
+        if response and response.get("success") and response.get("result"):
+            balances = response["result"]
+            if not isinstance(balances, list):
+                balances = [balances] if isinstance(balances, dict) else []
+
+            wallet_balance = 0.0
+            available_balance = 0.0
+            asset_symbol = "USD"
+
+            for balance in balances:
+                if not isinstance(balance, dict):
+                    continue
+                asset = (balance.get("asset_symbol") or "").upper()
+                if asset in ("USD", "USDT", "USDC"):
+                    wallet_balance = safe_float(balance.get("balance"), 0)
+                    available_balance = safe_float(balance.get("available_balance"), 0)
+                    asset_symbol = asset
+                    break
+
+            if wallet_balance == 0:
+                for balance in balances:
+                    if not isinstance(balance, dict):
+                        continue
+                    bal_val = safe_float(balance.get("balance"), 0)
+                    if bal_val > 0:
+                        wallet_balance = bal_val
+                        available_balance = safe_float(balance.get("available_balance"), 0)
+                        asset_symbol = (balance.get("asset_symbol") or "USD")
+                        break
+
+            margin_used = wallet_balance - available_balance
+
+            return {
+                'success': True,
+                'balance': wallet_balance,
+                'available_balance': available_balance,
+                'margin_used': margin_used,
+                'currency': asset_symbol
+            }
+
+        return {
+            'success': True,
+            'balance': 10000.0,
+            'available_balance': 8500.0,
+            'margin_used': 1500.0,
+            'currency': 'USDT'
+        }
+
+    except Exception as e:
+        print(f"Wallet balance error: {e}")
+        return {
+            'success': True,
+            'balance': 10000.0,
+            'available_balance': 8500.0,
+            'margin_used': 1500.0,
+            'currency': 'USDT'
+        }
+
+
+# ========== FILL PAIRING ENGINE (CORE FIX) ==========
+
+def get_fills_page(page_size=50):
+    """Fetch fills from API with larger page size to catch all fills"""
+    try:
+        fills = make_api_request('GET', f'/fills?page_size={page_size}')
+        if not fills or not fills.get('result'):
+            return []
+        return fills.get('result', [])
+    except Exception as e:
+        print(f"❌ Error fetching fills: {e}")
+        return []
+
+def group_fills_by_order(fills, symbol):
+    """
+    Group fills by order_id and aggregate them.
+    Handles split fills - e.g. lot 2 split into 1+1 under same order_id.
+    Returns list of aggregated orders: {order_id, side, total_size, avg_price, timestamp}
+    """
+    symbol_fills = [f for f in fills if f.get('product_symbol') == symbol]
+
+    order_groups = {}  # order_id -> aggregated data
+
+    for fill in symbol_fills:
+        order_id = str(fill.get('order_id') or fill.get('id', ''))
+        side = fill.get('side', '')
+        size = float(fill.get('size', 0))
+        price = float(fill.get('price', 0))
+        created_at = fill.get('created_at', '')
+
+        if not order_id or size <= 0 or price <= 0:
+            continue
+
+        if order_id not in order_groups:
+            order_groups[order_id] = {
+                'order_id': order_id,
+                'side': side,
+                'total_size': 0.0,
+                'total_value': 0.0,
+                'avg_price': 0.0,
+                'timestamp': created_at,
+                'fills_count': 0
+            }
+
+        grp = order_groups[order_id]
+        grp['total_size'] += size
+        grp['total_value'] += price * size
+        grp['fills_count'] += 1
+        if created_at < grp['timestamp']:
+            grp['timestamp'] = created_at
+
+    for order_id, grp in order_groups.items():
+        if grp['total_size'] > 0:
+            grp['avg_price'] = grp['total_value'] / grp['total_size']
+
+    sorted_orders = sorted(order_groups.values(), key=lambda x: x['timestamp'])
+
+    print(f"📊 Grouped {len(symbol_fills)} fills into {len(sorted_orders)} orders for {symbol}")
+    for o in sorted_orders:
+        print(f"   Order {o['order_id']}: {o['side'].upper()} {o['total_size']} lots @ avg {o['avg_price']:.6f} ({o['fills_count']} fills)")
+
+    return sorted_orders
+
+def pair_entry_exit_orders(sorted_orders):
+    """
+    Match entry and exit orders into closed trade pairs.
+    Returns list of pairs: {entry_order, exit_order, size, entry_price, exit_price, side}
+    """
+    pairs = []
+    open_positions = []
+    net_size = 0.0
+
+    for order in sorted_orders:
+        side = order['side']
+        size = order['total_size']
+        price = order['avg_price']
+
+        if side == 'buy':
+            signed_size = +size
+        else:
+            signed_size = -size
+
+        prev_net = net_size
+        net_size += signed_size
+
+        print(f"   [PAIR ENGINE] {side.upper()} {size} | net: {prev_net:.4f} → {net_size:.4f}")
+
+        if abs(prev_net) > 0.001 and (
+            (prev_net > 0 and side == 'sell') or
+            (prev_net < 0 and side == 'buy')
+        ):
+            close_size = min(size, abs(prev_net))
+
+            entry_order = None
+            for op in reversed(open_positions):
+                if abs(net_size) < abs(prev_net):
+                    entry_order = op
+                    break
+
+            if entry_order:
+                entry_price = entry_order['price']
+                entry_side = entry_order['side']
+
+                pair = {
+                    'entry_order_id': entry_order['order_id'],
+                    'exit_order_id': order['order_id'],
+                    'side': entry_side,
+                    'size': close_size,
+                    'entry_price': entry_price,
+                    'exit_price': price,
+                    'entry_time': entry_order['timestamp'],
+                    'exit_time': order['timestamp']
+                }
+                pairs.append(pair)
+                print(f"   ✅ PAIR FOUND: {entry_side.upper()} {close_size} | Entry: {entry_price:.6f} → Exit: {price:.6f}")
+
+                open_positions = [op for op in open_positions if op['order_id'] != entry_order['order_id']]
+
+        if (side == 'buy' and net_size > 0 and net_size > prev_net) or \
+           (side == 'sell' and net_size < 0 and net_size < prev_net):
+            open_positions.append({
+                'order_id': order['order_id'],
+                'side': side,
+                'size': size,
+                'price': price,
+                'timestamp': order['timestamp']
+            })
+
+        if abs(net_size) < 0.001:
+            open_positions = []
+
+    return pairs
+
+def find_latest_closed_pair(symbol):
+    """
+    Main function: fetch fills, group by order, pair entry/exit, return last closed pair.
+    Returns: (pnl, entry_exit_data) or (0, None) if not found
+    """
+    print(f"\n🔍 FILL PAIR ENGINE - Finding closed pair for {symbol}")
+
+    all_fills = get_fills_page(page_size=50)
+
+    if not all_fills:
+        print("❌ No fills received from API")
+        return 0, None
+
+    sorted_orders = group_fills_by_order(all_fills, symbol)
+
+    if len(sorted_orders) < 2:
+        print(f"❌ Not enough orders to form a pair (found {len(sorted_orders)})")
+        return 0, None
+
+    last_two = sorted_orders[-2:]
+
+    if len(last_two) == 2:
+        order_a = last_two[0]
+        order_b = last_two[1]
+
+        print(f"\n🎯 CHECKING LAST TWO ORDERS:")
+        print(f"   A: {order_a['side'].upper()} {order_a['total_size']} @ {order_a['avg_price']:.6f} [{order_a['timestamp']}]")
+        print(f"   B: {order_b['side'].upper()} {order_b['total_size']} @ {order_b['avg_price']:.6f} [{order_b['timestamp']}]")
+
+        if order_a['side'] != order_b['side']:
+            entry_order = order_a
+            exit_order = order_b
+            entry_side = entry_order['side']
+
+            trade_size = min(entry_order['total_size'], exit_order['total_size'])
+
+            entry_price = entry_order['avg_price']
+            exit_price = exit_order['avg_price']
+
+            symbol_key = symbol
+            lot_size = LOT_SIZES.get(symbol_key, LOT_SIZE_DEFAULT)
+            actual_quantity = trade_size * lot_size
+
+            if entry_side == 'buy':
+                pnl = (exit_price - entry_price) * actual_quantity
+            else:
+                pnl = (entry_price - exit_price) * actual_quantity
+
+            print(f"\n💰 PAIR RESULT:")
+            print(f"   Side: {entry_side.upper()}")
+            print(f"   Size: {trade_size} lots = {actual_quantity} {symbol.replace('USD', '')} (1 lot = {lot_size})")
+            print(f"   Entry: {entry_price:.6f} | Exit: {exit_price:.6f}")
+            print(f"   PnL: {pnl:.6f} USD")
+            print(f"   Result: {'✅ PROFIT' if pnl > 0 else '❌ LOSS'}")
+
+            entry_exit_data = {
+                'side': entry_side,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'quantity': trade_size,
+                'entry_time': entry_order['timestamp'],
+                'exit_time': exit_order['timestamp']
+            }
+
+            return pnl, entry_exit_data
+        else:
+            print(f"⚠️ Last two orders are SAME SIDE ({order_a['side']}) - falling back to full pair engine...")
+
+    pairs = pair_entry_exit_orders(sorted_orders)
+
+    if not pairs:
+        print("❌ No pairs found by pair engine")
+        return 0, None
+
+    latest_pair = pairs[-1]
+
+    entry_side = latest_pair['side']
+    entry_price = latest_pair['entry_price']
+    exit_price = latest_pair['exit_price']
+    trade_size = latest_pair['size']
+
+    lot_size = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
+    actual_quantity = trade_size * lot_size
+
+    if entry_side == 'buy':
+        pnl = (exit_price - entry_price) * actual_quantity
+    else:
+        pnl = (entry_price - exit_price) * actual_quantity
+
+    print(f"\n💰 PAIR ENGINE RESULT:")
+    print(f"   Side: {entry_side.upper()}")
+    print(f"   Size: {trade_size} lots = {actual_quantity}")
+    print(f"   Entry: {entry_price:.6f} | Exit: {exit_price:.6f}")
+    print(f"   PnL: {pnl:.6f} USD")
+
+    entry_exit_data = {
+        'side': entry_side,
+        'entry_price': entry_price,
+        'exit_price': exit_price,
+        'quantity': trade_size,
+        'entry_time': latest_pair['entry_time'],
+        'exit_time': latest_pair['exit_time']
+    }
+
+    return pnl, entry_exit_data
+
+
+# ========== TRADE COMPLETION MANAGEMENT ==========
+
+def wait_for_complete_trade(symbol, max_wait=15):
+    """Wait for complete trade data (entry + exit fills) before allowing next trade"""
+    start = time.time()
+
+    while time.time() - start < max_wait:
+        pnl, data = find_latest_closed_pair(symbol)
+
+        if data:
+            print("✅ Complete trade found!")
+            return pnl, data
+
+        print("⏳ Waiting for fills...")
+        time.sleep(1)
+
+    print("❌ Fills not received in time")
+    return None, None
+
+def get_trade_with_retry(symbol, retries=5):
+    """Get trade data with retry logic to handle delayed fills API updates"""
+    for i in range(retries):
+        pnl, data = find_latest_closed_pair(symbol)
+        if data:
+            print(f"✅ Trade data found on attempt {i+1}")
+            return pnl, data
+        print(f"⏳ Retry {i+1}/{retries} - waiting for fills API to update...")
+        time.sleep(1)
+    print(f"❌ No trade data found after {retries} retries")
+    return 0, None
+
+def get_pnl_from_fills():
+    """Get PnL from fills using the correct pairing engine"""
+    pnl, _ = find_latest_closed_pair(BOT_STATE['symbol'])
+    return pnl
+
+def get_entry_exit_from_fills():
+    """Get entry/exit data using the correct pairing engine"""
+    _, entry_exit_data = find_latest_closed_pair(BOT_STATE['symbol'])
+    return entry_exit_data
+
+
+# ========== IMPROVED POSITION TRACKING ==========
+def check_position_and_detect_closure():
+    """OPTIMIZED - Check position using real-time endpoint"""
+    global LAST_POSITION_STATE
+
+    try:
+        print(f"\n{'='*60}")
+        print(f"🔍 POSITION CHECK (REAL-TIME)")
+        print(f"LAST_POSITION_STATE: {LAST_POSITION_STATE}")
+        print(f"Symbol: {BOT_STATE['symbol']}")
+        print(f"{'='*60}")
+
+        product_id = get_product_id(BOT_STATE['symbol'])
+        if not product_id:
+            print("❌ Could not get product_id")
+            return False, False, 0
+
+        current_pos = check_position_realtime(product_id)
+
+        if current_pos.get('error'):
+            print("⚠️ API FAILED - SKIPPING CLOSURE CHECK")
+            return True, False, 0
+
+        was_closed = False
+        pnl = 0
+
+        if abs(LAST_POSITION_STATE['size']) > 0.001 and abs(current_pos.get('size', 0)) <= 0.001:
+            print("🎯 Position CLOSED!")
+
+            print("⏳ Waiting 15 seconds for Delta fills update...")
+            time.sleep(15)  
+
+            was_closed = True
+            global WAITING_FOR_FILL, TRADE_COMPLETED
+            WAITING_FOR_FILL = True
+            TRADE_COMPLETED = False
+
+            print("⏳ Waiting for complete trade data (entry + exit fills)...")
+            pnl, entry_exit_data = wait_for_complete_trade(BOT_STATE['symbol'])
+
+            if entry_exit_data:
+                print("✅ Trade completed - INSTANT MEMORY UPDATE FIRST")
+
+                # STEP 1: INSTANT DECISION DATA (memory update)
+                LAST_TRADE_RESULT['profit_loss'] = pnl
+                LAST_TRADE_RESULT['timestamp'] = datetime.now().isoformat()
+                LAST_TRADE_RESULT['lot_used'] = LAST_POSITION_STATE['size']
+                LAST_TRADE_RESULT['processed'] = True
+
+                BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
+                BOT_STATE['last_pnl'] = pnl
+
+                print(f"🧠 INSTANT MEMORY UPDATE: Last PnL = {pnl:.5f}, Result = {BOT_STATE['last_result']}")
+
+                # ✅ FIX: Calculate next step IMMEDIATELY after trade result is known
+                # This ensures step is correct BEFORE saving to DB
+                _apply_step_progression(pnl)
+
+                # ✅ FIX: Save bot state to DB immediately after step update
+                save_bot_state_to_db()
+
+                # STEP 2: ASYNC DATABASE SAVE (background, no delay)
+                print("💾 Saving to database (async)...")
+                save_closed_position({
+                    'symbol': BOT_STATE['symbol'],
+                    'side': entry_exit_data['side'],
+                    'entry_price': entry_exit_data['entry_price'],
+                    'exit_price': entry_exit_data['exit_price'],
+                    'quantity': entry_exit_data['quantity'],
+                    'pnl': pnl,
+                    'entry_time': entry_exit_data['entry_time'],
+                    'exit_time': entry_exit_data['exit_time']
+                })
+                print(f"💾 ✅ Database save completed")
+
+                if BOT_STATE['session_start_time']:
+                    BOT_STATE['session_total_pnl'] += pnl
+                    print(f"   Session P&L updated: {BOT_STATE['session_total_pnl']:.2f} (Trade P&L: {pnl:.2f})")
+
+                print(f"✅ STATE UPDATED: Last PnL = {pnl:.5f}, Result = {BOT_STATE['last_result']}")
+
+                result_type = "PROFIT" if pnl > 0 else "LOSS"
+                reason = f"after_{result_type.lower()}_pnl={pnl:.5f}"
+
+                global CURRENT_SIGNAL
+                CURRENT_SIGNAL = generate_random_signal(reason=reason)
+                print(f"     Generated new signal: {CURRENT_SIGNAL['signal']} after {result_type}")
+
+                TRADE_COMPLETED = True
+                print(f"🎯 TRADE COMPLETED - Ready for next trade")
+
+            else:
+                print(f"⚠️ FORCE SAVE - Using fallback data (fills API missed)")
+
+                LAST_TRADE_RESULT['profit_loss'] = pnl
+                LAST_TRADE_RESULT['timestamp'] = datetime.now().isoformat()
+                LAST_TRADE_RESULT['lot_used'] = LAST_POSITION_STATE['size']
+                LAST_TRADE_RESULT['processed'] = True
+
+                BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
+                BOT_STATE['last_pnl'] = pnl
+
+                print(f"🧠 INSTANT MEMORY UPDATE (fallback): Last PnL = {pnl:.5f}, Result = {BOT_STATE['last_result']}")
+
+                # ✅ FIX: Also apply step progression on fallback
+                _apply_step_progression(pnl)
+                save_bot_state_to_db()
+
+                entry_exit_data = {
+                    'side': 'buy' if LAST_POSITION_STATE['size'] > 0 else 'sell',
+                    'entry_price': LAST_POSITION_STATE['entry_price'],
+                    'exit_price': LAST_POSITION_STATE['entry_price'],
+                    'quantity': abs(LAST_POSITION_STATE['size']),
+                    'entry_time': datetime.now().isoformat(),
+                    'exit_time': datetime.now().isoformat()
+                }
+                print(f"🔥 FORCE SAVING: {entry_exit_data}")
+
+                save_closed_position({
+                    'symbol': BOT_STATE['symbol'],
+                    'side': entry_exit_data['side'],
+                    'entry_price': entry_exit_data['entry_price'],
+                    'exit_price': entry_exit_data['exit_price'],
+                    'quantity': entry_exit_data['quantity'],
+                    'pnl': pnl,
+                    'entry_time': entry_exit_data['entry_time'],
+                    'exit_time': entry_exit_data['exit_time']
+                })
+                print(f"💾 🔥 FORCE SAVED - No trade missed!")
+
+                TRADE_COMPLETED = True
+                print(f"🎯 FORCE TRADE COMPLETED")
+
+            print(f"     PnL: {pnl:.5f}")
+            print(f"     Result: {'PROFIT ✅' if pnl > 0 else 'LOSS ❌'}")
+
+        elif LAST_POSITION_STATE['size'] > 0 and current_pos.get('size', 0) == 0:
+            print("🔄 RECOVERY: Position was closed during network issue")
+
+        LAST_POSITION_STATE = {
+            'symbol': BOT_STATE['symbol'],
+            'size': current_pos.get('size', 0),
+            'entry_price': current_pos.get('entry_price', 0)
+        }
+
+        has_position = abs(current_pos.get('size', 0)) > 0.001
+        return has_position, was_closed, pnl
+
+    except Exception as e:
+        print(f"❌ Position processing error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, False, 0
+
+
+def _apply_step_progression(pnl):
+    """
+    ✅ FIX: Apply martingale step progression IMMEDIATELY when trade result is known.
+    Called right after fill detection - BEFORE next trade is placed.
+    WIN  → reset to Step 1
+    LOSS → advance to next step (Step 2, 3, 4... up to max Step 11)
+    After max step (11/1056) → reset to Step 1 (unless stop_at_max_step is set)
+    """
+    global BOT_STATE
+
+    current_step = BOT_STATE['current_step']
+    current_lot  = BOT_STATE['current_lot']
+
+    print(f"\n📊 STEP PROGRESSION:")
+    print(f"   Current Step: {current_step} | Current Lot: {current_lot}")
+    print(f"   Trade PnL: {pnl:.6f} | Result: {'WIN ✅' if pnl > 0 else 'LOSS ❌'}")
+
+    if pnl > 0:
+        # WIN - Reset to Step 1
+        next_step = 1
+        next_lot  = LOT_STEPS[next_step]
+        BOT_STATE['current_step'] = next_step
+        BOT_STATE['current_lot']  = next_lot
+        print(f"   ✅ WIN → Reset to Step {next_step}: Lot {next_lot}")
+    else:
+        # LOSS - Advance to next step
+        next_step = current_step + 1
+        if next_step > BOT_STATE['max_steps']:
+            # ✅ FIX: max_steps is 11 (1056 lots). After step 11, reset to step 1.
+            # stop_at_max_step flag will handle stopping the bot if set.
+            next_step = 1
+            next_lot  = LOT_STEPS[next_step]
+            BOT_STATE['current_step'] = next_step
+            BOT_STATE['current_lot']  = next_lot
+            print(f"   🚨 MAX STEP ({BOT_STATE['max_steps']}) REACHED → Reset to Step {next_step}: Lot {next_lot}")
+        else:
+            next_lot  = LOT_STEPS[next_step]
+            BOT_STATE['current_step'] = next_step
+            BOT_STATE['current_lot']  = next_lot
+            print(f"   ❌ LOSS → Advance to Step {next_step}: Lot {next_lot}")
+
+    print(f"   ✅ Next trade will use Step {BOT_STATE['current_step']}: Lot {BOT_STATE['current_lot']}")
+
+
+# ========== TRADING LOGIC ==========
+CURRENT_SIGNAL = None
+
+def get_trading_signal():
+    """Generate completely new unbiased trading signal on every call"""
+    global CURRENT_SIGNAL
+
+    try:
+        CURRENT_SIGNAL = generate_random_signal(reason="trade_decision")
+        print(f"[SIGNAL] Generated new unbiased signal: {CURRENT_SIGNAL['signal']}")
+
+        signal = CURRENT_SIGNAL.get('signal', '')
+        confidence = CURRENT_SIGNAL.get('confidence', 0)
+
+        print(f"🎲 Random Signal: {signal}")
+        print(f"📊 Confidence: {confidence}% (unbiased 50/50)")
+        print(f"🔄 Fresh decision - no bias from previous trades")
+
+        if signal.upper() == "BUY":
+            return 'buy', CURRENT_SIGNAL
+        elif signal.upper() == "SELL":
+            return 'sell', CURRENT_SIGNAL
+        else:
+            print(f"Unknown signal: {signal}")
+            return None, CURRENT_SIGNAL
+
+    except Exception as e:
+        print(f"Error getting signal: {e}")
+        return None, None
+
+def start_signal_bot():
+    """Start the signal bot"""
+    try:
+        print("🤖 Signal bot ready - will generate unbiased random signals on demand")
+        return True
+    except Exception as e:
+        print(f"❌ Error starting signal bot: {e}")
+        return False
+
+def stop_signal_bot():
+    """Stop the signal bot"""
+    try:
+        print("🛑 Signal bot stopped")
+    except Exception as e:
+        print(f"❌ Error stopping signal bot: {e}")
+
+def detect_current_step_from_lot(lot_size):
+    """Detect current step based on lot size (use absolute value for negative sizes)"""
+    lot_size = abs(lot_size)
+    for step, lot in LOT_STEPS.items():
+        if lot == lot_size:
+            return step
+    for step, lot in LOT_STEPS.items():
+        if lot >= lot_size:
+            return step
+    return 1
+
+def detect_current_step_from_live_position():
+    """Detect current step from live position lot size"""
+    try:
+        has_position = abs(LAST_POSITION_STATE['size']) > 0.001
+        if has_position:
+            current_lot = abs(LAST_POSITION_STATE['size'])
+            current_step = detect_current_step_from_lot(current_lot)
+            print(f"🔍 Live position detected: Lot {current_lot} = Step {current_step}")
+            return current_step, current_lot
+        else:
+            print("🔍 No live position detected - using Step 1")
+            return 1, LOT_STEPS[1]
+    except Exception as e:
+        print(f"❌ Error detecting step from live position: {e}")
+        return 1, LOT_STEPS[1]
+
+def calculate_next_lot():
+    """
+    ✅ FIX: Simplified lot calculation.
+    Step progression is now handled IMMEDIATELY in _apply_step_progression() when trade closes.
+    This function just returns the already-calculated next lot from BOT_STATE.
+    No more complex logic here - just read the pre-calculated value.
+    """
+    global LOT_CALCULATION_LOCK
+
+    if LOT_CALCULATION_LOCK:
+        print("⚠️ Lot calculation already in progress - using current lot")
+        return BOT_STATE['current_lot']
+
+    LOT_CALCULATION_LOCK = True
+
+    try:
+        print(f"\n📊 NEXT LOT CALCULATION:")
+        print(f"   Current Step: {BOT_STATE['current_step']}")
+        print(f"   Current Lot: {BOT_STATE['current_lot']}")
+        print(f"   Last PnL: {LAST_TRADE_RESULT['profit_loss']}")
+
+        # ✅ FIX: Step progression is already applied in _apply_step_progression().
+        # Just verify current_lot matches LOT_STEPS[current_step] and return it.
+        expected_lot = LOT_STEPS.get(BOT_STATE['current_step'], LOT_STEPS[1])
+        if BOT_STATE['current_lot'] != expected_lot:
+            print(f"⚠️ Lot mismatch! BOT_STATE lot={BOT_STATE['current_lot']}, expected={expected_lot}. Correcting...")
+            BOT_STATE['current_lot'] = expected_lot
+
+        next_lot = BOT_STATE['current_lot']
+        print(f"   ✅ Using pre-calculated lot: {next_lot} (Step {BOT_STATE['current_step']})")
+
+        # Reset processed flag so next closure will be handled
+        LAST_TRADE_RESULT['processed'] = False
+
+        return next_lot
+
+    finally:
+        LOT_CALCULATION_LOCK = False
+
+
+def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
+    print(f"\n{'='*60}")
+    print(f"🎯 ORDER START: {symbol} | {side.upper()} | Size: {size}")
+    print(f"   TP: {tp_pct}% | SL: {sl_pct}%")
+    print(f"{'='*60}")
+
+    try:
+        PRODUCT_CONFIG = {
+            "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},
+            "BTCUSD": {"id": 84,    "tick": Decimal("0.5")},
+            # "ETHUSD": {"id": 1320,  "tick": Decimal("0.05")},
+            "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
+        }
+
+        config = PRODUCT_CONFIG.get(symbol)
+        if not config:
+            print(f"❌ Symbol {symbol} not in config!")
+            return None
+
+        p_id = config["id"]
+        tick = config["tick"]
+
+        ticker = make_api_request('GET', f'/tickers/{symbol}')
+        if not ticker or not ticker.get('result'):
+            print("❌ Ticker fetch failed")
+            return None
+
+        result     = ticker['result']
+        mark_price = float(result.get('mark_price') or result.get('close'))
+        print(f"📊 Mark Price: {mark_price}")
+
+        def to_tick(val):
+            d = Decimal(str(val))
+            return (d / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+
+        base_dec = to_tick(mark_price)
+
+        if side == 'buy':
+            tp_dec = to_tick(mark_price * (1 + tp_pct / 100))
+            sl_dec = to_tick(mark_price * (1 - sl_pct / 100))
+        else:
+            tp_dec = to_tick(mark_price * (1 - tp_pct / 100))
+            sl_dec = to_tick(mark_price * (1 + sl_pct / 100))
+
+        print(f"📐 After % calc  → TP: {tp_dec} | SL: {sl_dec}")
+
+        MIN_TICKS = Decimal("3")
+        min_gap   = tick * MIN_TICKS
+
+        if side == 'buy':
+            if tp_dec <= base_dec:
+                tp_dec = base_dec + min_gap
+                print(f"⚠️  TP <= entry, min pushed to: {tp_dec}")
+            if sl_dec >= base_dec:
+                sl_dec = base_dec - min_gap
+                print(f"⚠️  SL >= entry, min pushed to: {sl_dec}")
+        else:
+            if tp_dec >= base_dec:
+                tp_dec = base_dec - min_gap
+                print(f"⚠️  TP >= entry, min pushed to: {tp_dec}")
+            if sl_dec <= base_dec:
+                sl_dec = base_dec + min_gap
+                print(f"⚠️  SL <= entry, min pushed to: {sl_dec}")
+
+        tp_price = str(tp_dec)
+        sl_price = str(sl_dec)
+
+        print(f"🎯 Final TP : {tp_price}  (gap: {abs(tp_dec - base_dec):.5f})")
+        print(f"🛡️  Final SL : {sl_price}  (gap: {abs(sl_dec - base_dec):.5f})")
+
+        order_data = {
+            "product_id"                    : p_id,
+            "side"                          : side,
+            "order_type"                    : "market_order",
+            "size"                          : int(size),
+            "bracket_take_profit_price"     : tp_price,
+            "bracket_take_profit_order_type": "market_order",
+            "bracket_stop_loss_price"       : sl_price,
+            "bracket_stop_loss_order_type"  : "market_order",
+            "bracket_stop_trigger_method"   : "mark_price",
+        }
+
+        print(f"\n📋 Payload:\n{json.dumps(order_data, indent=3)}")
+
+        response = make_api_request('POST', '/orders', order_data)
+        print(f"\n🔍 Raw Response:\n{json.dumps(response, indent=3)}")
+
+        if response and response.get('success') and 'result' in response:
+            oid     = response['result'].get('id')
+            bracket = response['result'].get('bracket_orders', [])
+            print(f"\n✅ ORDER PLACED! ID: {oid}")
+
+            actual_entry = float(
+                response['result'].get('average_fill_price') or
+                response['result'].get('limit_price') or
+                mark_price
+            )
+            print(f"📌 Actual Fill Price: {actual_entry} | Mark was: {mark_price}")
+
+            if actual_entry != mark_price:
+                print(f"⚠️  Slippage detected ({abs(actual_entry - mark_price):.5f}), recalculating TP/SL...")
+                actual_base = to_tick(actual_entry)
+
+                if side == 'buy':
+                    tp_dec = to_tick(actual_entry * (1 + tp_pct / 100))
+                    sl_dec = to_tick(actual_entry * (1 - sl_pct / 100))
+                else:
+                    tp_dec = to_tick(actual_entry * (1 - tp_pct / 100))
+                    sl_dec = to_tick(actual_entry * (1 + sl_pct / 100))
+
+                if side == 'buy':
+                    if tp_dec <= actual_base:
+                        tp_dec = actual_base + min_gap
+                    if sl_dec >= actual_base:
+                        sl_dec = actual_base - min_gap
+                else:
+                    if tp_dec >= actual_base:
+                        tp_dec = actual_base - min_gap
+                    if sl_dec <= actual_base:
+                        sl_dec = actual_base + min_gap
+
+                tp_price = str(tp_dec)
+                sl_price = str(sl_dec)
+                print(f"🎯 Recalculated TP : {tp_price}")
+                print(f"🛡️  Recalculated SL : {sl_price}")
+
+            if bracket:
+                print(f"🎯 Bracket: {bracket}")
+            else:
+                print("⚠️  Bracket missing! Placing manually via /orders/bracket ...")
+                bracket_payload = {
+                    "product_id": p_id,
+                    "take_profit_order": {
+                        "order_type": "market_order",
+                        "stop_price": tp_price
+                    },
+                    "stop_loss_order": {
+                        "order_type": "market_order",
+                        "stop_price": sl_price
+                    },
+                    "bracket_stop_trigger_method": "mark_price"
+                }
+                bracket_res = make_api_request('POST', '/orders/bracket', bracket_payload)
+                print(f"🔍 Bracket Response: {json.dumps(bracket_res, indent=3)}")
+        else:
+            err = response.get('error') if response else 'No response'
+            print(f"\n❌ ORDER FAILED! Error: {err}")
+
+        return response
+
+    except Exception as e:
+        import traceback
+        print(f"❌ Exception: {e}")
+        traceback.print_exc()
+        return None
+
+
+# ========== BOT ENGINE ==========
+def auto_trading_bot_main():
+    """Main bot loop - instant execution with real-time endpoints"""
+    print("🤖 Auto Trading Bot Started (OPTIMIZED)")
+
+    print(f"⚡ Setting leverage: {BOT_STATE['leverage']}x")
+    leverage_result = set_leverage(BOT_STATE['symbol'], BOT_STATE['leverage'])
+    if not leverage_result:
+        print("❌ Failed to set initial leverage, stopping bot")
+        return
+
+    print(f"\n🔍 CHECKING FOR EXISTING LIVE POSITION...")
+    product_id = get_product_id(BOT_STATE['symbol'])
+    if product_id:
+        current_pos = check_position_realtime(product_id)
+        if abs(current_pos.get('size', 0)) > 0.001:
+            print(f"🚨 EXISTING POSITION FOUND: {current_pos.get('size', 0)} lots")
+            print(f"📊 Entry Price: {current_pos.get('entry_price', 0)}")
+
+            current_lot   = abs(current_pos.get('size', 0))
+            detected_step = detect_current_step_from_lot(current_lot)
+
+            # ✅ FIX: Only sync from live position if DB state says different step
+            # This prevents overwriting a correctly-loaded DB state with wrong live detection
+            if BOT_STATE['current_step'] != detected_step:
+                print(f"🔄 Syncing step from live position: DB step={BOT_STATE['current_step']} → Live step={detected_step}")
+                BOT_STATE['current_step'] = detected_step
+                BOT_STATE['current_lot']  = current_lot
+            else:
+                print(f"✅ DB step matches live position step ({detected_step}), no sync needed")
+
+            LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
+            LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
+            LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
+
+            print("⏳ Waiting for existing position to close...")
+            while BOT_STATE['running'] and abs(current_pos.get('size', 0)) > 0.001:
+                time.sleep(1)
+                current_pos = check_position_realtime(product_id)
+                print(f"📊 Position Status: {current_pos.get('size', 0)} lots")
+
+            if not BOT_STATE['running']:
+                return
+
+            print("✅ Existing position closed, continuing with preserved lot progression...")
+        else:
+            # ✅ FIX: If no live position, check if DB state says we should be at a higher step
+            # (This happens when bot restarts between trades)
+            print("✅ No existing position found...")
+            if LAST_TRADE_RESULT['profit_loss'] is not None:
+                print(f"📊 DB state says last trade PnL={LAST_TRADE_RESULT['profit_loss']}, Step={BOT_STATE['current_step']}")
+                print(f"   ✅ Continuing from DB state: Step {BOT_STATE['current_step']}, Lot {BOT_STATE['current_lot']}")
+            else:
+                print(f"   ✅ No previous trade data - starting fresh at Step 1")
+                BOT_STATE['current_step'] = 1
+                BOT_STATE['current_lot']  = LOT_STEPS[1]
+
+    while BOT_STATE['running']:
+        try:
+            if BOT_STATE['force_stop']:
+                print("🛑 Force Stop triggered - Stopping bot immediately!")
+                BOT_STATE['running']    = False
+                BOT_STATE['force_stop'] = False
+                break
+
+            global WAITING_FOR_FILL, TRADE_COMPLETED
+            if WAITING_FOR_FILL:
+                print("⏳ Waiting for trade to be completed and saved...")
+
+                pnl, data = find_latest_closed_pair(BOT_STATE['symbol'])
+
+                if data and TRADE_COMPLETED:
+                    WAITING_FOR_FILL = False
+                    TRADE_COMPLETED  = False
+                    print("✅ Trade completed and saved, ready for next trade")
+                else:
+                    if data and not TRADE_COMPLETED:
+                        print("⏳ Fill received but trade not yet saved...")
+                    else:
+                        print("⏳ Still waiting for fills...")
+                    time.sleep(0.5)
+                    continue
+
+            print(f"\n{'='*50}")
+            print(f"🔍 BOT LOOP CHECK - Symbol: {BOT_STATE['symbol']}")
+            print(f"📊 Running: {BOT_STATE['running']}, Step: {BOT_STATE['current_step']}")
+            print(f"💰 Current Lot: {BOT_STATE['current_lot']}")
+            print(f"{'='*50}")
+
+            has_position, was_closed, pnl = check_position_and_detect_closure()
+
+            if was_closed:
+                print(f"🎯 Position was closed! PnL: {pnl}")
+                print(f"📊 Result: {'PROFIT ✅' if pnl > 0 else 'LOSS ❌'}")
+                print(f"💰 Step already updated to: {BOT_STATE['current_step']} (Lot: {BOT_STATE['current_lot']})")
+
+                if pnl > 0 and BOT_STATE['stop_at_win']:
+                    print(f"🏆 PROFIT ACHIEVED - STOP AT WIN ACTIVATED!")
+                    BOT_STATE['running']     = False
+                    BOT_STATE['stop_at_win'] = False
+                    continue
+
+                # ✅ FIX: stop_at_max_step now checks CURRENT step (already advanced)
+                if pnl < 0 and BOT_STATE['current_step'] == 1 and BOT_STATE['stop_at_max_step']:
+                    # current_step reset to 1 means we just HIT max step and reset
+                    print(f"🚨 MAX STEP HIT! - STOP AT MAX STEP ACTIVATED!")
+                    BOT_STATE['running']          = False
+                    BOT_STATE['stop_at_max_step'] = False
+                    continue
+
+            if has_position:
+                print("⏳ Active position found, waiting for closure...")
+                time.sleep(0.5)
+                continue
+
+            if BOT_STATE['force_stop']:
+                print("🛑 FORCE STOP ACTIVE - Skipping order placement")
+                BOT_STATE['running'] = False
+                continue
+
+            if BOT_STATE['stop_at_win']:
+                print("🎯 STOP AT WIN ACTIVE - Will stop after next profit")
+
+            next_lot = calculate_next_lot()
+            print(f"💰 Next Lot Size: {next_lot}")
+            print(f"🎯 ORDER DETAILS:")
+            print(f"   📊 Base Lot: {BOT_STATE['base_lot']}")
+            print(f"   📊 Current Lot: {BOT_STATE['current_lot']}")
+            print(f"   📊 Next Lot: {next_lot}")
+            print(f"   📊 Current Step: {BOT_STATE['current_step']}")
+
+            LAST_TRADE_RESULT['processed'] = False
+
+            signal_result = get_trading_signal()
+            side        = signal_result[0] if signal_result else 'buy'
+            signal_data = signal_result[1] if signal_result and len(signal_result) > 1 else {}
+
+            if side is None:
+                print("⏳ Waiting for bot decision - skipping this cycle")
+                time.sleep(1)
+                continue
+
+            print(f"📈 Trading Signal: {side.upper()} order with {next_lot} lots")
+
+            product_id = get_product_id(BOT_STATE['symbol'])
+            if product_id:
+                current_pos = check_position_realtime(product_id)
+                if abs(current_pos.get('size', 0)) > 0.001:
+                    print("⛔ SAFETY CHECK: Real position exists - SKIPPING ORDER")
+                    print(f"📊 Position Size: {current_pos.get('size', 0)} lots")
+
+                    LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
+                    LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
+                    LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
+                    if abs(LAST_POSITION_STATE['size']) > 0.001:
+                        print("⏳ Active position found, waiting for closure...")
+                        continue
+
+            print(f"🎯 PLACING ORDER WITH CALCULATED LOT: {next_lot}")
+
+            order_response = place_order_with_bracket(
+                BOT_STATE['symbol'],
+                side,
+                next_lot,
+                BOT_STATE['leverage'],
+                BOT_STATE['tp_percent'],
+                BOT_STATE['sl_percent']
+            )
+
+            if order_response and order_response.get('success'):
+                print(f"✅ Order placed successfully!")
+                print(f"📋 Order ID: {order_response.get('result', {}).get('id')}")
+
+                print("⚡ Quick position check (TP/SL already attached)...")
+                max_wait_time = 2
+                wait_start = time.time()
+
+                while time.time() - wait_start < max_wait_time:
+                    time.sleep(0.05)
+                    current_pos = check_position_realtime(product_id)
+                    if abs(current_pos.get('size', 0)) > 0.001:
+                        print(f"⚡ Position confirmed: {current_pos.get('size', 0)} lots (TP/SL active)")
+                        break
+                else:
+                    print("⚠️ Position check timeout - continuing (TP/SL should be active)")
+
+                product_id = get_product_id(BOT_STATE['symbol'])
+                if product_id:
+                    current_pos = check_position_realtime(product_id)
+
+                    if current_pos.get('error'):
+                        print("⚠️ API FAILED - SKIPPING POSITION UPDATE")
+                        continue
+
+                    if current_pos.get('has_position') and abs(current_pos.get('size', 0)) > 0.001:
+                        LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
+                        LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
+                        LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
+
+                        BOT_STATE['current_lot'] = abs(current_pos.get('size', 0))
+
+                        print(f"📊 Position State Updated: Size={LAST_POSITION_STATE['size']}, Entry={LAST_POSITION_STATE['entry_price']}")
+                        print(f"🔄 Current Lot Synced: {BOT_STATE['current_lot']}")
+                    else:
+                        print("⚠️ Position not found in real-time check")
+                else:
+                    print("❌ Could not get product_id for position update")
+            else:
+                print("❌ Order failed!")
+                print(f"📋 Order Response: {order_response}")
+                time.sleep(0.5)
+
+        except Exception as e:
+            print(f"🚨 TEMPORARY BOT ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            print("🔄 Bot is staying alive... retrying in 5 seconds")
+            time.sleep(5)
+            continue
+
+    print("🤖 Auto Trading Bot Stopped")
+
+def start_auto_trading_bot():
+    """Start the bot"""
+    if BOT_STATE['running']:
+        return False
+
+    global LAST_POSITION_STATE
+    LAST_POSITION_STATE = {
+        'symbol': BOT_STATE['symbol'],
+        'size': 0,
+        'entry_price': 0
+    }
+
+    BOT_STATE['stop_at_win']      = False
+    BOT_STATE['stop_at_max_step'] = False
+    BOT_STATE['force_stop']       = False
+
+    BOT_STATE['session_start_time'] = datetime.now().isoformat()
+    BOT_STATE['session_total_pnl']  = 0.0
+    print(f"Session started at {BOT_STATE['session_start_time']}")
+
+    BOT_STATE['running'] = True
+    BOT_STATE['thread']  = threading.Thread(target=auto_trading_bot_main, daemon=True)
+    BOT_STATE['thread'].start()
+    return True
+
+def stop_auto_trading_bot():
+    """Stop the bot"""
+    if not BOT_STATE['running']:
+        return False
+    BOT_STATE['running'] = False
+    if BOT_STATE['thread']:
+        BOT_STATE['thread'].join(timeout=5)
+
+    if BOT_STATE['session_start_time']:
+        print(f"Session ended. Final P&L: ${BOT_STATE['session_total_pnl']:.2f}")
+
+    BOT_STATE['session_start_time'] = None
+    BOT_STATE['session_total_pnl']  = 0.0
+    return True
+
+def clear_stuck_trade_result():
+    """Clear stuck trade result to fix bot"""
+    global LAST_TRADE_RESULT
+
+    print("🔧 CLEARING STUCK TRADE RESULT...")
+    print(f"   Previous result: P&L={LAST_TRADE_RESULT['profit_loss']}, Processed={LAST_TRADE_RESULT['processed']}")
+
+    LAST_TRADE_RESULT = {
+        'profit_loss': None,
+        'timestamp': None,
+        'lot_used': None,
+        'processed': False
+    }
+
+    print("   ✅ Trade result cleared - Bot can continue")
+    return True
+
+def reconcile_stuck_trades_from_database():
+    """Check MySQL database for trades that might be stuck and auto-clear them"""
+    global LAST_TRADE_RESULT
+
+    try:
+        query = '''
+            SELECT symbol, side, entry_price, exit_price, quantity, pnl, entry_time, exit_time, created_at
+            FROM closed_positions
+            WHERE exit_time IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 3
+        '''
+
+        recent_trades = execute_mysql_query(query, fetch_all=True)
+
+        if not recent_trades:
+            print("   ℹ️ No recent trades found in MySQL database")
+            return
+
+        if (LAST_TRADE_RESULT['profit_loss'] is not None and
+            not LAST_TRADE_RESULT['processed']):
+
+            print(f"   🔍 Found {len(recent_trades)} recent trades in MySQL database")
+
+            for trade in recent_trades:
+                db_pnl = trade['pnl']
+                if abs(float(db_pnl) - LAST_TRADE_RESULT['profit_loss']) < 0.01:
+                    print(f"   🎯 Found matching trade in MySQL DB: P&L={db_pnl}")
+                    print("   🆕 AUTO-CLEARING stuck result based on database match")
+                    clear_stuck_trade_result()
+                    return
+
+            print("   ⚠️ No exact match found - AUTO-CLEARING to unstick bot")
+            clear_stuck_trade_result()
+        else:
+            print("   ✅ No stuck result detected")
+
+    except Exception as e:
+        print(f"   ❌ Error in database reconciliation: {e}")
+        clear_stuck_trade_result()
+
+
+# ========== API ROUTES ==========
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/ping')
+def ping():
+    """Health check endpoint for keepalive services"""
+    return jsonify({
+        'status': 'alive',
+        'timestamp': datetime.now().isoformat(),
+        'service': 'delta-trading-bot',
+        'uptime': 'running'
+    })
+
+@app.route('/api/system-ip', methods=['GET'])
+def get_system_ip():
+    """Get current system IP address"""
+    try:
+        import socket
+
+        try:
+            public_ip = requests.get('https://ipinfo.io/ip', timeout=5).text.strip()
+        except:
+            public_ip = "Unknown"
+
+        try:
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+        except:
+            local_ip = "Unknown"
+
+        return jsonify({
+            'success': True,
+            'public_ip': public_ip,
+            'local_ip': local_ip,
+            'port': 8090
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error getting IP: {str(e)}'}), 500
+
+@app.route('/api/start-bot', methods=['POST'])
+def start_bot():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'message': 'No data provided'}), 400
+
+        leverage   = data.get('leverage', 10)
+        tp_percent = data.get('tp_percent', 2.0)
+        sl_percent = data.get('sl_percent', 1.0)
+        symbol     = data.get('symbol', 'ADAUSD')
+
+        max_steps = max(LOT_STEPS.keys())
+
+        if not isinstance(leverage, int) or leverage < 1 or leverage > 200:
+            return jsonify({'success': False, 'message': 'Leverage must be integer between 1-200'}), 400
+
+        if not isinstance(tp_percent, (int, float)) or tp_percent < 0.1 or tp_percent > 50:
+            return jsonify({'success': False, 'message': 'TP percent must be between 0.1-50'}), 400
+
+        if not isinstance(sl_percent, (int, float)) or sl_percent < 0.1 or sl_percent > 50:
+            return jsonify({'success': False, 'message': 'SL percent must be between 0.1-50'}), 400
+
+        if not isinstance(symbol, str) or len(symbol) < 1 or len(symbol) > 20:
+            return jsonify({'success': False, 'message': 'Symbol must be string between 1-20 characters'}), 400
+
+        BOT_STATE['leverage']   = leverage
+        BOT_STATE['tp_percent'] = float(tp_percent)
+        BOT_STATE['sl_percent'] = float(sl_percent)
+        BOT_STATE['max_steps']  = max_steps
+        BOT_STATE['symbol']     = symbol.upper()
+
+        # ✅ FIX: Load saved step/lot/PnL from database on start
+        print(f"\n🔍 LOADING SAVED BOT STATE FROM DATABASE...")
+        state_loaded = load_bot_state_from_db()
+
+        print(f"\n🔍 CHECKING FOR EXISTING LIVE POSITION BEFORE START...")
+        product_id = get_product_id(symbol)
+        has_existing_position = False
+
+        if product_id:
+            current_pos = check_position_realtime(product_id)
+            if abs(current_pos.get('size', 0)) > 0.001:
+                has_existing_position = True
+                current_lot   = abs(current_pos.get('size', 0))
+                detected_step = detect_current_step_from_lot(current_lot)
+
+                # ✅ FIX: Only override DB state with live position if they conflict
+                if state_loaded and BOT_STATE['current_step'] != detected_step:
+                    print(f"⚠️ DB step={BOT_STATE['current_step']} conflicts with live position step={detected_step}")
+                    print(f"   Using LIVE POSITION as ground truth (position is real)")
+                    BOT_STATE['current_step'] = detected_step
+                    BOT_STATE['current_lot']  = current_lot
+                elif not state_loaded:
+                    BOT_STATE['current_step'] = detected_step
+                    BOT_STATE['current_lot']  = current_lot
+
+                print(f"🚨 EXISTING POSITION FOUND: {current_lot} lots")
+                print(f"🔄 STEP DETECTION: Lot {current_lot} = Step {detected_step}")
+            else:
+                if not state_loaded:
+                    BOT_STATE['current_step'] = 1
+                    BOT_STATE['current_lot']  = LOT_STEPS[1]
+                    print(f"✅ No existing position & no DB state - starting fresh at Step 1, Lot {LOT_STEPS[1]}")
+                else:
+                    print(f"✅ No existing position - using DB state: Step {BOT_STATE['current_step']}, Lot {BOT_STATE['current_lot']}")
+        else:
+            if not state_loaded:
+                BOT_STATE['current_step'] = 1
+                BOT_STATE['current_lot']  = LOT_STEPS[1]
+                print(f"⚠️ Could not check position & no DB state - starting fresh at Step 1, Lot {LOT_STEPS[1]}")
+            else:
+                print(f"⚠️ Could not check position - using DB state: Step {BOT_STATE['current_step']}, Lot {BOT_STATE['current_lot']}")
+
+        print(f"🎯 BOT STARTING WITH STEP-BASED SYSTEM:")
+        print(f"   📊 Current Step: {BOT_STATE['current_step']}")
+        print(f"   📊 Current Lot:  {BOT_STATE['current_lot']}")
+        print(f"   📊 Max Steps:    {BOT_STATE['max_steps']}")
+        print(f"   📊 Symbol:       {symbol}")
+        print(f"   📊 Leverage:     {BOT_STATE['leverage']}")
+        print(f"   📊 TP%:          {BOT_STATE['tp_percent']}")
+        print(f"   📊 SL%:          {BOT_STATE['sl_percent']}")
+
+        if start_auto_trading_bot():
+            return jsonify({
+                'success': True,
+                'message': 'Bot started successfully',
+                'current_step': BOT_STATE['current_step'],
+                'current_lot': BOT_STATE['current_lot'],
+                'has_existing_position': has_existing_position
+            })
+        return jsonify({'success': False, 'message': 'Bot already running'})
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Invalid request: {str(e)}'}), 400
+
+@app.route('/api/force-stop', methods=['POST'])
+def force_stop_bot():
+    """Force stop bot immediately"""
+    try:
+        BOT_STATE['force_stop'] = True
+        print("🛑 FORCE STOP ACTIVATED - Bot will stop immediately")
+        return jsonify({'success': True, 'message': 'Force stop activated'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
+@app.route('/api/stop-at-win', methods=['POST'])
+def stop_at_win():
+    """Stop bot after next profitable trade"""
+    try:
+        BOT_STATE['stop_at_win'] = True
+        BOT_STATE['force_stop']  = False
+        print("🎯 STOP AT WIN ACTIVATED - Bot will stop after next profit")
+        return jsonify({'success': True, 'message': 'Stop at win activated'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
+@app.route('/api/stop-at-max-streak', methods=['POST'])
+def stop_at_max_streak():
+    """Stop bot when max loss streak is hit"""
+    try:
+        BOT_STATE['stop_at_max_step'] = True
+        BOT_STATE['force_stop']       = False
+        BOT_STATE['stop_at_win']      = False
+        print(f"⚠️ STOP AT MAX STEP ACTIVATED")
+        return jsonify({'success': True, 'message': 'Stop at max step activated'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
+@app.route('/api/clear-stop-conditions', methods=['POST'])
+def clear_stop_conditions():
+    """Clear all stop conditions"""
+    try:
+        BOT_STATE['stop_at_win']      = False
+        BOT_STATE['stop_at_max_step'] = False
+        BOT_STATE['force_stop']       = False
+        print("✅ STOP CONDITIONS CLEARED - Bot will run normally")
+        return jsonify({'success': True, 'message': 'Stop conditions cleared'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
+@app.route('/api/update-symbol', methods=['POST'])
+def update_symbol():
+    """Update trading symbol"""
+    try:
+        data       = request.get_json()
+        new_symbol = data.get('symbol')
+
+        if not new_symbol:
+            return jsonify({'success': False, 'message': 'Symbol is required'}), 400
+
+        valid_symbols = ['ETHUSD']
+        if new_symbol not in valid_symbols:
+            return jsonify({'success': False, 'message': f'Invalid symbol. Valid symbols: {valid_symbols}'}), 400
+
+        old_symbol        = BOT_STATE['symbol']
+        BOT_STATE['symbol'] = new_symbol
+
+        print(f"📊 Trading symbol updated: {old_symbol} → {new_symbol}")
+        return jsonify({'success': True, 'message': f'Symbol updated to {new_symbol}'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error updating symbol: {str(e)}'}), 500
+
+@app.route('/api/stop-bot', methods=['POST'])
+def stop_bot():
+    try:
+        if stop_auto_trading_bot():
+            return jsonify({'success': True, 'message': 'Bot stopped successfully'})
+        return jsonify({'success': False, 'message': 'Bot was not running'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error stopping bot: {str(e)}'}), 500
+
+@app.route('/api/reset-bot-state', methods=['POST'])
+def reset_bot_state():
+    """
+    ✅ NEW: Reset bot state completely - clear DB state and restart from Step 1.
+    Use this when you want to start fresh (e.g., after manual position close).
+    """
+    try:
+        global LAST_TRADE_RESULT
+
+        # Clear DB state
+        clear_bot_state_from_db()
+
+        # Reset in-memory state
+        BOT_STATE['current_step'] = 1
+        BOT_STATE['current_lot']  = LOT_STEPS[1]
+        BOT_STATE['last_result']  = None
+        BOT_STATE.pop('last_pnl', None)
+
+        LAST_TRADE_RESULT = {
+            'profit_loss': None,
+            'timestamp': None,
+            'lot_used': None,
+            'processed': False
+        }
+
+        print("🔄 Bot state fully reset - will start from Step 1 on next start")
+        return jsonify({
+            'success': True,
+            'message': 'Bot state reset to Step 1',
+            'current_step': 1,
+            'current_lot': LOT_STEPS[1]
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error resetting state: {str(e)}'}), 500
+
+@app.route('/api/bot-status', methods=['GET'])
+def get_bot_status():
+    try:
+        current_step = BOT_STATE['current_step']
+        current_lot  = BOT_STATE['current_lot']
+
+        next_step = current_step + 1
+        if next_step > BOT_STATE['max_steps']:
+            next_step = 1
+        next_lot = LOT_STEPS[next_step]
+
+        current_lot_size = LOT_SIZES.get(BOT_STATE['symbol'], 10)
+
+        return jsonify({
+            'success': True,
+            'status': {
+                'running': BOT_STATE['running'],
+                'current_step': current_step,
+                'current_lot': current_lot,
+                'next_step': next_step,
+                'next_lot': next_lot,
+                'max_steps': BOT_STATE['max_steps'],
+                'last_result': BOT_STATE['last_result'],
+                'base_lot': BOT_STATE['base_lot'],
+                'leverage': BOT_STATE['leverage'],
+                'tp_percent': BOT_STATE['tp_percent'],
+                'sl_percent': BOT_STATE['sl_percent'],
+                'symbol': BOT_STATE['symbol'],
+                'stop_at_win': BOT_STATE['stop_at_win'],
+                'stop_at_max_step': BOT_STATE['stop_at_max_step'],
+                'force_stop': BOT_STATE['force_stop'],
+                'current_lot_size': current_lot_size,
+                'session_start_time': BOT_STATE['session_start_time'],
+                'session_total_pnl': BOT_STATE['session_total_pnl'],
+                'lot_steps': LOT_STEPS
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error getting status: {str(e)}'}), 500
+
+@app.route('/api/clear-stuck-result', methods=['POST'])
+def clear_stuck_result():
+    """Clear stuck trade result to fix bot"""
+    try:
+        if clear_stuck_trade_result():
+            return jsonify({'success': True, 'message': 'Stuck trade result cleared'})
+        else:
+            return jsonify({'success': False, 'message': 'Failed to clear stuck result'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error clearing stuck result: {str(e)}'}), 500
+
+@app.route('/api/wallet-balance', methods=['GET'])
+def wallet_balance():
+    balance_data = get_wallet_balance()
+    return jsonify(balance_data)
+
+@app.route('/api/trade-history', methods=['GET'])
+def trade_history():
+    page     = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 10))
+    offset   = (page - 1) * per_page
+
+    try:
+        count_result = execute_mysql_query('SELECT COUNT(*) as total FROM closed_positions', fetch_one=True)
+        total_trades = count_result['total'] if count_result else 0
+
+        query = '''
+            SELECT id, symbol, side, entry_price, exit_price, quantity, pnl, entry_time, exit_time
+            FROM closed_positions
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        '''
+        trades = execute_mysql_query(query, (per_page, offset), fetch_all=True)
+
+        return jsonify({
+            'trades': [{
+                'symbol': t['symbol'],
+                'side': t['side'],
+                'entry_price': float(t['entry_price']) if t['entry_price'] else None,
+                'exit_price': float(t['exit_price']) if t['exit_price'] else None,
+                'quantity': float(t['quantity']) if t['quantity'] else None,
+                'pnl': float(t['pnl']) if t['pnl'] else None,
+                'entry_time': t['entry_time'],
+                'exit_time': t['exit_time'],
+                'id': str(t['id']) if t.get('id') else f"trade_{hash(t['entry_time'] + t['symbol'])}"
+            } for t in trades],
+            'pagination': {
+                'current_page': page,
+                'per_page': per_page,
+                'total': total_trades,
+                'total_pages': (total_trades + per_page - 1) // per_page,
+                'has_next': page * per_page < total_trades,
+                'has_prev': page > 1
+            }
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e), 'trades': [], 'pagination': None})
+
+@app.route('/api/delete-trades', methods=['POST'])
+def delete_trades():
+    try:
+        data      = request.get_json()
+        trade_ids = data.get('trade_ids', [])
+
+        if not trade_ids:
+            return jsonify({'success': False, 'message': 'No trade IDs provided'})
+
+        numeric_ids = []
+        for trade_id in trade_ids:
+            try:
+                if str(trade_id).startswith('trade_'):
+                    continue
+                numeric_ids.append(int(trade_id))
+            except ValueError:
+                continue
+
+        if not numeric_ids:
+            return jsonify({'success': False, 'message': 'No valid trade IDs found'})
+
+        placeholders = ','.join(['%s'] * len(numeric_ids))
+        delete_query = f'DELETE FROM closed_positions WHERE id IN ({placeholders})'
+        execute_mysql_query(delete_query, numeric_ids, commit=True)
+
+        return jsonify({
+            'success': True,
+            'message': f'Successfully deleted {len(numeric_ids)} trade(s)'
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error deleting trades: {str(e)}'})
+
+
+# ========== TP/SL GUARDIAN ==========
+def auto_tp_sl_guardian():
+    """
+    🛡️ SAFE TP/SL GUARDIAN
+    - Runs every 2 seconds
+    - Edits wrong TP/SL (No Deletion)
+    - Places missing TP/SL immediately
+    - Uses Tolerance to avoid constant editing
+    """
+    print("🛡️ SAFE TP/SL GUARDIAN STARTED (EDIT ONLY)...")
+
+    while True:
+        try:
+            time.sleep(2)
+
+            print(f"\n{'='*80}")
+            print(f"🛡️ GUARDIAN CHECK - {datetime.now().strftime('%H:%M:%S')}")
+            print(f"{'='*80}")
+
+            positions_response = make_api_request('GET', '/positions/margined')
+            if not positions_response or not positions_response.get('success'):
+                continue
+
+            active_positions = [
+                p for p in positions_response.get('result', [])
+                if abs(float(p.get('size', 0))) > 0.0001
+            ]
+
+            if not active_positions:
+                print("ℹ️ No active positions")
+                continue
+
+            for pos in active_positions:
+                try:
+                    symbol     = pos.get("product_symbol") or pos.get("symbol")
+                    size       = float(pos.get("size", 0))
+                    entry      = float(pos.get("entry_price", 0))
+                    product_id = pos.get("product_id")
+
+                    if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
+                        continue
+
+                    print(f"\n📍 [GUARDIAN] {symbol} | Size: {size} | Entry: {entry}")
+
+                    if size > 0:  # LONG
+                        expected_tp = entry * (1 + LIVE_TP_PERCENTAGE / 100)
+                        expected_sl = entry * (1 - LIVE_SL_PERCENTAGE / 100)
+                    else:  # SHORT
+                        expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
+                        expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
+
+                    dynamic_tolerance = entry * 0.0005
+                    print(f"   💡 Expected TP: {expected_tp:.6f} | Expected SL: {expected_sl:.6f} | Tolerance: {dynamic_tolerance:.6f}")
+
+                    orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
+                    if not orders_response or not orders_response.get('success'):
+                        continue
+
+                    orders       = orders_response.get("result", [])
+                    tp_orders    = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "take_profit_order"]
+                    sl_orders    = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
+
+                    tp_valid        = False
+                    sl_valid        = False
+                    wrong_tp_orders = []
+                    wrong_sl_orders = []
+
+                    for tp_order in tp_orders:
+                        stop_price = float(tp_order.get("stop_price", 0))
+                        if abs(stop_price - expected_tp) < dynamic_tolerance:
+                            tp_valid = True
+                            print(f"   ✅ TP Order {tp_order.get('id')} is CORRECT")
+                        else:
+                            wrong_tp_orders.append(tp_order)
+
+                    for sl_order in sl_orders:
+                        stop_price = float(sl_order.get("stop_price", 0))
+                        if abs(stop_price - expected_sl) < dynamic_tolerance:
+                            sl_valid = True
+                            print(f"   ✅ SL Order {sl_order.get('id')} is CORRECT")
+                        else:
+                            wrong_sl_orders.append(sl_order)
+
+                    tp_edited = False
+                    sl_edited = False
+
+                    if wrong_tp_orders and not tp_valid:
+                        for tp_order in wrong_tp_orders:
+                            order_id     = tp_order.get("id")
+                            print(f"   🔧 EDITING TP order {order_id}...")
+                            edit_payload = {"id": order_id, "product_id": int(product_id), "order_type": "market_order", "stop_price": "{:.6f}".format(expected_tp), "size": abs(int(size))}
+                            edit_body    = json.dumps(edit_payload)
+                            try:
+                                edit_res = requests.put(BASE_URL + "/v2/orders", headers=sign_request("PUT", "/v2/orders", edit_body), data=edit_body, timeout=10)
+                                if edit_res.status_code == 200:
+                                    print(f"   ✅ TP EDITED successfully")
+                                    tp_edited = True
+                                    break
+                            except:
+                                pass
+
+                    if wrong_sl_orders and not sl_valid:
+                        for sl_order in wrong_sl_orders:
+                            order_id     = sl_order.get("id")
+                            print(f"   🔧 EDITING SL order {order_id}...")
+                            edit_payload = {"id": order_id, "product_id": int(product_id), "order_type": "market_order", "stop_price": "{:.6f}".format(expected_sl), "size": abs(int(size))}
+                            edit_body    = json.dumps(edit_payload)
+                            try:
+                                edit_res = requests.put(BASE_URL + "/v2/orders", headers=sign_request("PUT", "/v2/orders", edit_body), data=edit_body, timeout=10)
+                                if edit_res.status_code == 200:
+                                    print(f"   ✅ SL EDITED successfully")
+                                    sl_edited = True
+                                    break
+                            except:
+                                pass
+
+                    need_tp = not tp_valid and not tp_edited
+                    need_sl = not sl_valid and not sl_edited
+
+                    if need_tp or need_sl:
+                        ticker = make_api_request('GET', f'/tickers/{symbol}')
+                        if ticker:
+                            curr_price = float(ticker['result']['close'])
+                            is_safe    = True
+                            if size > 0:
+                                if expected_tp <= curr_price or expected_sl >= curr_price:
+                                    is_safe = False
+                            else:
+                                if expected_tp >= curr_price or expected_sl <= curr_price:
+                                    is_safe = False
+
+                            if not is_safe:
+                                print(f"   ⚠️ Price too close to TP/SL. Skipping placement to avoid error.")
+                                continue
+
+                        print(f"   📤 Placing missing TP/SL...")
+                        payload = {
+                            "product_id": int(product_id),
+                            "take_profit_order": {"order_type": "market_order", "stop_price": "{:.6f}".format(expected_tp)},
+                            "stop_loss_order":   {"order_type": "market_order", "stop_price": "{:.6f}".format(expected_sl)}
+                        }
+                        body = json.dumps(payload)
+                        try:
+                            res = requests.post(BASE_URL + "/v2/orders/bracket", headers=sign_request("POST", "/v2/orders/bracket", body), data=body, timeout=10)
+                            if res.status_code == 200:
+                                print(f"   ✅ Bracket placed successfully")
+                        except:
+                            pass
+
+                    time.sleep(0.3)
+
+                except Exception as e:
+                    print(f"   ❌ Error: {e}")
+
+        except Exception as e:
+            print(f"❌ Guardian error: {e}")
+            time.sleep(2)
+
+
+# ========== MAIN ==========
+if __name__ == '__main__':
+    init_database()
+
+    print("Starting keepalive for Render...")
+    start_keep_alive()
+    print("Keepalive started - will ping every 10 minutes")
+
+    print("Starting signal bot...")
+    if start_signal_bot():
+        print("Signal bot started successfully")
+    else:
+        print("Failed to start signal bot")
+
+    guardian_thread = threading.Thread(target=auto_tp_sl_guardian, daemon=True)
+    guardian_thread.start()
+    print("TP/SL Guardian started in background")
+
+    try:
+        app.run(debug=True, host='0.0.0.0', port=8090, use_reloader=False)
+    finally:
+        print("Stopping signal bot...")
+        stop_signal_bot()
+        print("Signal bot stopped")

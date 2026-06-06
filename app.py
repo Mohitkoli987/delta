@@ -7,6 +7,7 @@ import json
 import threading
 from threading import Lock
 import os
+import sys
 from datetime import datetime
 from dotenv import load_dotenv
 import pymysql
@@ -16,6 +17,58 @@ from decimal import Decimal, ROUND_HALF_UP
 import time as _time
 import random
 from datetime import datetime
+import websocket
+
+# ========== LOGGING CONFIGURATION ==========
+# server.log: Saare logs (Debug + Info)
+# trade.log: Sirf important Trade/State/Error logs
+class Logger(object):
+    def __init__(self, filename="server.log", secondary_file="trade.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8", buffering=1)
+        self.trade_log_file = open(secondary_file, "w", encoding="utf-8", buffering=1)
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+        try:
+            os.fsync(self.log.fileno())
+        except:
+            pass
+
+    def trade_write(self, category, message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted_msg = f"[{timestamp}] [{category}] {message}\n"
+        self.terminal.write(formatted_msg)
+        self.log.write(formatted_msg)
+        self.trade_log_file.write(formatted_msg)
+        self.log.flush()
+        self.trade_log_file.flush()
+        try:
+            os.fsync(self.trade_log_file.fileno())
+        except:
+            pass
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+        self.trade_log_file.flush()
+
+# Initialize Logger
+custom_logger = Logger("server.log", "trade.log")
+sys.stdout = custom_logger
+sys.stderr = custom_logger
+
+def log_trade(msg): custom_logger.trade_write("TRADE", msg)
+def log_state(msg): custom_logger.trade_write("STATE", msg)
+def log_error(msg): custom_logger.trade_write("ERROR", msg)
+def log_system(msg): custom_logger.trade_write("SYSTEM", msg)
+
+# Silence Flask/Werkzeug logs
+import logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +78,8 @@ from keepalive import start_keep_alive
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
+
+LAST_SAVED_TRADE_KEY = None
 
 # ========== MYSQL CONNECTION MANAGER ==========
 def get_mysql_connection():
@@ -43,7 +98,7 @@ def get_mysql_connection():
         )
         return connection
     except Exception as e:
-        print(f"❌ MySQL connection failed: {e}")
+        log_error(f"MySQL connection failed: {e}")
         raise
 
 def execute_mysql_query(query, params=None, fetch_one=False, fetch_all=False, commit=False):
@@ -53,22 +108,18 @@ def execute_mysql_query(query, params=None, fetch_one=False, fetch_all=False, co
         connection = get_mysql_connection()
         with connection.cursor() as cursor:
             cursor.execute(query, params or ())
-
             if commit:
                 connection.commit()
                 return cursor.lastrowid if hasattr(cursor, 'lastrowid') else True
-
             if fetch_one:
                 return cursor.fetchone()
             elif fetch_all:
                 return cursor.fetchall()
             else:
                 return True
-
     except Exception as e:
         if connection:
             connection.rollback()
-        print(f"❌ MySQL query failed: {e}")
         raise
     finally:
         if connection:
@@ -85,52 +136,36 @@ def get_database_size():
         result = execute_mysql_query(query, fetch_one=True)
         return result['db_size_mb'] if result else 0
     except Exception as e:
-        print(f"❌ Error getting database size: {e}")
         return 0
 
 def cleanup_old_trades(target_size_mb=8.5):
     """Remove oldest trades to keep database under target size"""
     try:
         current_size = get_database_size()
-        print(f"📊 Current database size: {current_size}MB")
-
         if current_size <= target_size_mb:
-            print(f"✅ Database size is under limit ({current_size}MB <= {target_size_mb}MB)")
             return True
 
-        print(f"⚠️ Database size exceeds limit ({current_size}MB > {target_size_mb}MB)")
-        print("🧹 Starting cleanup of oldest trades...")
+        log_system(f"Cleanup: DB size {current_size}MB > {target_size_mb}MB limit. Starting cleanup...")
 
         while current_size > target_size_mb:
             count_query = "SELECT COUNT(*) as total_rows FROM closed_positions"
             total_result = execute_mysql_query(count_query, fetch_one=True)
             total_rows = total_result['total_rows'] if total_result else 0
-
             if total_rows <= 10:
-                print("⚠️ Only 10 or fewer rows remaining, stopping cleanup")
                 break
-
             rows_to_delete = max(1, total_rows // 10)
-
             delete_query = """
             DELETE FROM closed_positions
             ORDER BY created_at ASC
             LIMIT %s
             """
             execute_mysql_query(delete_query, (rows_to_delete,), commit=True)
-
             current_size = get_database_size()
-            print(f"🗑️ Deleted {rows_to_delete} oldest rows, new size: {current_size}MB")
 
-            if rows_to_delete == 1 and current_size > target_size_mb:
-                print("⚠️ Deleting rows one by one, but still over limit")
-                break
-
-        print(f"✅ Cleanup completed. Final database size: {current_size}MB")
+        log_system(f"Cleanup completed. Final size: {current_size}MB")
         return True
-
     except Exception as e:
-        print(f"❌ Error during cleanup: {e}")
+        log_error(f"Cleanup error: {e}")
         return False
 
 # API Configuration
@@ -138,18 +173,25 @@ def cleanup_old_trades(target_size_mb=8.5):
 BASE_URL = "https://api.india.delta.exchange"
 
 WS_URL = "wss://socket.india.delta.exchange"
+# WS_URL ="wss://testnet-socket.india.delta.exchange"
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
 # ---------- LIVE POSITION TP/SL CONFIGURATION ----------
-LIVE_TP_PERCENTAGE = 0.1  # Take Profit %
+LIVE_TP_PERCENTAGE = 0.5   # Take Profit %
 LIVE_SL_PERCENTAGE = 0.35  # Stop Loss %
 
 processing_lock = threading.Lock()
 last_processed = {}
 
+# =====================================================================
 # Step-Based Lot Progression System
+# Rule:
+#   WIN  (any step) → reset to Step 1 (lot = 1)
+#   LOSS (any step) → advance to next step
+#   Max step reached → reset to Step 1
+# =====================================================================
 LOT_STEPS = {
     1: 1,
     2: 2,
@@ -157,12 +199,27 @@ LOT_STEPS = {
     4: 8,
     5: 16,
     6: 32,
-    7: 64,
-    8: 128,
-    9: 256,
-    10: 512,
-    11: 1056
+    # 7: 64,
+    # 8: 128,
+    # 9: 256,
+    # 10: 512,
+    # 11: 1056
 }
+
+
+# LOT_STEPS = {
+#     1: 100,
+#     2: 200,
+#     3: 400,
+#     4: 800,
+#     5: 1600,
+#     6: 3200,
+#     7: 6400,
+#     8: 12800,
+#     9: 25600,
+#     10: 51200,
+#     11: 102400
+# }
 
 # Bot State
 BOT_STATE = {
@@ -176,19 +233,26 @@ BOT_STATE = {
     'sl_percent': 0.4,
     'max_steps': max(LOT_STEPS.keys()),
     'last_result': None,
-    'symbol': 'ADAUSD',
+    'symbol': 'ETHUSD',
     'stop_at_win': False,
     'stop_at_max_step': False,
     'force_stop': False,
     'session_start_time': None,
-    'session_total_pnl': 0.0
+    'session_total_pnl': 0.0,
+    # =====================================================================
+    # ORDER COMPLETION TRACKING
+    # last_placed_order_id: The order ID of the most recently placed order.
+    # order_completed: True only after pair found + trade saved + state saved.
+    #                  MUST be True before DB load, DB sync, or new order.
+    # =====================================================================
+    'last_placed_order_id': None,
+    'order_completed': True,   # True at boot (no pending order)
 }
 
 # Trading Configuration - Market Specific Lot Sizes
 LOT_SIZES = {
-    'ADAUSD': 1,
+    'ETHUSD': 0.01,
 }
-
 LOT_SIZE_DEFAULT = 1
 
 # Trade Result Memory
@@ -201,6 +265,68 @@ LAST_TRADE_RESULT = {
 
 LOT_CALCULATION_LOCK = False
 LAST_PROCESSED_TRADE_ID = None
+
+# =====================================================================
+# FIX 1: FILL DEDUPLICATION
+# Every fill order_id used as entry OR exit is stored here so the same
+# fill is NEVER processed as part of two different trades.
+# =====================================================================
+USED_FILL_IDS = set()
+USED_FILL_IDS_LOCK = Lock()
+
+# =====================================================================
+# DUPLICATE TRADE FIX: PROCESSED_ORDER_IDS
+#
+# WHY THE DUPLICATE HAPPENED:
+#   The WS path (_pair_ws_fills) and the dead reckoning path
+#   (find_trade_by_order_id) both ran in the same or back-to-back
+#   check_position_and_detect_closure() calls on the same entry order_id.
+#
+#   _pair_ws_fills() marks USED_FILL_IDS at the END of pairing.
+#   find_trade_by_order_id() reads USED_FILL_IDS at the START with a
+#   snapshot copy (already_used = set(USED_FILL_IDS)). If both functions
+#   run before either one has finished writing back to USED_FILL_IDS, the
+#   snapshot in find_trade_by_order_id() does NOT contain the WS-marked IDs
+#   yet, and the same entry fill gets paired a second time, producing a
+#   fake trade identical to the real one (same timestamp = 05:14:29).
+#
+#   Additionally, save_closed_position() only deduped on (symbol,
+#   entry_time) which is a timestamp string. Two paths completing within
+#   the same second produce identical entry_time strings, so the in-memory
+#   LAST_SAVED_TRADE_KEY check passes for the second call, and the DB
+#   INSERT hits the UNIQUE KEY (symbol, entry_time, side) — but the
+#   pymysql IntegrityError is silently caught, meaning the second fake
+#   trade is dropped at the DB level. HOWEVER: _apply_step_progression()
+#   and save_bot_state_to_db() already ran for the second path BEFORE
+#   save_closed_position() was called, corrupting the step/lot state.
+#
+# THE FIX:
+#   PROCESSED_ORDER_IDS is a set of entry order_ids that have been fully
+#   processed (pair found + state saved + DB saved). It is checked at the
+#   very top of EVERY pairing path — WS, REST, and dead reckoning — under
+#   PROCESSED_ORDER_IDS_LOCK before any pairing work begins.
+#
+#   The entry order_id is added to PROCESSED_ORDER_IDS atomically BEFORE
+#   _apply_step_progression() and save_bot_state_to_db() are called, so
+#   even if a second path runs concurrently, it will see the ID as already
+#   processed and return immediately without touching step/lot state or DB.
+#
+#   This is a separate set from USED_FILL_IDS:
+#   - USED_FILL_IDS: tracks individual fill order_ids (entry AND exit)
+#                    to prevent the same fill appearing in two trades.
+#   - PROCESSED_ORDER_IDS: tracks entry order_ids to prevent the same
+#                           TRADE from being processed twice from any path.
+# =====================================================================
+PROCESSED_ORDER_IDS      = set()
+PROCESSED_ORDER_IDS_LOCK = Lock()
+
+# =====================================================================
+# FIX 2: COOLDOWN
+# LAST_CLOSE_TIMESTAMP is set the instant a position close is detected.
+# The bot loop enforces COOLDOWN_SECONDS gap before the next order.
+# =====================================================================
+LAST_CLOSE_TIMESTAMP = 0.0
+COOLDOWN_SECONDS = 15
 
 # Recovery System
 PROCESSED_EXIT_FILL_IDS = set()
@@ -227,6 +353,8 @@ db_lock = Lock()
 BOT_PROCESS = None
 bot_process_lock = Lock()
 
+LAST_SAVED_TRADE_KEY = None
+
 
 # ========== DATABASE ==========
 def init_database():
@@ -244,15 +372,44 @@ def init_database():
                 entry_time VARCHAR(50) NOT NULL,
                 exit_time VARCHAR(50),
                 is_latest TINYINT(1) DEFAULT 0,
+                entry_order_id VARCHAR(100) DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_symbol (symbol),
                 INDEX idx_created_at (created_at),
-                INDEX idx_is_latest (is_latest)
+                INDEX idx_is_latest (is_latest),
+                INDEX idx_entry_order_id (entry_order_id),
+                UNIQUE KEY uq_trade (symbol, entry_time, side),
+                UNIQUE KEY uq_entry_order (entry_order_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         '''
         execute_mysql_query(create_table_query, commit=True)
 
-        # ✅ FIX: Create bot_state table to persist step/lot across restarts
+        # Add entry_order_id column to existing tables that may not have it
+        # This is safe to run on existing tables — ALTER COLUMN IF NOT EXISTS
+        try:
+            execute_mysql_query(
+                "ALTER TABLE closed_positions ADD COLUMN entry_order_id VARCHAR(100) DEFAULT NULL",
+                commit=True
+            )
+        except Exception:
+            pass  # Column already exists — that is fine
+
+        try:
+            execute_mysql_query(
+                "ALTER TABLE closed_positions ADD UNIQUE KEY uq_entry_order (entry_order_id)",
+                commit=True
+            )
+        except Exception:
+            pass  # Index already exists — that is fine
+
+        try:
+            execute_mysql_query(
+                "ALTER TABLE closed_positions ADD INDEX idx_entry_order_id (entry_order_id)",
+                commit=True
+            )
+        except Exception:
+            pass  # Index already exists — that is fine
+
         create_state_table_query = '''
             CREATE TABLE IF NOT EXISTS bot_state (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -263,7 +420,6 @@ def init_database():
         '''
         execute_mysql_query(create_state_table_query, commit=True)
         print("✅ MySQL tables ready (existing data preserved)")
-
     except Exception as e:
         print(f"❌ Failed to initialize MySQL database: {e}")
         raise
@@ -272,8 +428,8 @@ def init_database():
 # ========== PERSISTENT STATE FUNCTIONS ==========
 def save_bot_state_to_db():
     """
-    ✅ FIX: Save current step, lot, and last PnL to database so restart resumes correctly.
-    Called after every trade result is processed.
+    Save current step, lot, and last PnL to database so restart resumes correctly.
+    Called after EVERY trade result is processed.
     """
     try:
         state_data = {
@@ -289,16 +445,18 @@ def save_bot_state_to_db():
             ON DUPLICATE KEY UPDATE state_value = VALUES(state_value), updated_at = NOW()
         '''
         execute_mysql_query(upsert_query, ('martingale_state', json.dumps(state_data)), commit=True)
-        print(f"💾 Bot state saved to DB: Step={state_data['current_step']}, Lot={state_data['current_lot']}, LastPnL={state_data['last_pnl']}")
+        log_state(f"STATE SAVED | Step={state_data['current_step']} | Lot={state_data['current_lot']} | LastPnL={state_data['last_pnl']}")
     except Exception as e:
-        print(f"❌ Error saving bot state to DB: {e}")
+        log_error(f"Saving bot state to DB: {e}")
 
 
 def load_bot_state_from_db():
     """
-    ✅ FIX: Load last saved step/lot/PnL from database on restart.
-    This ensures the martingale sequence continues properly after a server restart.
+    Load last saved step/lot/PnL from database on restart.
     Returns True if state was loaded, False if no state found (fresh start).
+
+    SAFETY: Caller MUST check BOT_STATE['order_completed'] == True before calling.
+    This function does NOT check it itself; the guard is in auto_trading_bot_main().
     """
     global LAST_TRADE_RESULT
     try:
@@ -308,34 +466,27 @@ def load_bot_state_from_db():
             fetch_one=True
         )
         if not result or not result.get('state_value'):
-            print("ℹ️ No saved bot state found - fresh start")
+            log_system("No saved bot state found - fresh start")
             return False
 
         state_data = json.loads(result['state_value'])
         saved_at = state_data.get('saved_at', 'unknown')
 
-        print(f"✅ LOADED SAVED BOT STATE from DB (saved at {saved_at}):")
-        print(f"   Step: {state_data.get('current_step')}")
-        print(f"   Lot: {state_data.get('current_lot')}")
-        print(f"   Last PnL: {state_data.get('last_pnl')}")
-        print(f"   Last Result: {state_data.get('last_result')}")
+        log_state(f"LOADED Step={state_data.get('current_step')}, Lot={state_data.get('current_lot')}, Last PnL={state_data.get('last_pnl')}")
 
         BOT_STATE['current_step'] = int(state_data.get('current_step', 1))
-        BOT_STATE['current_lot'] = float(state_data.get('current_lot', LOT_STEPS[1]))
-        BOT_STATE['last_result'] = state_data.get('last_result')
+        BOT_STATE['current_lot']  = float(state_data.get('current_lot', LOT_STEPS[1]))
+        BOT_STATE['last_result']  = state_data.get('last_result')
 
-        # Restore last PnL so next trade can calculate correct step
         last_pnl = state_data.get('last_pnl')
         if last_pnl is not None:
             LAST_TRADE_RESULT['profit_loss'] = float(last_pnl)
-            LAST_TRADE_RESULT['processed'] = True   # Already processed before save
-            LAST_TRADE_RESULT['timestamp'] = saved_at
-            print(f"   ✅ Last PnL restored: {LAST_TRADE_RESULT['profit_loss']}")
+            LAST_TRADE_RESULT['processed']   = True
+            LAST_TRADE_RESULT['timestamp']   = saved_at
 
         return True
-
     except Exception as e:
-        print(f"❌ Error loading bot state from DB: {e}")
+        log_error(f"Loading bot state from DB: {e}")
         return False
 
 
@@ -347,9 +498,116 @@ def clear_bot_state_from_db():
             ('martingale_state',),
             commit=True
         )
-        print("🗑️ Bot state cleared from DB")
+        log_system("Bot state cleared from DB")
     except Exception as e:
-        print(f"❌ Error clearing bot state from DB: {e}")
+        log_error(f"Clearing bot state from DB: {e}")
+
+
+def verify_and_sync_step_from_db():
+    """
+    Read the most recent trade from DB.
+    Recompute BOT_STATE step/lot from actual DB PnL.
+    Returns True if synced OK, False if no trades in DB yet.
+
+    DB is ground truth. Memory is just cache.
+
+    SAFETY: Caller MUST check BOT_STATE['order_completed'] == True before calling.
+    This function does NOT check it itself; the guard is in auto_trading_bot_main().
+    """
+    try:
+        query = '''
+            SELECT pnl, side, entry_time, exit_time, quantity
+            FROM closed_positions
+            WHERE symbol = %s AND exit_time IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+        '''
+        last_trade = execute_mysql_query(query, (BOT_STATE['symbol'],), fetch_one=True)
+
+        if not last_trade:
+            print("ℹ️ [DB SYNC] No trades in DB yet - using current step")
+            return False
+
+        db_pnl    = float(last_trade['pnl']) if last_trade['pnl'] is not None else 0.0
+        db_result = 'PROFIT' if db_pnl > 0 else 'LOSS'
+
+        print(f"\n🔍 [DB SYNC] Last trade from DB:")
+        print(f"   PnL: {db_pnl:.5f} → Result: {db_result}")
+        print(f"   Memory Step BEFORE sync: {BOT_STATE['current_step']} | Lot: {BOT_STATE['current_lot']}")
+
+        # Only re-sync if the DB result differs from what memory thinks
+        memory_pnl = LAST_TRADE_RESULT.get('profit_loss')
+
+        # If memory already matches DB, no correction needed
+        if memory_pnl is not None and abs(memory_pnl - db_pnl) < 0.001:
+            print(f"   ✅ Memory matches DB - no correction needed")
+            return True
+
+        # DB result is different from memory (or memory is empty) - correct step
+        print(f"   ⚠️ DB PnL ({db_pnl:.5f}) differs from memory ({memory_pnl}) - CORRECTING STEP")
+
+        # Update memory to match DB
+        LAST_TRADE_RESULT['profit_loss'] = db_pnl
+        LAST_TRADE_RESULT['processed']   = True
+        BOT_STATE['last_result']         = db_result
+
+        # Now recompute: what SHOULD the step be based on DB result?
+        # We read current step from DB state (saved after last trade)
+        saved_state = execute_mysql_query(
+            "SELECT state_value FROM bot_state WHERE state_key = %s",
+            ('martingale_state',),
+            fetch_one=True
+        )
+
+        if saved_state and saved_state.get('state_value'):
+            state_data    = json.loads(saved_state['state_value'])
+            correct_step  = int(state_data.get('current_step', 1))
+            correct_lot   = float(state_data.get('current_lot', LOT_STEPS[1]))
+            print(f"   ✅ Corrected from DB state: Step={correct_step}, Lot={correct_lot}")
+        else:
+            # No saved state - derive step from PnL directly
+            if db_pnl > 0:
+                correct_step = 1
+                correct_lot  = LOT_STEPS[1]
+            else:
+                current = BOT_STATE['current_step']
+                correct_step = min(current + 1, BOT_STATE['max_steps'])
+                correct_lot  = LOT_STEPS[correct_step]
+            print(f"   ✅ Derived step from PnL: Step={correct_step}, Lot={correct_lot}")
+
+        BOT_STATE['current_step'] = correct_step
+        BOT_STATE['current_lot']  = correct_lot
+
+        print(f"   ✅ [DB SYNC] Step corrected → Step {correct_step}: Lot {correct_lot}")
+        return True
+
+    except Exception as e:
+        print(f"❌ [DB SYNC] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+# def generate_random_signal(reason="trade_result"):
+#     """Pure random BUY/SELL signal - no candles, no indicators"""
+#     direction = random.choice(["BUY", "SELL"])
+#     return {
+#         'signal': direction,
+#         'timestamp': datetime.now().isoformat(),
+#         'confidence': 50,
+#         'layer': 'RANDOM',
+#         'score': 0,
+#         'score_buy': 0,
+#         'score_sell': 0,
+#         'source': 'random_signal',
+#         'reason': f'Random signal ({direction})',
+#         'decision_ready': True,
+#         'decision_confidence': 0.5,
+#         'wait': False,
+#         'position_analysis': {'has_position': False},
+#         'backtest_results': {},
+#         'last_trade_result': reason
+#     }
 
 
 # ========== SIGNAL GENERATION ==========
@@ -362,14 +620,14 @@ def _ema(prices, period):
     for p in prices[period:]:
         val = p * k + val * (1 - k)
     return val
- 
- 
+
+
 def _sma(prices, period):
     if len(prices) < period:
         return None
     return sum(prices[-period:]) / period
- 
- 
+
+
 def _rsi(closes, period=14):
     """Wilder RSI"""
     if len(closes) < period + 1:
@@ -388,8 +646,8 @@ def _rsi(closes, period=14):
     if al == 0:
         return 100.0
     return 100 - (100 / (1 + ag / al))
- 
- 
+
+
 def _macd(closes, fast=12, slow=26, signal=9):
     """MACD line, signal line, histogram"""
     if len(closes) < slow + signal:
@@ -399,23 +657,22 @@ def _macd(closes, fast=12, slow=26, signal=9):
     if ema_fast is None or ema_slow is None:
         return None, None, None
     macd_line = ema_fast - ema_slow
- 
-    # Build MACD series for signal line
+
     macd_series = []
     for i in range(slow - 1, len(closes)):
         ef = _ema(closes[:i + 1], fast)
         es = _ema(closes[:i + 1], slow)
         if ef and es:
             macd_series.append(ef - es)
- 
+
     if len(macd_series) < signal:
         return macd_line, None, None
- 
+
     signal_line = _ema(macd_series, signal)
     histogram = macd_line - signal_line if signal_line else None
     return macd_line, signal_line, histogram
- 
- 
+
+
 def _bollinger(closes, period=20, std_dev=2.0):
     """Bollinger Bands: upper, middle (SMA), lower"""
     if len(closes) < period:
@@ -425,10 +682,10 @@ def _bollinger(closes, period=20, std_dev=2.0):
     variance = sum((x - mid) ** 2 for x in recent) / period
     std = variance ** 0.5
     return mid + std_dev * std, mid, mid - std_dev * std
- 
- 
+
+
 def _atr(candles, period=14):
-    """Average True Range — measures volatility"""
+    """Average True Range"""
     if len(candles) < period + 1:
         return None
     trs = []
@@ -444,11 +701,12 @@ def _atr(candles, period=14):
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
     return atr
- 
- 
-def _candle_strength(candles, lookback=3):
+
+
+def _candle_strength(candles, lookback=5):
     """
     Measures momentum strength from last N candles.
+    lookback=5 (upgraded from 3 — better momentum detection)
     Returns: +1 (bullish), -1 (bearish), 0 (neutral)
     """
     if len(candles) < lookback:
@@ -460,21 +718,18 @@ def _candle_strength(candles, lookback=3):
     rng  = last['high'] - last['low']
     body = abs(last['close'] - last['open'])
     body_pct = (body / rng) if rng > 0 else 0
- 
-    # Strong bull: 2+ bull candles AND last candle body > 50% of range
-    if bull >= 2 and body_pct > 0.5 and last['close'] > last['open']:
+
+    if bull >= 3 and body_pct > 0.5 and last['close'] > last['open']:
         return 1
-    if bear >= 2 and body_pct > 0.5 and last['close'] < last['open']:
+    if bear >= 3 and body_pct > 0.5 and last['close'] < last['open']:
         return -1
     return 0
- 
- 
+
+
 # ──────────────────────────────────────────────
 #  TIMEFRAME BIAS SCORER
-#  Returns: (bias, score) where bias = 'BUY'/'SELL'/'NEUTRAL'
-#  score = 0-10
 # ──────────────────────────────────────────────
- 
+
 def _score_timeframe(candles, label=""):
     """
     Score a single timeframe for directional bias.
@@ -482,12 +737,12 @@ def _score_timeframe(candles, label=""):
     """
     if len(candles) < 30:
         return {'bias': 'NEUTRAL', 'score': 0, 'details': ['Not enough candles']}
- 
+
     closes = [c['close'] for c in candles]
     score_buy  = 0
     score_sell = 0
     details    = []
- 
+
     # ── EMA 9 vs 21 (short trend)
     ema9  = _ema(closes, 9)
     ema21 = _ema(closes, 21)
@@ -498,7 +753,7 @@ def _score_timeframe(candles, label=""):
         else:
             score_sell += 2
             details.append(f"[{label}] EMA9<EMA21 → SELL +2")
- 
+
     # ── EMA 21 vs 50 (medium trend)
     ema50 = _ema(closes, 50) if len(closes) >= 50 else None
     if ema21 and ema50:
@@ -508,7 +763,7 @@ def _score_timeframe(candles, label=""):
         else:
             score_sell += 1
             details.append(f"[{label}] EMA21<EMA50 → SELL +1")
- 
+
     # ── RSI filter
     rsi = _rsi(closes, 14)
     if rsi < 35:
@@ -523,17 +778,22 @@ def _score_timeframe(candles, label=""):
     else:
         score_sell += 1
         details.append(f"[{label}] RSI={rsi:.1f} above 50 → SELL +1")
- 
+
     # ── MACD histogram direction
     macd_line, signal_line, histogram = _macd(closes)
     if histogram is not None:
-        if histogram > 0:
-            score_buy += 2
-            details.append(f"[{label}] MACD histogram positive → BUY +2")
+        # ── FIX: Weak histogram (near zero) ko ignore karo
+        histogram_threshold = abs(closes[-1]) * 0.00005  # 0.005% of price
+        if abs(histogram) > histogram_threshold:
+            if histogram > 0:
+                score_buy += 2
+                details.append(f"[{label}] MACD histogram positive → BUY +2")
+            else:
+                score_sell += 2
+                details.append(f"[{label}] MACD histogram negative → SELL +2")
         else:
-            score_sell += 2
-            details.append(f"[{label}] MACD histogram negative → SELL +2")
-        # MACD crossover bonus (strongest signal)
+            details.append(f"[{label}] MACD histogram too weak — SKIP")
+
         if macd_line and signal_line:
             if macd_line > signal_line:
                 score_buy += 1
@@ -541,31 +801,30 @@ def _score_timeframe(candles, label=""):
             else:
                 score_sell += 1
                 details.append(f"[{label}] MACD below signal → SELL +1")
- 
+
     # ── Bollinger Bands position
     bb_upper, bb_mid, bb_lower = _bollinger(closes)
     if bb_upper and bb_lower:
         price = closes[-1]
         bb_range = bb_upper - bb_lower
         if bb_range > 0:
-            bb_pos = (price - bb_lower) / bb_range  # 0=at lower, 1=at upper
+            bb_pos = (price - bb_lower) / bb_range
             if bb_pos < 0.25:
                 score_buy += 1
                 details.append(f"[{label}] Price near BB lower → BUY +1")
             elif bb_pos > 0.75:
                 score_sell += 1
                 details.append(f"[{label}] Price near BB upper → SELL +1")
- 
-    # ── Candle momentum
-    pattern = _candle_strength(candles, lookback=3)
+
+    # ── Candle momentum (lookback=5 now)
+    pattern = _candle_strength(candles, lookback=5)
     if pattern == 1:
         score_buy += 1
         details.append(f"[{label}] Bullish candle momentum → BUY +1")
     elif pattern == -1:
         score_sell += 1
         details.append(f"[{label}] Bearish candle momentum → SELL +1")
- 
-    # Max possible = 10 per direction
+
     net = score_buy - score_sell
     if net > 0:
         bias = 'BUY'
@@ -576,7 +835,7 @@ def _score_timeframe(candles, label=""):
     else:
         bias = 'NEUTRAL'
         score = 0
- 
+
     return {
         'bias': bias,
         'score': score,
@@ -589,20 +848,14 @@ def _score_timeframe(candles, label=""):
         'ema50': ema50,
         'details': details
     }
- 
- 
+
+
 # ──────────────────────────────────────────────
-#  CANDLE FETCHER  (multi-resolution)
+#  CANDLE FETCHER
 # ──────────────────────────────────────────────
- 
+
 def _fetch_candles(symbol, resolution, num_candles):
-    """
-    Fetch OHLC candles from Delta Exchange.
-    resolution: '5m', '15m', '1h', '4h'
-    Returns sorted list of dicts.
-    """
     try:
-        # Map resolution to seconds
         res_seconds = {
             '1m': 60, '3m': 180, '5m': 300,
             '15m': 900, '30m': 1800,
@@ -611,7 +864,7 @@ def _fetch_candles(symbol, resolution, num_candles):
         sec = res_seconds.get(resolution, 300)
         end_time   = int(_time.time())
         start_time = end_time - (num_candles * sec)
- 
+
         response = make_api_request(
             'GET',
             f'/history/candles?resolution={resolution}&symbol={symbol}&start={start_time}&end={end_time}'
@@ -619,7 +872,7 @@ def _fetch_candles(symbol, resolution, num_candles):
         if not response or not response.get('result'):
             print(f"⚠️ No candles for {symbol} @ {resolution}")
             return []
- 
+
         parsed = []
         for c in response['result']:
             try:
@@ -632,263 +885,333 @@ def _fetch_candles(symbol, resolution, num_candles):
                 })
             except Exception:
                 continue
- 
+
         parsed.sort(key=lambda x: x['time'])
         print(f"📊 {symbol} @ {resolution}: {len(parsed)} candles fetched")
         return parsed
- 
+
     except Exception as e:
         print(f"❌ Error fetching {resolution} candles: {e}")
         return []
- 
- 
+
+
 # ──────────────────────────────────────────────
-#  ATR MARKET FILTER — skip choppy/low-vol markets
+#  ATR MARKET FILTER
 # ──────────────────────────────────────────────
- 
+
 def _is_market_tradeable(candles_15m):
-    """
-    Returns True if market has enough volatility to trade.
-    Skips flat/dead markets where signals are unreliable.
-    """
     if len(candles_15m) < 15:
-        return True  # not enough data, don't block
- 
+        return True
+
     atr_val = _atr(candles_15m, 14)
     closes  = [c['close'] for c in candles_15m]
     price   = closes[-1]
- 
+
     if atr_val is None or price <= 0:
         return True
- 
-    # ATR as % of price
+
     atr_pct = (atr_val / price) * 100
- 
-    # Below 0.02% ATR = extremely flat market = skip
+
     if atr_pct < 0.02:
         print(f"⚠️ Market too flat: ATR={atr_pct:.4f}% — SKIPPING signal")
         return False
- 
+
     print(f"✅ Market volatility OK: ATR={atr_pct:.4f}%")
     return True
- 
- 
+
+
 # ──────────────────────────────────────────────
-#  MAIN SIGNAL FUNCTION  (drop-in replacement)
+#  MAIN SIGNAL FUNCTION — v3 (FASTER + TP/SL REF)
 # ──────────────────────────────────────────────
- 
+
 def generate_smart_signal(reason="trade_decision"):
     """
-    UPGRADED SIGNAL ENGINE v2 — Multi-Timeframe Confluence
- 
+    SIGNAL ENGINE v3 — Multi-Timeframe Confluence + TP/SL Reference
+
+    KEY CHANGES vs v2:
+    - 4H is ADVISORY only (not blocking) — fixes "signal bahut der" issue
+    - MIN_15M_NET reduced: 4 → 3 (faster signal generation)
+    - NEUTRAL on 4H is allowed — only 1H+15M must agree
+    - Weak MACD histogram ignored (near-zero filter)
+    - ref_entry, ref_sl, ref_tp added to signal (reading only, bot handles real SL/TP)
+    - Candle lookback upgraded 3 → 5
+
     Logic:
     1. Fetch 4h, 1h, 15m candles
-    2. Score each timeframe independently (0-10)
-    3. Require ALL THREE to agree on direction
-    4. Require 15m score >= 6 for entry quality
-    5. Skip if market is too flat (ATR filter)
-    6. Return WAIT signal if criteria not met
- 
-    This generates ONE accurate signal after each trade,
-    not continuous spammy decisions.
+    2. Score each timeframe (0-10)
+    3. 1H + 15M MUST agree (required)
+    4. 4H is bonus — if agrees, confidence boost; if neutral/conflicts, warning only
+    5. 15m net score >= 3 required
+    6. ATR filter (skip flat markets)
+    7. Add ref_entry/ref_sl/ref_tp for display purposes only
     """
- 
-    symbol = BOT_STATE.get('symbol', 'ADAUSD')
+
+    symbol = BOT_STATE.get('symbol', 'ETHUSD')
     print(f"\n{'='*60}")
-    print(f"🧠 SIGNAL ENGINE v2 — {symbol} — {datetime.now().strftime('%H:%M:%S')}")
+    print(f"🧠 SIGNAL ENGINE v3 — {symbol} — {datetime.now().strftime('%H:%M:%S')}")
     print(f"{'='*60}")
- 
-    # ── Step 1: Fetch all three timeframes ──────────────────
-    candles_4h  = _fetch_candles(symbol, '4h',  60)   # ~10 days
-    candles_1h  = _fetch_candles(symbol, '1h',  80)   # ~3.3 days
-    candles_15m = _fetch_candles(symbol, '15m', 80)   # ~20 hours
- 
-    # Minimum candle requirements
+
+    # ── Step 1: Fetch candles ────────────────────────────────
+    candles_4h  = _fetch_candles(symbol, '4h',  60)
+    candles_1h  = _fetch_candles(symbol, '1h',  80)
+    candles_15m = _fetch_candles(symbol, '15m', 80)
+
     if len(candles_4h) < 20:
-        print(f"⚠️ Not enough 4h candles ({len(candles_4h)}) — falling back to 1h+15m only")
+        print(f"⚠️ Not enough 4h candles ({len(candles_4h)}) — 4H will be advisory only")
         candles_4h = None
- 
+
     if len(candles_1h) < 20 or len(candles_15m) < 20:
-        print(f"⚠️ Insufficient candle data — random fallback")
+        print(f"⚠️ Insufficient 1H/15M candle data — random fallback")
         direction = random.choice(['BUY', 'SELL'])
         return _make_signal(direction, 50, 'RANDOM_FALLBACK', 0, reason,
                             {}, {}, {}, candles_15m or [])
- 
+
     # ── Step 2: ATR volatility filter ───────────────────────
     if not _is_market_tradeable(candles_15m):
-        # Market too flat — return a hold signal
-        # Bot will wait 30s then retry
-        print("⏸️ Market not tradeable — WAIT")
         return _make_wait_signal(reason, "Market too flat (low ATR)")
- 
+
     # ── Step 3: Score each timeframe ────────────────────────
-    result_4h  = _score_timeframe(candles_4h,  '4H')  if candles_4h else None
+    result_4h  = _score_timeframe(candles_4h,  '4H') if candles_4h else None
     result_1h  = _score_timeframe(candles_1h,  '1H')
     result_15m = _score_timeframe(candles_15m, '15M')
- 
+
     print(f"\n📊 TIMEFRAME SCORES:")
     if result_4h:
-        print(f"   4H  → {result_4h['bias']:7s} | BUY={result_4h['score_buy']} SELL={result_4h['score_sell']} | Net={result_4h['net']}")
-    print(f"   1H  → {result_1h['bias']:7s} | BUY={result_1h['score_buy']} SELL={result_1h['score_sell']} | Net={result_1h['net']}")
-    print(f"   15M → {result_15m['bias']:7s} | BUY={result_15m['score_buy']} SELL={result_15m['score_sell']} | Net={result_15m['net']}")
- 
-    # ── Step 4: Confluence check ─────────────────────────────
-    # All available timeframes must agree
+        print(f"   4H  → {result_4h['bias']:7s} | BUY={result_4h['score_buy']} SELL={result_4h['score_sell']} | Net={result_4h['net']} [ADVISORY]")
+    print(f"   1H  → {result_1h['bias']:7s} | BUY={result_1h['score_buy']} SELL={result_1h['score_sell']} | Net={result_1h['net']} [REQUIRED]")
+    print(f"   15M → {result_15m['bias']:7s} | BUY={result_15m['score_buy']} SELL={result_15m['score_sell']} | Net={result_15m['net']} [REQUIRED]")
+
     bias_1h  = result_1h['bias']
     bias_15m = result_15m['bias']
-    bias_4h  = result_4h['bias'] if result_4h else bias_1h  # fallback to 1h if no 4h
- 
-    if bias_4h == 'NEUTRAL' or bias_1h == 'NEUTRAL' or bias_15m == 'NEUTRAL':
-        print(f"⚖️ Neutral timeframe detected — WAIT for clearer setup")
-        return _make_wait_signal(reason, f"Neutral TF: 4H={bias_4h} 1H={bias_1h} 15M={bias_15m}")
- 
-    if not (bias_4h == bias_1h == bias_15m):
-        print(f"⚡ Timeframes CONFLICTING — 4H={bias_4h} 1H={bias_1h} 15M={bias_15m} — WAIT")
-        return _make_wait_signal(reason, f"TF conflict: 4H={bias_4h} 1H={bias_1h} 15M={bias_15m}")
- 
-    # ── Step 5: Entry quality filter (15m must be strong) ────
-    # Require 15m net score >= 4 for entry
-    # This filters out weak/marginal signals
-    MIN_15M_NET = 4  # out of max ~10
- 
+    bias_4h  = result_4h['bias'] if result_4h else 'NEUTRAL'
+
+    # ── Step 4: Core confluence — 1H + 15M MUST agree ───────
+    # (4H is now advisory — neutral/conflict on 4H only lowers confidence)
+    if bias_1h == 'NEUTRAL' or bias_15m == 'NEUTRAL':
+        print(f"⚖️ 1H or 15M is NEUTRAL — WAIT")
+        return _make_wait_signal(reason, f"Neutral TF: 1H={bias_1h} 15M={bias_15m}")
+
+    if bias_1h != bias_15m:
+        print(f"⚡ 1H vs 15M CONFLICT — 1H={bias_1h} 15M={bias_15m} — WAIT")
+        return _make_wait_signal(reason, f"1H/15M conflict: 1H={bias_1h} 15M={bias_15m}")
+
+    # ── Step 5: Entry quality filter ────────────────────────
+    # Reduced from 4 → 3 for faster signal generation
+    MIN_15M_NET = 3
+
     if abs(result_15m['net']) < MIN_15M_NET:
         print(f"📉 15M signal too weak (net={result_15m['net']}, need >={MIN_15M_NET}) — WAIT")
         return _make_wait_signal(reason,
             f"15M weak signal: net={result_15m['net']} (need >={MIN_15M_NET})")
- 
-    # ── Step 6: All checks passed → CONFIRMED SIGNAL ─────────
-    direction = bias_15m  # All 3 agree, use 15m for exact entry timing
- 
-    # Confidence = weighted average of all timeframe scores
-    w4  = 0.25  # 4h weight
-    w1  = 0.35  # 1h weight
-    w15 = 0.40  # 15m weight (most important for entry)
- 
-    max_possible = 10.0
-    score_4h_val  = result_4h['score']  if result_4h  else result_1h['score']
-    conf_raw = (score_4h_val * w4 + result_1h['score'] * w1 + result_15m['score'] * w15) / max_possible
-    confidence = int(min(50 + conf_raw * 50, 95))  # 50-95% range
- 
+
+    # ── Step 6: All checks passed → CONFIRMED ───────────────
+    direction = bias_15m
+
+    # Confidence calculation
+    # 4H agreement = full weight; 4H neutral = half weight; 4H conflict = no weight
+    w1  = 0.45
+    w15 = 0.55
+    score_1h_val  = result_1h['score']
+    score_15m_val = result_15m['score']
+    max_possible  = 10.0
+
+    conf_raw = (score_1h_val * w1 + score_15m_val * w15) / max_possible
+
+    # 4H bonus/penalty
+    if result_4h:
+        if bias_4h == direction:
+            conf_raw = min(conf_raw * 1.15, 1.0)   # +15% boost
+            print(f"   ✅ 4H AGREES ({bias_4h}) — confidence boosted")
+        elif bias_4h == 'NEUTRAL':
+            conf_raw = conf_raw * 0.95              # -5% minor penalty
+            print(f"   ⚠️ 4H NEUTRAL — slight confidence reduction")
+        else:
+            conf_raw = conf_raw * 0.85              # -15% penalty (4H disagrees)
+            print(f"   ⚠️ 4H DISAGREES ({bias_4h} vs {direction}) — confidence reduced")
+
+    confidence = int(min(50 + conf_raw * 50, 95))
+
     layer = 'STRONG_BUY' if direction == 'BUY' else 'STRONG_SELL'
     if result_15m['score'] < 7:
         layer = 'MODERATE_BUY' if direction == 'BUY' else 'MODERATE_SELL'
- 
+
+    # 4H agrees = upgrade to STRONG
+    if result_4h and bias_4h == direction and result_15m['score'] >= 5:
+        layer = 'STRONG_BUY' if direction == 'BUY' else 'STRONG_SELL'
+
     print(f"\n✅ CONFIRMED SIGNAL: {direction}")
-    print(f"   All 3 timeframes ALIGNED: 4H={bias_4h} 1H={bias_1h} 15M={bias_15m}")
+    print(f"   1H={bias_1h} 15M={bias_15m} 4H={bias_4h}(advisory)")
     print(f"   15M net score: {result_15m['net']} / max ~10")
-    print(f"   Confidence: {confidence}%")
-    print(f"   Layer: {layer}")
- 
-    # Print all factor details
+    print(f"   Confidence: {confidence}%  Layer: {layer}")
+
     all_details = []
-    if result_4h:  all_details += result_4h['details']
+    if result_4h: all_details += result_4h['details']
     all_details += result_1h['details']
     all_details += result_15m['details']
     for d in all_details:
         print(f"   {d}")
- 
-    current_price = candles_15m[-1]['close'] if candles_15m else 0
- 
+
     return _make_signal(
         direction, confidence, layer,
         result_15m['net'], reason,
         result_4h or {}, result_1h, result_15m,
         candles_15m
     )
- 
- 
+
+
 # ──────────────────────────────────────────────
 #  SIGNAL BUILDER HELPERS
 # ──────────────────────────────────────────────
- 
+
 def _make_signal(direction, confidence, layer, net_score, reason,
                  r4h, r1h, r15m, candles_15m):
-    """Build the standard signal dict"""
-    price = candles_15m[-1]['close'] if candles_15m else 0
+    """
+    Build the standard signal dict.
+    ref_entry / ref_sl / ref_tp = READING ONLY (bot uses its own SL/TP logic)
+    """
+    price   = candles_15m[-1]['close'] if candles_15m else 0
+    atr_val = _atr(candles_15m, 14) if candles_15m else None
+
+    # Reference levels — display/log only, NOT used by order placement
+    if atr_val and price:
+        if direction == 'BUY':
+            ref_sl = round(price - 1.5 * atr_val, 4)
+            ref_tp = round(price + 3.0 * atr_val, 4)
+        else:
+            ref_sl = round(price + 1.5 * atr_val, 4)
+            ref_tp = round(price - 3.0 * atr_val, 4)
+    else:
+        ref_sl = None
+        ref_tp = None
+
+    print(f"   📍 Entry={price} | ref_SL={ref_sl} | ref_TP={ref_tp} (display only)")
+
     return {
-        'signal': direction,
+        'signal':    direction,
         'timestamp': datetime.now().isoformat(),
         'confidence': confidence,
-        'layer': layer,
-        'score': net_score,
+        'layer':     layer,
+        'score':     net_score,
         'score_buy':  r15m.get('score_buy', 0),
         'score_sell': r15m.get('score_sell', 0),
-        'source': 'smart_signal_v2',
+        'source':    'smart_signal_v3',
+
+        # ── Reference levels (READ ONLY — bot does NOT use these for orders) ──
+        'entry_price': price,    # current market price at signal time
+        'ref_sl':      ref_sl,   # ATR-based reference SL (1.5x ATR)
+        'ref_tp':      ref_tp,   # ATR-based reference TP (3.0x ATR = 2:1 RR)
+
         'reason': (
             f"MTF confluence: "
-            f"4H={r4h.get('bias','?')} "
+            f"4H={r4h.get('bias','?')}(advisory) "
             f"1H={r1h.get('bias','?')} "
             f"15M={r15m.get('bias','?')} | "
             f"Net15m={net_score}"
         ),
-        'decision_ready': True,
+        'decision_ready':      True,
         'decision_confidence': confidence / 100,
-        'wait': False,
-        'position_analysis': {'has_position': False},
+        'wait':                False,
+        'position_analysis':   {'has_position': False},
         'backtest_results': {
-            'ema9':    r15m.get('ema9'),
-            'ema21':   r15m.get('ema21'),
-            'ema50':   r15m.get('ema50'),
-            'rsi':     r15m.get('rsi'),
-            'price':   price,
-            'factors': r15m.get('details', []),
-            '4h_bias': r4h.get('bias', '?'),
-            '1h_bias': r1h.get('bias', '?'),
+            'ema9':     r15m.get('ema9'),
+            'ema21':    r15m.get('ema21'),
+            'ema50':    r15m.get('ema50'),
+            'rsi':      r15m.get('rsi'),
+            'price':    price,
+            'ref_sl':   ref_sl,
+            'ref_tp':   ref_tp,
+            'factors':  r15m.get('details', []),
+            '4h_bias':  r4h.get('bias', '?'),
+            '1h_bias':  r1h.get('bias', '?'),
             '15m_bias': r15m.get('bias', '?'),
         },
         'last_trade_result': reason,
     }
- 
- 
+
+
 def _make_wait_signal(reason, why):
     """Return a WAIT signal — bot will sleep and retry"""
     print(f"⏸️ WAIT: {why}")
     return {
-        'signal': 'WAIT',
-        'timestamp': datetime.now().isoformat(),
-        'confidence': 0,
-        'layer': 'WAIT',
-        'score': 0,
-        'score_buy': 0,
-        'score_sell': 0,
-        'source': 'smart_signal_v2',
-        'reason': why,
-        'decision_ready': False,
+        'signal':      'WAIT',
+        'timestamp':   datetime.now().isoformat(),
+        'confidence':  0,
+        'layer':       'WAIT',
+        'score':       0,
+        'score_buy':   0,
+        'score_sell':  0,
+        'source':      'smart_signal_v3',
+        'reason':      why,
+        'entry_price': None,
+        'ref_sl':      None,
+        'ref_tp':      None,
+        'decision_ready':      False,
         'decision_confidence': 0,
-        'wait': True,
-        'position_analysis': {'has_position': False},
-        'backtest_results': {},
-        'last_trade_result': reason,
+        'wait':                True,
+        'position_analysis':   {'has_position': False},
+        'backtest_results':    {},
+        'last_trade_result':   reason,
     }
  
- 
-def generate_random_signal(reason="trade_result"):
-    """
-    REPLACED: Calls smart signal engine v2.
-    Same function name — no other code needs to change.
-    """
-    return generate_smart_signal(reason=reason)
- 
- 
-# ──────────────────────────────────────────────
-#  BOT LOOP CHANGE NEEDED
-#  In get_trading_signal(), add WAIT handling:
-#
-#   signal_result = get_trading_signal()
-#   side = signal_result[0]
-#
-#   if side == 'WAIT' or side is None:
-#       print("⏸️ WAIT signal — retrying in 30s")
-#       time.sleep(30)   # wait 30 seconds then retry
-#       continue
-#
+
+
+
+
+
+
+
 
 def save_closed_position(trade_data):
-    """Save closed trade to MySQL database with thread safety and size management"""
-    print(f"💾 Saving trade to MySQL database: {trade_data}")
+    """
+    Save closed trade to MySQL database with strong duplicate protection.
+
+    DUPLICATE FIX: Now accepts and stores entry_order_id. The DB has a
+    UNIQUE KEY on entry_order_id, so any second attempt to insert the same
+    trade is rejected at the database level even if all in-memory checks
+    somehow passed. This is the final safety net.
+    """
+    global LAST_SAVED_TRADE_KEY
+
     try:
         with db_lock:
-            print(f"📊 MySQL database connecting...")
+            trade_key = (
+                trade_data['symbol'],
+                trade_data['side'],
+                trade_data['entry_time']
+            )
+
+            if LAST_SAVED_TRADE_KEY == trade_key:
+                log_trade(f"SAVE SKIPPED | Duplicate trade_key in memory: {trade_key}")
+                return
+
+            # Check entry_order_id dedup first (strongest guard)
+            entry_order_id = trade_data.get('entry_order_id')
+            if entry_order_id:
+                order_id_check = execute_mysql_query(
+                    "SELECT id FROM closed_positions WHERE entry_order_id = %s LIMIT 1",
+                    (str(entry_order_id),),
+                    fetch_one=True
+                )
+                if order_id_check:
+                    log_trade(f"SAVE SKIPPED | entry_order_id={entry_order_id} already in DB")
+                    LAST_SAVED_TRADE_KEY = trade_key
+                    return
+
+            duplicate_query = """
+                SELECT id FROM closed_positions
+                WHERE symbol=%s AND entry_time=%s
+                LIMIT 1
+            """
+            existing_trade = execute_mysql_query(
+                duplicate_query,
+                (trade_data['symbol'], trade_data['entry_time']),
+                fetch_one=True
+            )
+
+            if existing_trade:
+                log_trade(f"SAVE SKIPPED | Duplicate (symbol, entry_time) already in DB")
+                LAST_SAVED_TRADE_KEY = trade_key
+                return
 
             cleanup_old_trades(target_size_mb=8.5)
 
@@ -900,29 +1223,36 @@ def save_closed_position(trade_data):
 
             insert_query = '''
                 INSERT INTO closed_positions
-                (symbol, side, entry_price, exit_price, quantity, pnl, entry_time, exit_time, is_latest)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1)
+                (symbol, side, entry_price, exit_price, quantity, pnl,
+                 entry_time, exit_time, is_latest, entry_order_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,%s)
             '''
+            execute_mysql_query(
+                insert_query,
+                (
+                    trade_data['symbol'],
+                    trade_data['side'],
+                    trade_data['entry_price'],
+                    trade_data['exit_price'],
+                    trade_data['quantity'],
+                    trade_data['pnl'],
+                    trade_data['entry_time'],
+                    trade_data['exit_time'],
+                    str(entry_order_id) if entry_order_id else None
+                ),
+                commit=True
+            )
 
-            execute_mysql_query(insert_query, (
-                trade_data['symbol'],
-                trade_data['side'],
-                trade_data['entry_price'],
-                trade_data['exit_price'],
-                trade_data['quantity'],
-                trade_data['pnl'],
-                trade_data['entry_time'],
-                trade_data['exit_time']
-            ), commit=True)
+            LAST_SAVED_TRADE_KEY = trade_key
+            log_trade(f"TRADE SAVED | DB write completed | entry_order_id={entry_order_id}")
 
-            final_size = get_database_size()
-            print(f"✅ Trade saved successfully to MySQL database")
-            print(f"📊 Final database size: {final_size}MB")
-
+    except pymysql.err.IntegrityError as e:
+        # DB-level unique constraint caught a duplicate that slipped past all
+        # in-memory checks. This is expected and safe — just log and move on.
+        log_trade(f"SAVE SKIPPED | DB IntegrityError (duplicate blocked at DB level): {e}")
+        LAST_SAVED_TRADE_KEY = trade_key
     except Exception as e:
-        print(f"❌ Error saving trade to MySQL database: {e}")
-        import traceback
-        traceback.print_exc()
+        log_error(f"Error saving trade to MySQL: {e}")
 
 
 # ========== OPTIMIZED POSITION TRACKING ==========
@@ -942,14 +1272,13 @@ def get_product_id(symbol):
             if product.get('symbol') == symbol:
                 product_id = product.get('id')
                 PRODUCT_ID_CACHE[symbol] = product_id
-                print(f"✅ Cached product_id for {symbol}: {product_id}")
                 return product_id
 
         return None
-
     except Exception as e:
-        print(f"❌ Error getting product_id: {e}")
+        log_error(f"Error getting product_id: {e}")
         return None
+
 
 def check_position_realtime(product_id):
     """Check position with real-time endpoint"""
@@ -958,32 +1287,24 @@ def check_position_realtime(product_id):
         if not response or not response.get('success'):
             print("⚠️ API FAILED - Returning error state")
             return {'error': True}
+
         response = make_api_request('GET', f'/positions?product_id={product_id}')
 
         if response and response.get('success') and response.get('result'):
-            result = response['result']
-            size = float(result.get('size', 0))
+            result      = response['result']
+            size        = float(result.get('size', 0))
             entry_price = float(result.get('entry_price', 0)) if abs(size) > 0.001 else 0
-
             return {
                 'has_position': abs(size) > 0.001,
                 'size': size,
                 'entry_price': entry_price
             }
 
-        return {
-            'has_position': False,
-            'size': 0,
-            'entry_price': 0
-        }
+        return {'has_position': False, 'size': 0, 'entry_price': 0}
 
     except Exception as e:
         print(f"❌ Error checking position: {e}")
-        return {
-            'has_position': False,
-            'size': 0,
-            'entry_price': 0
-        }
+        return {'has_position': False, 'size': 0, 'entry_price': 0}
 
 
 # ========== API FUNCTIONS ==========
@@ -998,9 +1319,10 @@ def get_server_time():
     except:
         return str(int(time.time()))
 
+
 def sign_request(method, path, body=""):
     """Generate API signature using Delta Exchange format"""
-    ts = get_server_time()
+    ts      = get_server_time()
     payload = method + ts + path + body
     signature = hmac.new(
         DELTA_API_SECRET.encode(),
@@ -1014,6 +1336,7 @@ def sign_request(method, path, body=""):
         "Content-Type": "application/json"
     }
 
+
 def safe_float(value, fallback=0.0):
     """Convert value to float safely"""
     try:
@@ -1026,11 +1349,11 @@ def safe_float(value, fallback=0.0):
     except:
         return fallback
 
+
 def make_api_request(method, endpoint, data=None):
     """Make authenticated API request using Delta Exchange format"""
     path = f"/v2{endpoint}"
     body = json.dumps(data) if data else ""
-
     headers = sign_request(method, path, body)
     url = f"{BASE_URL}{path}"
 
@@ -1045,11 +1368,8 @@ def make_api_request(method, endpoint, data=None):
         if response.status_code == 200:
             return response.json()
         else:
-            print(f"❌ API Error: Status {response.status_code}")
-            print(f"❌ Error Body: {response.text}")
             return None
     except Exception as e:
-        print(f"🚨 API Exception: {e}")
         return None
 
 
@@ -1061,15 +1381,14 @@ def place_order(symbol, side, quantity, order_type='market_order'):
         'order_type': order_type,
         'size': quantity
     }
-
     print(f"📋 Order Data: {order_data}")
     return make_api_request('POST', '/orders', order_data)
+
 
 def set_leverage(symbol, leverage):
     """Set leverage using correct Delta Exchange endpoint"""
     products = make_api_request('GET', '/products')
     if not products or not products.get('result'):
-        print(f"❌ Failed to fetch products")
         return None
 
     product_id = None
@@ -1079,12 +1398,10 @@ def set_leverage(symbol, leverage):
             break
 
     if not product_id:
-        print(f"❌ Product not found: {symbol}")
         return None
 
-    print(f"🔧 Found product_id: {product_id} for {symbol}")
-
     return make_api_request('POST', f'/products/{product_id}/orders/leverage', {'leverage': str(leverage)})
+
 
 def get_wallet_balance():
     """Get wallet balance from Delta Exchange API"""
@@ -1096,18 +1413,18 @@ def get_wallet_balance():
             if not isinstance(balances, list):
                 balances = [balances] if isinstance(balances, dict) else []
 
-            wallet_balance = 0.0
+            wallet_balance    = 0.0
             available_balance = 0.0
-            asset_symbol = "USD"
+            asset_symbol      = "USD"
 
             for balance in balances:
                 if not isinstance(balance, dict):
                     continue
                 asset = (balance.get("asset_symbol") or "").upper()
                 if asset in ("USD", "USDT", "USDC"):
-                    wallet_balance = safe_float(balance.get("balance"), 0)
+                    wallet_balance    = safe_float(balance.get("balance"), 0)
                     available_balance = safe_float(balance.get("available_balance"), 0)
-                    asset_symbol = asset
+                    asset_symbol      = asset
                     break
 
             if wallet_balance == 0:
@@ -1116,13 +1433,12 @@ def get_wallet_balance():
                         continue
                     bal_val = safe_float(balance.get("balance"), 0)
                     if bal_val > 0:
-                        wallet_balance = bal_val
+                        wallet_balance    = bal_val
                         available_balance = safe_float(balance.get("available_balance"), 0)
-                        asset_symbol = (balance.get("asset_symbol") or "USD")
+                        asset_symbol      = (balance.get("asset_symbol") or "USD")
                         break
 
             margin_used = wallet_balance - available_balance
-
             return {
                 'success': True,
                 'balance': wallet_balance,
@@ -1150,34 +1466,75 @@ def get_wallet_balance():
         }
 
 
-# ========== FILL PAIRING ENGINE (CORE FIX) ==========
+# ========== OPTIMIZED FILL RETRIEVAL ENGINE ==========
 
-def get_fills_page(page_size=50):
-    """Fetch fills from API with larger page size to catch all fills"""
+def get_fills_page(page_size=5):
+    """
+    Fetch only the most recent fills from API.
+    page_size is capped at 5 - we only need the latest fills
+    for the current trade, never historical data.
+    """
     try:
-        fills = make_api_request('GET', f'/fills?page_size={page_size}')
+        # Hard cap: never fetch more than 5 fills
+        safe_page_size = min(page_size, 5)
+        fills = make_api_request('GET', f'/fills?page_size={safe_page_size}')
         if not fills or not fills.get('result'):
             return []
         return fills.get('result', [])
     except Exception as e:
-        print(f"❌ Error fetching fills: {e}")
+        log_error(f"Error fetching fills: {e}")
         return []
 
-def group_fills_by_order(fills, symbol):
+
+def find_trade_by_order_id(symbol, target_order_id):
     """
-    Group fills by order_id and aggregate them.
-    Handles split fills - e.g. lot 2 split into 1+1 under same order_id.
-    Returns list of aggregated orders: {order_id, side, total_size, avg_price, timestamp}
+    Fetch the 5 most recent fills and find the entry fill matching
+    target_order_id, then find its paired exit fill.
+
+    DUPLICATE FIX: Before doing ANY pairing work, this function checks
+    PROCESSED_ORDER_IDS under lock. If target_order_id is already in that
+    set, it means a previous call (from WS, REST, or dead reckoning) already
+    completed the full pair+save+state sequence for this order. Return
+    immediately with (0, None) so no duplicate processing occurs.
+
+    The entry order_id is added to PROCESSED_ORDER_IDS atomically (under
+    lock) immediately after a valid pair is found — before _apply_step_
+    progression() or save_bot_state_to_db() are called by the caller.
+    This ensures that even if two paths call this function concurrently,
+    only one will find the pair; the second will see the ID in
+    PROCESSED_ORDER_IDS and return (0, None).
+
+    Returns: (pnl, entry_exit_data) or (0, None) if not found / duplicate.
     """
+    if not target_order_id:
+        log_error("find_trade_by_order_id called with no target_order_id")
+        return 0, None
+
+    # ── DUPLICATE CHECK: bail out immediately if already processed ────────
+    with PROCESSED_ORDER_IDS_LOCK:
+        if str(target_order_id) in PROCESSED_ORDER_IDS:
+            log_trade(f"DUPLICATE BLOCKED | order {target_order_id} already in PROCESSED_ORDER_IDS")
+            return 0, None
+
+    fills = get_fills_page(page_size=5)
+    if not fills:
+        return 0, None
+
+    # Filter to this symbol only
     symbol_fills = [f for f in fills if f.get('product_symbol') == symbol]
+    if not symbol_fills:
+        return 0, None
 
-    order_groups = {}  # order_id -> aggregated data
+    # Sort oldest-first by created_at
+    symbol_fills_sorted = sorted(symbol_fills, key=lambda x: x.get('created_at', ''))
 
-    for fill in symbol_fills:
-        order_id = str(fill.get('order_id') or fill.get('id', ''))
-        side = fill.get('side', '')
-        size = float(fill.get('size', 0))
-        price = float(fill.get('price', 0))
+    # Group fills by order_id (handles split fills under same order_id)
+    order_groups = {}
+    for fill in symbol_fills_sorted:
+        order_id   = str(fill.get('order_id') or fill.get('id', ''))
+        side       = fill.get('side', '')
+        size       = float(fill.get('size', 0))
+        price      = float(fill.get('price', 0))
         created_at = fill.get('created_at', '')
 
         if not order_id or size <= 0 or price <= 0:
@@ -1185,17 +1542,154 @@ def group_fills_by_order(fills, symbol):
 
         if order_id not in order_groups:
             order_groups[order_id] = {
-                'order_id': order_id,
-                'side': side,
-                'total_size': 0.0,
+                'order_id':    order_id,
+                'side':        side,
+                'total_size':  0.0,
                 'total_value': 0.0,
-                'avg_price': 0.0,
-                'timestamp': created_at,
+                'avg_price':   0.0,
+                'timestamp':   created_at,
                 'fills_count': 0
             }
 
         grp = order_groups[order_id]
-        grp['total_size'] += size
+        grp['total_size']  += size
+        grp['total_value'] += price * size
+        grp['fills_count'] += 1
+        if created_at < grp['timestamp']:
+            grp['timestamp'] = created_at
+
+    for grp in order_groups.values():
+        if grp['total_size'] > 0:
+            grp['avg_price'] = grp['total_value'] / grp['total_size']
+
+    # Find the entry order matching target_order_id
+    entry_order = order_groups.get(str(target_order_id))
+    if not entry_order:
+        return 0, None
+
+    # Find the exit order: opposite side, not the entry itself, not already used
+    with USED_FILL_IDS_LOCK:
+        already_used = set(USED_FILL_IDS)
+
+    exit_order = None
+    for oid, grp in order_groups.items():
+        if oid == str(target_order_id):
+            continue
+        if oid in already_used:
+            continue
+        if grp['side'] != entry_order['side']:
+            # Opposite side after the entry → this is the exit
+            if grp['timestamp'] >= entry_order['timestamp']:
+                exit_order = grp
+                break
+
+    if not exit_order:
+        return 0, None
+
+    # Calculate PnL
+    entry_side  = entry_order['side']
+    entry_price = entry_order['avg_price']
+    exit_price  = exit_order['avg_price']
+    trade_size  = min(entry_order['total_size'], exit_order['total_size'])
+
+    lot_size        = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
+    actual_quantity = trade_size * lot_size
+
+    if entry_side == 'buy':
+        pnl = (exit_price - entry_price) * actual_quantity
+    else:
+        pnl = (entry_price - exit_price) * actual_quantity
+
+    entry_exit_data = {
+        'side':           entry_side,
+        'entry_price':    entry_price,
+        'exit_price':     exit_price,
+        'quantity':       trade_size,
+        'entry_time':     entry_order['timestamp'],
+        'exit_time':      exit_order['timestamp'],
+        'entry_order_id': str(target_order_id),
+        'exit_order_id':  exit_order['order_id']
+    }
+
+    log_trade(f"PNL CALCULATED | {entry_side.upper()} | Entry={entry_price:.4f} | Exit={exit_price:.4f} | PnL={pnl:.5f} | Result={'PROFIT' if pnl > 0 else 'LOSS'}")
+    log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
+
+    # ── ATOMIC MARK: add to both sets BEFORE returning so no second caller
+    # can pair the same fills again ────────────────────────────────────────
+    with PROCESSED_ORDER_IDS_LOCK:
+        PROCESSED_ORDER_IDS.add(str(target_order_id))
+
+    with USED_FILL_IDS_LOCK:
+        USED_FILL_IDS.add(str(target_order_id))
+        USED_FILL_IDS.add(exit_order['order_id'])
+
+    return pnl, entry_exit_data
+
+
+def wait_for_trade_fills(symbol, target_order_id, max_retries=5, retry_delay=2):
+    """
+    After 10-second post-closure wait, attempt to find the closed trade
+    using only the 5 most recent fills.
+
+    Retries up to max_retries times with retry_delay seconds between each.
+    Returns (pnl, entry_exit_data) or (0, None) if not found after all retries.
+    """
+    if not target_order_id:
+        log_error("wait_for_trade_fills: no target_order_id set - cannot retrieve fills")
+        return 0, None
+
+    log_trade(f"TRACKING ORDER: {target_order_id}")
+
+    for attempt in range(1, max_retries + 1):
+        pnl, data = find_trade_by_order_id(symbol, target_order_id)
+        if data:
+            return pnl, data
+        if attempt < max_retries:
+            print(f"⏳ Fill not found yet (attempt {attempt}/{max_retries}) - retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+
+    log_error(f"Fill not found after {max_retries} retries for order {target_order_id} - stopping trade processing")
+    return 0, None
+
+
+# =====================================================================
+# LEGACY COMPATIBILITY WRAPPERS
+# The functions below are kept so that any code path that still calls
+# the old names continues to work. They all delegate to the new
+# optimised engine above.
+# =====================================================================
+
+def group_fills_by_order(fills, symbol):
+    """
+    Legacy wrapper - kept for compatibility.
+    Groups fills by order_id. Used only in fallback WS pairing paths.
+    """
+    symbol_fills = [f for f in fills if f.get('product_symbol') == symbol]
+    order_groups = {}
+
+    for fill in symbol_fills:
+        order_id   = str(fill.get('order_id') or fill.get('id', ''))
+        side       = fill.get('side', '')
+        size       = float(fill.get('size', 0))
+        price      = float(fill.get('price', 0))
+        created_at = fill.get('created_at', '')
+
+        if not order_id or size <= 0 or price <= 0:
+            continue
+
+        if order_id not in order_groups:
+            order_groups[order_id] = {
+                'order_id':    order_id,
+                'side':        side,
+                'total_size':  0.0,
+                'total_value': 0.0,
+                'avg_price':   0.0,
+                'timestamp':   created_at,
+                'fills_count': 0
+            }
+
+        grp = order_groups[order_id]
+        grp['total_size']  += size
         grp['total_value'] += price * size
         grp['fills_count'] += 1
         if created_at < grp['timestamp']:
@@ -1206,701 +1700,93 @@ def group_fills_by_order(fills, symbol):
             grp['avg_price'] = grp['total_value'] / grp['total_size']
 
     sorted_orders = sorted(order_groups.values(), key=lambda x: x['timestamp'])
-
-    print(f"📊 Grouped {len(symbol_fills)} fills into {len(sorted_orders)} orders for {symbol}")
-    for o in sorted_orders:
-        print(f"   Order {o['order_id']}: {o['side'].upper()} {o['total_size']} lots @ avg {o['avg_price']:.6f} ({o['fills_count']} fills)")
-
     return sorted_orders
 
-def pair_entry_exit_orders(sorted_orders):
-    """
-    Match entry and exit orders into closed trade pairs.
-    Returns list of pairs: {entry_order, exit_order, size, entry_price, exit_price, side}
-    """
-    pairs = []
-    open_positions = []
-    net_size = 0.0
-
-    for order in sorted_orders:
-        side = order['side']
-        size = order['total_size']
-        price = order['avg_price']
-
-        if side == 'buy':
-            signed_size = +size
-        else:
-            signed_size = -size
-
-        prev_net = net_size
-        net_size += signed_size
-
-        print(f"   [PAIR ENGINE] {side.upper()} {size} | net: {prev_net:.4f} → {net_size:.4f}")
-
-        if abs(prev_net) > 0.001 and (
-            (prev_net > 0 and side == 'sell') or
-            (prev_net < 0 and side == 'buy')
-        ):
-            close_size = min(size, abs(prev_net))
-
-            entry_order = None
-            for op in reversed(open_positions):
-                if abs(net_size) < abs(prev_net):
-                    entry_order = op
-                    break
-
-            if entry_order:
-                entry_price = entry_order['price']
-                entry_side = entry_order['side']
-
-                pair = {
-                    'entry_order_id': entry_order['order_id'],
-                    'exit_order_id': order['order_id'],
-                    'side': entry_side,
-                    'size': close_size,
-                    'entry_price': entry_price,
-                    'exit_price': price,
-                    'entry_time': entry_order['timestamp'],
-                    'exit_time': order['timestamp']
-                }
-                pairs.append(pair)
-                print(f"   ✅ PAIR FOUND: {entry_side.upper()} {close_size} | Entry: {entry_price:.6f} → Exit: {price:.6f}")
-
-                open_positions = [op for op in open_positions if op['order_id'] != entry_order['order_id']]
-
-        if (side == 'buy' and net_size > 0 and net_size > prev_net) or \
-           (side == 'sell' and net_size < 0 and net_size < prev_net):
-            open_positions.append({
-                'order_id': order['order_id'],
-                'side': side,
-                'size': size,
-                'price': price,
-                'timestamp': order['timestamp']
-            })
-
-        if abs(net_size) < 0.001:
-            open_positions = []
-
-    return pairs
 
 def find_latest_closed_pair(symbol):
     """
-    Main function: fetch fills, group by order, pair entry/exit, return last closed pair.
-    Returns: (pnl, entry_exit_data) or (0, None) if not found
+    Legacy wrapper - delegates to find_trade_by_order_id using
+    BOT_STATE['last_placed_order_id'].
+
+    Returns (pnl, entry_exit_data) matching the current session order only.
+    Fetches at most 5 fills - never 100.
     """
-    print(f"\n🔍 FILL PAIR ENGINE - Finding closed pair for {symbol}")
-
-    all_fills = get_fills_page(page_size=50)
-
-    if not all_fills:
-        print("❌ No fills received from API")
+    target_order_id = BOT_STATE.get('last_placed_order_id', None)
+    if not target_order_id:
+        log_error("find_latest_closed_pair: no last_placed_order_id - cannot match trade")
         return 0, None
 
-    sorted_orders = group_fills_by_order(all_fills, symbol)
-
-    if len(sorted_orders) < 2:
-        print(f"❌ Not enough orders to form a pair (found {len(sorted_orders)})")
-        return 0, None
-
-    last_two = sorted_orders[-2:]
-
-    if len(last_two) == 2:
-        order_a = last_two[0]
-        order_b = last_two[1]
-
-        print(f"\n🎯 CHECKING LAST TWO ORDERS:")
-        print(f"   A: {order_a['side'].upper()} {order_a['total_size']} @ {order_a['avg_price']:.6f} [{order_a['timestamp']}]")
-        print(f"   B: {order_b['side'].upper()} {order_b['total_size']} @ {order_b['avg_price']:.6f} [{order_b['timestamp']}]")
-
-        if order_a['side'] != order_b['side']:
-            entry_order = order_a
-            exit_order = order_b
-            entry_side = entry_order['side']
-
-            trade_size = min(entry_order['total_size'], exit_order['total_size'])
-
-            entry_price = entry_order['avg_price']
-            exit_price = exit_order['avg_price']
-
-            symbol_key = symbol
-            lot_size = LOT_SIZES.get(symbol_key, LOT_SIZE_DEFAULT)
-            actual_quantity = trade_size * lot_size
-
-            if entry_side == 'buy':
-                pnl = (exit_price - entry_price) * actual_quantity
-            else:
-                pnl = (entry_price - exit_price) * actual_quantity
-
-            print(f"\n💰 PAIR RESULT:")
-            print(f"   Side: {entry_side.upper()}")
-            print(f"   Size: {trade_size} lots = {actual_quantity} {symbol.replace('USD', '')} (1 lot = {lot_size})")
-            print(f"   Entry: {entry_price:.6f} | Exit: {exit_price:.6f}")
-            print(f"   PnL: {pnl:.6f} USD")
-            print(f"   Result: {'✅ PROFIT' if pnl > 0 else '❌ LOSS'}")
-
-            entry_exit_data = {
-                'side': entry_side,
-                'entry_price': entry_price,
-                'exit_price': exit_price,
-                'quantity': trade_size,
-                'entry_time': entry_order['timestamp'],
-                'exit_time': exit_order['timestamp']
-            }
-
-            return pnl, entry_exit_data
-        else:
-            print(f"⚠️ Last two orders are SAME SIDE ({order_a['side']}) - falling back to full pair engine...")
-
-    pairs = pair_entry_exit_orders(sorted_orders)
-
-    if not pairs:
-        print("❌ No pairs found by pair engine")
-        return 0, None
-
-    latest_pair = pairs[-1]
-
-    entry_side = latest_pair['side']
-    entry_price = latest_pair['entry_price']
-    exit_price = latest_pair['exit_price']
-    trade_size = latest_pair['size']
-
-    lot_size = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
-    actual_quantity = trade_size * lot_size
-
-    if entry_side == 'buy':
-        pnl = (exit_price - entry_price) * actual_quantity
-    else:
-        pnl = (entry_price - exit_price) * actual_quantity
-
-    print(f"\n💰 PAIR ENGINE RESULT:")
-    print(f"   Side: {entry_side.upper()}")
-    print(f"   Size: {trade_size} lots = {actual_quantity}")
-    print(f"   Entry: {entry_price:.6f} | Exit: {exit_price:.6f}")
-    print(f"   PnL: {pnl:.6f} USD")
-
-    entry_exit_data = {
-        'side': entry_side,
-        'entry_price': entry_price,
-        'exit_price': exit_price,
-        'quantity': trade_size,
-        'entry_time': latest_pair['entry_time'],
-        'exit_time': latest_pair['exit_time']
-    }
-
-    return pnl, entry_exit_data
-
-
-# ========== TRADE COMPLETION MANAGEMENT ==========
-
-def wait_for_complete_trade(symbol, max_wait=5):
-    """Wait for complete trade data (entry + exit fills) before allowing next trade"""
-    start = time.time()
-
-    while time.time() - start < max_wait:
-        pnl, data = find_latest_closed_pair(symbol)
-
-        if data:
-            print("✅ Complete trade found!")
-            return pnl, data
-
-        print("⏳ Waiting for fills...")
-        time.sleep(0.5)
-
-    print("❌ Fills not received in time")
-    return None, None
-
-def get_trade_with_retry(symbol, retries=5):
-    """Get trade data with retry logic to handle delayed fills API updates"""
-    for i in range(retries):
-        pnl, data = find_latest_closed_pair(symbol)
-        if data:
-            print(f"✅ Trade data found on attempt {i+1}")
-            return pnl, data
-        print(f"⏳ Retry {i+1}/{retries} - waiting for fills API to update...")
-        time.sleep(1)
-    print(f"❌ No trade data found after {retries} retries")
-    return 0, None
-
-def get_pnl_from_fills():
-    """Get PnL from fills using the correct pairing engine"""
-    pnl, _ = find_latest_closed_pair(BOT_STATE['symbol'])
-    return pnl
-
-def get_entry_exit_from_fills():
-    """Get entry/exit data using the correct pairing engine"""
-    _, entry_exit_data = find_latest_closed_pair(BOT_STATE['symbol'])
-    return entry_exit_data
-
-
-# ========== IMPROVED POSITION TRACKING ==========
-def check_position_and_detect_closure():
-    """OPTIMIZED - Check position using real-time endpoint"""
-    global LAST_POSITION_STATE
-
-    try:
-        print(f"\n{'='*60}")
-        print(f"🔍 POSITION CHECK (REAL-TIME)")
-        print(f"LAST_POSITION_STATE: {LAST_POSITION_STATE}")
-        print(f"Symbol: {BOT_STATE['symbol']}")
-        print(f"{'='*60}")
-
-        product_id = get_product_id(BOT_STATE['symbol'])
-        if not product_id:
-            print("❌ Could not get product_id")
-            return False, False, 0
-
-        current_pos = check_position_realtime(product_id)
-
-        if current_pos.get('error'):
-            print("⚠️ API FAILED - SKIPPING CLOSURE CHECK")
-            return True, False, 0
-
-        was_closed = False
-        pnl = 0
-
-        if abs(LAST_POSITION_STATE['size']) > 0.001 and abs(current_pos.get('size', 0)) <= 0.001:
-            print("🎯 Position CLOSED!")
-
-            was_closed = True
-            global WAITING_FOR_FILL, TRADE_COMPLETED
-            WAITING_FOR_FILL = True
-            TRADE_COMPLETED = False
-
-            print("⏳ Waiting for complete trade data (entry + exit fills)...")
-            pnl, entry_exit_data = wait_for_complete_trade(BOT_STATE['symbol'])
-
-            if entry_exit_data:
-                print("✅ Trade completed - INSTANT MEMORY UPDATE FIRST")
-
-                # STEP 1: INSTANT DECISION DATA (memory update)
-                LAST_TRADE_RESULT['profit_loss'] = pnl
-                LAST_TRADE_RESULT['timestamp'] = datetime.now().isoformat()
-                LAST_TRADE_RESULT['lot_used'] = LAST_POSITION_STATE['size']
-                LAST_TRADE_RESULT['processed'] = True
-
-                BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
-                BOT_STATE['last_pnl'] = pnl
-
-                print(f"🧠 INSTANT MEMORY UPDATE: Last PnL = {pnl:.5f}, Result = {BOT_STATE['last_result']}")
-
-                # ✅ FIX: Calculate next step IMMEDIATELY after trade result is known
-                # This ensures step is correct BEFORE saving to DB
-                _apply_step_progression(pnl)
-
-                # ✅ FIX: Save bot state to DB immediately after step update
-                save_bot_state_to_db()
-
-                # STEP 2: ASYNC DATABASE SAVE (background, no delay)
-                print("💾 Saving to database (async)...")
-                save_closed_position({
-                    'symbol': BOT_STATE['symbol'],
-                    'side': entry_exit_data['side'],
-                    'entry_price': entry_exit_data['entry_price'],
-                    'exit_price': entry_exit_data['exit_price'],
-                    'quantity': entry_exit_data['quantity'],
-                    'pnl': pnl,
-                    'entry_time': entry_exit_data['entry_time'],
-                    'exit_time': entry_exit_data['exit_time']
-                })
-                print(f"💾 ✅ Database save completed")
-
-                if BOT_STATE['session_start_time']:
-                    BOT_STATE['session_total_pnl'] += pnl
-                    print(f"   Session P&L updated: {BOT_STATE['session_total_pnl']:.2f} (Trade P&L: {pnl:.2f})")
-
-                print(f"✅ STATE UPDATED: Last PnL = {pnl:.5f}, Result = {BOT_STATE['last_result']}")
-
-                result_type = "PROFIT" if pnl > 0 else "LOSS"
-                reason = f"after_{result_type.lower()}_pnl={pnl:.5f}"
-
-                global CURRENT_SIGNAL
-                CURRENT_SIGNAL = generate_random_signal(reason=reason)
-                print(f"     Generated new signal: {CURRENT_SIGNAL['signal']} after {result_type}")
-
-                TRADE_COMPLETED = True
-                print(f"🎯 TRADE COMPLETED - Ready for next trade")
-
-            else:
-                print(f"⚠️ FORCE SAVE - Using fallback data (fills API missed)")
-
-                LAST_TRADE_RESULT['profit_loss'] = pnl
-                LAST_TRADE_RESULT['timestamp'] = datetime.now().isoformat()
-                LAST_TRADE_RESULT['lot_used'] = LAST_POSITION_STATE['size']
-                LAST_TRADE_RESULT['processed'] = True
-
-                BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
-                BOT_STATE['last_pnl'] = pnl
-
-                print(f"🧠 INSTANT MEMORY UPDATE (fallback): Last PnL = {pnl:.5f}, Result = {BOT_STATE['last_result']}")
-
-                # ✅ FIX: Also apply step progression on fallback
-                _apply_step_progression(pnl)
-                save_bot_state_to_db()
-
-                entry_exit_data = {
-                    'side': 'buy' if LAST_POSITION_STATE['size'] > 0 else 'sell',
-                    'entry_price': LAST_POSITION_STATE['entry_price'],
-                    'exit_price': LAST_POSITION_STATE['entry_price'],
-                    'quantity': abs(LAST_POSITION_STATE['size']),
-                    'entry_time': datetime.now().isoformat(),
-                    'exit_time': datetime.now().isoformat()
-                }
-                print(f"🔥 FORCE SAVING: {entry_exit_data}")
-
-                save_closed_position({
-                    'symbol': BOT_STATE['symbol'],
-                    'side': entry_exit_data['side'],
-                    'entry_price': entry_exit_data['entry_price'],
-                    'exit_price': entry_exit_data['exit_price'],
-                    'quantity': entry_exit_data['quantity'],
-                    'pnl': pnl,
-                    'entry_time': entry_exit_data['entry_time'],
-                    'exit_time': entry_exit_data['exit_time']
-                })
-                print(f"💾 🔥 FORCE SAVED - No trade missed!")
-
-                TRADE_COMPLETED = True
-                print(f"🎯 FORCE TRADE COMPLETED")
-
-            print(f"     PnL: {pnl:.5f}")
-            print(f"     Result: {'PROFIT ✅' if pnl > 0 else 'LOSS ❌'}")
-
-        elif LAST_POSITION_STATE['size'] > 0 and current_pos.get('size', 0) == 0:
-            print("🔄 RECOVERY: Position was closed during network issue")
-
-        LAST_POSITION_STATE = {
-            'symbol': BOT_STATE['symbol'],
-            'size': current_pos.get('size', 0),
-            'entry_price': current_pos.get('entry_price', 0)
-        }
-
-        has_position = abs(current_pos.get('size', 0)) > 0.001
-        return has_position, was_closed, pnl
-
-    except Exception as e:
-        print(f"❌ Position processing error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False, False, 0
-
-
-def _apply_step_progression(pnl):
+    return find_trade_by_order_id(symbol, target_order_id)
+
+
+# =====================================================================
+# _mark_order_complete
+#
+# Called ONLY after all three steps complete for the current order:
+#   1. Pair found (find_trade_by_order_id returned data)
+#   2. Trade saved (save_closed_position completed)
+#   3. State saved (save_bot_state_to_db completed)
+#
+# Sets BOT_STATE['order_completed'] = True and clears last_placed_order_id.
+# Until this is called, no DB load, no DB sync, no new order is allowed.
+# =====================================================================
+def _mark_order_complete(order_id):
     """
-    ✅ FIX: Apply martingale step progression IMMEDIATELY when trade result is known.
-    Called right after fill detection - BEFORE next trade is placed.
-    WIN  → reset to Step 1
-    LOSS → advance to next step (Step 2, 3, 4... up to max Step 11)
-    After max step (11/1056) → reset to Step 1 (unless stop_at_max_step is set)
+    Mark the current tracked order as fully processed.
+    Must be called only after pair found + trade saved + state saved.
     """
-    global BOT_STATE
-
-    current_step = BOT_STATE['current_step']
-    current_lot  = BOT_STATE['current_lot']
-
-    print(f"\n📊 STEP PROGRESSION:")
-    print(f"   Current Step: {current_step} | Current Lot: {current_lot}")
-    print(f"   Trade PnL: {pnl:.6f} | Result: {'WIN ✅' if pnl > 0 else 'LOSS ❌'}")
-
-    if pnl > 0:
-        # WIN - Reset to Step 1
-        next_step = 1
-        next_lot  = LOT_STEPS[next_step]
-        BOT_STATE['current_step'] = next_step
-        BOT_STATE['current_lot']  = next_lot
-        print(f"   ✅ WIN → Reset to Step {next_step}: Lot {next_lot}")
-    else:
-        # LOSS - Advance to next step
-        next_step = current_step + 1
-        if next_step > BOT_STATE['max_steps']:
-            # ✅ FIX: max_steps is 11 (1056 lots). After step 11, reset to step 1.
-            # stop_at_max_step flag will handle stopping the bot if set.
-            next_step = 1
-            next_lot  = LOT_STEPS[next_step]
-            BOT_STATE['current_step'] = next_step
-            BOT_STATE['current_lot']  = next_lot
-            print(f"   🚨 MAX STEP ({BOT_STATE['max_steps']}) REACHED → Reset to Step {next_step}: Lot {next_lot}")
-        else:
-            next_lot  = LOT_STEPS[next_step]
-            BOT_STATE['current_step'] = next_step
-            BOT_STATE['current_lot']  = next_lot
-            print(f"   ❌ LOSS → Advance to Step {next_step}: Lot {next_lot}")
-
-    print(f"   ✅ Next trade will use Step {BOT_STATE['current_step']}: Lot {BOT_STATE['current_lot']}")
+    BOT_STATE['order_completed'] = True
+    BOT_STATE['last_placed_order_id'] = None
+    log_trade(f"ORDER COMPLETED: {order_id}")
 
 
-# ========== TRADING LOGIC ==========
-CURRENT_SIGNAL = None
-
-def get_trading_signal():
-    """Generate completely new unbiased trading signal on every call"""
-    global CURRENT_SIGNAL
-
-    try:
-        CURRENT_SIGNAL = generate_random_signal(reason="trade_decision")
-        print(f"[SIGNAL] Generated new unbiased signal: {CURRENT_SIGNAL['signal']}")
-
-        signal = CURRENT_SIGNAL.get('signal', '')
-        confidence = CURRENT_SIGNAL.get('confidence', 0)
-
-        print(f"🎲 Random Signal: {signal}")
-        print(f"📊 Confidence: {confidence}% (unbiased 50/50)")
-        print(f"🔄 Fresh decision - no bias from previous trades")
-
-        if signal.upper() == "BUY":
-            return 'buy', CURRENT_SIGNAL
-        elif signal.upper() == "SELL":
-            return 'sell', CURRENT_SIGNAL
-        else:
-            print(f"Unknown signal: {signal}")
-            return None, CURRENT_SIGNAL
-
-    except Exception as e:
-        print(f"Error getting signal: {e}")
-        return None, None
-
-def start_signal_bot():
-    """Start the signal bot"""
-    try:
-        print("🤖 Signal bot ready - will generate unbiased random signals on demand")
-        return True
-    except Exception as e:
-        print(f"❌ Error starting signal bot: {e}")
-        return False
-
-def stop_signal_bot():
-    """Stop the signal bot"""
-    try:
-        print("🛑 Signal bot stopped")
-    except Exception as e:
-        print(f"❌ Error stopping signal bot: {e}")
-
-def detect_current_step_from_lot(lot_size):
-    """Detect current step based on lot size (use absolute value for negative sizes)"""
-    lot_size = abs(lot_size)
-    for step, lot in LOT_STEPS.items():
-        if lot == lot_size:
-            return step
-    for step, lot in LOT_STEPS.items():
-        if lot >= lot_size:
-            return step
-    return 1
-
-def detect_current_step_from_live_position():
-    """Detect current step from live position lot size"""
-    try:
-        has_position = abs(LAST_POSITION_STATE['size']) > 0.001
-        if has_position:
-            current_lot = abs(LAST_POSITION_STATE['size'])
-            current_step = detect_current_step_from_lot(current_lot)
-            print(f"🔍 Live position detected: Lot {current_lot} = Step {current_step}")
-            return current_step, current_lot
-        else:
-            print("🔍 No live position detected - using Step 1")
-            return 1, LOT_STEPS[1]
-    except Exception as e:
-        print(f"❌ Error detecting step from live position: {e}")
-        return 1, LOT_STEPS[1]
-
-def calculate_next_lot():
-    """
-    ✅ FIX: Simplified lot calculation.
-    Step progression is now handled IMMEDIATELY in _apply_step_progression() when trade closes.
-    This function just returns the already-calculated next lot from BOT_STATE.
-    No more complex logic here - just read the pre-calculated value.
-    """
-    global LOT_CALCULATION_LOCK
-
-    if LOT_CALCULATION_LOCK:
-        print("⚠️ Lot calculation already in progress - using current lot")
-        return BOT_STATE['current_lot']
-
-    LOT_CALCULATION_LOCK = True
-
-    try:
-        print(f"\n📊 NEXT LOT CALCULATION:")
-        print(f"   Current Step: {BOT_STATE['current_step']}")
-        print(f"   Current Lot: {BOT_STATE['current_lot']}")
-        print(f"   Last PnL: {LAST_TRADE_RESULT['profit_loss']}")
-
-        # ✅ FIX: Step progression is already applied in _apply_step_progression().
-        # Just verify current_lot matches LOT_STEPS[current_step] and return it.
-        expected_lot = LOT_STEPS.get(BOT_STATE['current_step'], LOT_STEPS[1])
-        if BOT_STATE['current_lot'] != expected_lot:
-            print(f"⚠️ Lot mismatch! BOT_STATE lot={BOT_STATE['current_lot']}, expected={expected_lot}. Correcting...")
-            BOT_STATE['current_lot'] = expected_lot
-
-        next_lot = BOT_STATE['current_lot']
-        print(f"   ✅ Using pre-calculated lot: {next_lot} (Step {BOT_STATE['current_step']})")
-
-        # Reset processed flag so next closure will be handled
-        LAST_TRADE_RESULT['processed'] = False
-
-        return next_lot
-
-    finally:
-        LOT_CALCULATION_LOCK = False
-
-
-def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
-    print(f"\n{'='*60}")
-    print(f"🎯 ORDER START: {symbol} | {side.upper()} | Size: {size}")
-    print(f"   TP: {tp_pct}% | SL: {sl_pct}%")
-    print(f"{'='*60}")
-
-    try:
-        PRODUCT_CONFIG = {
-            "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},
-            "BTCUSD": {"id": 84,    "tick": Decimal("0.5")},
-            "ETHUSD": {"id": 1320,  "tick": Decimal("0.05")},
-        }
-
-        config = PRODUCT_CONFIG.get(symbol)
-        if not config:
-            print(f"❌ Symbol {symbol} not in config!")
-            return None
-
-        p_id = config["id"]
-        tick = config["tick"]
-
-        ticker = make_api_request('GET', f'/tickers/{symbol}')
-        if not ticker or not ticker.get('result'):
-            print("❌ Ticker fetch failed")
-            return None
-
-        result     = ticker['result']
-        mark_price = float(result.get('mark_price') or result.get('close'))
-        print(f"📊 Mark Price: {mark_price}")
-
-        def to_tick(val):
-            d = Decimal(str(val))
-            return (d / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
-
-        base_dec = to_tick(mark_price)
-
-        if side == 'buy':
-            tp_dec = to_tick(mark_price * (1 + tp_pct / 100))
-            sl_dec = to_tick(mark_price * (1 - sl_pct / 100))
-        else:
-            tp_dec = to_tick(mark_price * (1 - tp_pct / 100))
-            sl_dec = to_tick(mark_price * (1 + sl_pct / 100))
-
-        print(f"📐 After % calc  → TP: {tp_dec} | SL: {sl_dec}")
-
-        MIN_TICKS = Decimal("3")
-        min_gap   = tick * MIN_TICKS
-
-        if side == 'buy':
-            if tp_dec <= base_dec:
-                tp_dec = base_dec + min_gap
-                print(f"⚠️  TP <= entry, min pushed to: {tp_dec}")
-            if sl_dec >= base_dec:
-                sl_dec = base_dec - min_gap
-                print(f"⚠️  SL >= entry, min pushed to: {sl_dec}")
-        else:
-            if tp_dec >= base_dec:
-                tp_dec = base_dec - min_gap
-                print(f"⚠️  TP >= entry, min pushed to: {tp_dec}")
-            if sl_dec <= base_dec:
-                sl_dec = base_dec + min_gap
-                print(f"⚠️  SL <= entry, min pushed to: {sl_dec}")
-
-        tp_price = str(tp_dec)
-        sl_price = str(sl_dec)
-
-        print(f"🎯 Final TP : {tp_price}  (gap: {abs(tp_dec - base_dec):.5f})")
-        print(f"🛡️  Final SL : {sl_price}  (gap: {abs(sl_dec - base_dec):.5f})")
-
-        order_data = {
-            "product_id"                    : p_id,
-            "side"                          : side,
-            "order_type"                    : "market_order",
-            "size"                          : int(size),
-            "bracket_take_profit_price"     : tp_price,
-            "bracket_take_profit_order_type": "market_order",
-            "bracket_stop_loss_price"       : sl_price,
-            "bracket_stop_loss_order_type"  : "market_order",
-            "bracket_stop_trigger_method"   : "mark_price",
-        }
-
-        print(f"\n📋 Payload:\n{json.dumps(order_data, indent=3)}")
-
-        response = make_api_request('POST', '/orders', order_data)
-        print(f"\n🔍 Raw Response:\n{json.dumps(response, indent=3)}")
-
-        if response and response.get('success') and 'result' in response:
-            oid     = response['result'].get('id')
-            bracket = response['result'].get('bracket_orders', [])
-            print(f"\n✅ ORDER PLACED! ID: {oid}")
-
-            actual_entry = float(
-                response['result'].get('average_fill_price') or
-                response['result'].get('limit_price') or
-                mark_price
-            )
-            print(f"📌 Actual Fill Price: {actual_entry} | Mark was: {mark_price}")
-
-            if actual_entry != mark_price:
-                print(f"⚠️  Slippage detected ({abs(actual_entry - mark_price):.5f}), recalculating TP/SL...")
-                actual_base = to_tick(actual_entry)
-
-                if side == 'buy':
-                    tp_dec = to_tick(actual_entry * (1 + tp_pct / 100))
-                    sl_dec = to_tick(actual_entry * (1 - sl_pct / 100))
-                else:
-                    tp_dec = to_tick(actual_entry * (1 - tp_pct / 100))
-                    sl_dec = to_tick(actual_entry * (1 + sl_pct / 100))
-
-                if side == 'buy':
-                    if tp_dec <= actual_base:
-                        tp_dec = actual_base + min_gap
-                    if sl_dec >= actual_base:
-                        sl_dec = actual_base - min_gap
-                else:
-                    if tp_dec >= actual_base:
-                        tp_dec = actual_base - min_gap
-                    if sl_dec <= actual_base:
-                        sl_dec = actual_base + min_gap
-
-                tp_price = str(tp_dec)
-                sl_price = str(sl_dec)
-                print(f"🎯 Recalculated TP : {tp_price}")
-                print(f"🛡️  Recalculated SL : {sl_price}")
-
-            if bracket:
-                print(f"🎯 Bracket: {bracket}")
-            else:
-                print("⚠️  Bracket missing! Placing manually via /orders/bracket ...")
-                bracket_payload = {
-                    "product_id": p_id,
-                    "take_profit_order": {
-                        "order_type": "market_order",
-                        "stop_price": tp_price
-                    },
-                    "stop_loss_order": {
-                        "order_type": "market_order",
-                        "stop_price": sl_price
-                    },
-                    "bracket_stop_trigger_method": "mark_price"
-                }
-                bracket_res = make_api_request('POST', '/orders/bracket', bracket_payload)
-                print(f"🔍 Bracket Response: {json.dumps(bracket_res, indent=3)}")
-        else:
-            err = response.get('error') if response else 'No response'
-            print(f"\n❌ ORDER FAILED! Error: {err}")
-
-        return response
-
-    except Exception as e:
-        import traceback
-        print(f"❌ Exception: {e}")
-        traceback.print_exc()
-        return None
-
-
-# ========== BOT ENGINE ==========
 def auto_trading_bot_main():
-    """Main bot loop - instant execution with real-time endpoints"""
-    print("🤖 Auto Trading Bot Started (OPTIMIZED)")
+    """
+    Main bot loop.
+
+    Key fixes applied here:
+    1. FIX 1: USED_FILL_IDS prevents any fill being used in two trades
+    2. FIX 2: COOLDOWN enforced via LAST_CLOSE_TIMESTAMP
+    3. FIX 3: verify_and_sync_step_from_db() called BEFORE every order
+               to cross-check DB truth against memory step/lot
+    4. FIX 4: WAITING_FOR_FILL loop no longer calls find_latest_closed_pair()
+               — only checks TRADE_COMPLETED flag set inside
+               check_position_and_detect_closure(). This prevents a second
+               call to _apply_step_progression() for the same trade.
+    5. FIX 5: On startup with no open position, ALWAYS reset to Step 1.
+    6. FIX 6: fresh_start flag prevents load_bot_state_from_db() from
+               overwriting the Step 1 reset on the very first PRE-ORDER DB CHECK.
+    7. FIX 7: BOT_STATE['last_placed_order_id'] is set immediately after
+               every successful order placement.
+    8. FIX 8: BOT_STATE['order_completed'] MUST be True before:
+               - load_bot_state_from_db()
+               - verify_and_sync_step_from_db()
+               - place_order_with_bracket()
+               If False, the loop blocks with a clear log message until the
+               current order's pair+save+state sequence completes and
+               _mark_order_complete() is called by check_position_and_detect_closure().
+    9. FIX 9: After order placement, the position confirmation block
+               now performs one authoritative final REST check when the
+               fast-poll loop times out. This ensures LAST_POSITION_STATE
+               reflects reality before check_position_and_detect_closure()
+               runs. If the position has ALREADY closed by the time we check
+               (micro-close), LAST_POSITION_STATE stays at 0 — but Step 4
+               (dead reckoning) in check_position_and_detect_closure()
+               handles that case via direct fill lookup.
+    10. FIX 10 (DUPLICATE TRADE FIX): PROCESSED_ORDER_IDS set prevents any
+               entry order_id from being processed more than once across ALL
+               detection paths (WS, REST, dead reckoning). Combined with
+               entry_order_id stored in DB with UNIQUE KEY constraint.
+    """
+    global LAST_CLOSE_TIMESTAMP
+
+    # ------------------------------------------------------------------
+    # FIX 6: fresh_start flag - True means "we decided Step 1 at startup,
+    # do NOT let load_bot_state_from_db() override it before first order"
+    # ------------------------------------------------------------------
+    fresh_start = False
+
+    print("🤖 Auto Trading Bot Started (OPTIMIZED - DB VERIFIED - ORDER COMPLETION GUARDED)")
 
     print(f"⚡ Setting leverage: {BOT_STATE['leverage']}x")
     leverage_result = set_leverage(BOT_STATE['symbol'], BOT_STATE['leverage'])
@@ -1919,18 +1805,26 @@ def auto_trading_bot_main():
             current_lot   = abs(current_pos.get('size', 0))
             detected_step = detect_current_step_from_lot(current_lot)
 
-            # ✅ FIX: Only sync from live position if DB state says different step
-            # This prevents overwriting a correctly-loaded DB state with wrong live detection
             if BOT_STATE['current_step'] != detected_step:
-                print(f"🔄 Syncing step from live position: DB step={BOT_STATE['current_step']} → Live step={detected_step}")
+                print(f"🔄 Syncing: DB step={BOT_STATE['current_step']} → Live step={detected_step}")
                 BOT_STATE['current_step'] = detected_step
                 BOT_STATE['current_lot']  = current_lot
             else:
-                print(f"✅ DB step matches live position step ({detected_step}), no sync needed")
+                print(f"✅ DB step matches live position ({detected_step}), no sync needed")
 
             LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
             LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
             LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
+
+            # An existing live position means there IS a pending order from
+            # a previous session. We don't have the order ID, so we set
+            # order_completed=False to force proper closure detection before
+            # the next order. check_position_and_detect_closure() will handle
+            # the fill matching and call _mark_order_complete() when done.
+            # We use a sentinel order_id of 'RESUMED' for logging clarity.
+            BOT_STATE['last_placed_order_id'] = 'RESUMED'
+            BOT_STATE['order_completed']      = False
+            log_system(f"TRACKING ORDER: RESUMED (existing position, step={detected_step}, lot={current_lot})")
 
             print("⏳ Waiting for existing position to close...")
             while BOT_STATE['running'] and abs(current_pos.get('size', 0)) > 0.001:
@@ -1941,18 +1835,23 @@ def auto_trading_bot_main():
             if not BOT_STATE['running']:
                 return
 
-            print("✅ Existing position closed, continuing with preserved lot progression...")
+            print("✅ Existing position closed, continuing...")
+            # Existing position was found and closed - DB sequence continues
+            # fresh_start remains False, load_bot_state_from_db() will run normally
         else:
-            # ✅ FIX: If no live position, check if DB state says we should be at a higher step
-            # (This happens when bot restarts between trades)
+            # -----------------------------------------------------------------
+            # FIX 5 + FIX 6: No existing live position on startup
+            # → ALWAYS reset to Step 1
+            # → Set fresh_start = True so the PRE-ORDER DB CHECK in the main
+            #    loop does NOT call load_bot_state_from_db() and undo this reset
+            # -----------------------------------------------------------------
             print("✅ No existing position found...")
-            if LAST_TRADE_RESULT['profit_loss'] is not None:
-                print(f"📊 DB state says last trade PnL={LAST_TRADE_RESULT['profit_loss']}, Step={BOT_STATE['current_step']}")
-                print(f"   ✅ Continuing from DB state: Step {BOT_STATE['current_step']}, Lot {BOT_STATE['current_lot']}")
-            else:
-                print(f"   ✅ No previous trade data - starting fresh at Step 1")
-                BOT_STATE['current_step'] = 1
-                BOT_STATE['current_lot']  = LOT_STEPS[1]
+            print(f"   ✅ Fresh start - Step 1")
+            BOT_STATE['current_step']         = 1
+            BOT_STATE['current_lot']          = LOT_STEPS[1]
+            BOT_STATE['order_completed']      = True   # No pending order
+            BOT_STATE['last_placed_order_id'] = None
+            fresh_start = True  # FIX 6: protect Step 1 from DB overwrite
 
     while BOT_STATE['running']:
         try:
@@ -1963,99 +1862,191 @@ def auto_trading_bot_main():
                 break
 
             global WAITING_FOR_FILL, TRADE_COMPLETED
+
+            # =====================================================================
+            # FIX 8: ORDER COMPLETION GUARD
+            # If the current order is not yet fully processed (pair not found,
+            # trade not saved, or state not saved), we MUST NOT proceed to DB load,
+            # DB sync, or new order placement.
+            #
+            # check_position_and_detect_closure() runs below and will detect the
+            # position close, find fills, save trade, save state, and finally call
+            # _mark_order_complete() which sets order_completed=True.
+            #
+            # We allow check_position_and_detect_closure() to run on every loop
+            # iteration so it can detect the closure. But we skip the DB load,
+            # DB sync, and order placement sections entirely until order_completed.
+            # =====================================================================
+            if not BOT_STATE['order_completed']:
+                pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
+                log_system(f"BLOCKING NEXT ORDER - CURRENT ORDER NOT FINISHED: {pending_order_id}")
+
+                # Run closure detection so we can detect the close and process fills
+                has_position, was_closed, pnl = check_position_and_detect_closure()
+
+                if was_closed:
+                    print(f"🎯 Position closed during order-guard wait! PnL: {pnl}")
+                    # order_completed is now True (set by _mark_order_complete inside closure detection)
+                    if pnl > 0 and BOT_STATE['stop_at_win']:
+                        print(f"🏆 PROFIT - STOP AT WIN ACTIVATED!")
+                        BOT_STATE['running']     = False
+                        BOT_STATE['stop_at_win'] = False
+                        continue
+                    if pnl < 0 and BOT_STATE['current_step'] == 1 and BOT_STATE['stop_at_max_step']:
+                        print(f"🚨 MAX STEP HIT! - STOP AT MAX STEP ACTIVATED!")
+                        BOT_STATE['running']          = False
+                        BOT_STATE['stop_at_max_step'] = False
+                        continue
+                elif has_position:
+                    print("⏳ Order guard: active position - waiting...")
+                    time.sleep(0.5)
+                    continue
+                else:
+                    # No position and not closed in this cycle - still waiting for fills
+                    if not BOT_STATE['order_completed']:
+                        print(f"⏳ Order guard: waiting for fill processing to complete for order {pending_order_id}...")
+                        time.sleep(0.5)
+                        continue
+                # If order is now complete, fall through to normal loop logic below
+
+            # =====================================================================
+            # FIX 4: WAITING_FOR_FILL loop - do NOT call find_latest_closed_pair()
+            # here. Step progression is already done inside
+            # check_position_and_detect_closure(). Calling find_latest_closed_pair()
+            # again here was causing a second closure detection and double
+            # _apply_step_progression() call on the same trade.
+            # =====================================================================
             if WAITING_FOR_FILL:
-                print("⏳ Waiting for trade to be completed and saved...")
-
-                pnl, data = find_latest_closed_pair(BOT_STATE['symbol'])
-
-                if data and TRADE_COMPLETED:
+                if TRADE_COMPLETED:
                     WAITING_FOR_FILL = False
                     TRADE_COMPLETED  = False
                     print("✅ Trade completed and saved, ready for next trade")
                 else:
-                    if data and not TRADE_COMPLETED:
-                        print("⏳ Fill received but trade not yet saved...")
-                    else:
-                        print("⏳ Still waiting for fills...")
+                    print("⏳ Waiting for trade save to complete...")
                     time.sleep(0.5)
                     continue
 
             print(f"\n{'='*50}")
-            print(f"🔍 BOT LOOP CHECK - Symbol: {BOT_STATE['symbol']}")
-            print(f"📊 Running: {BOT_STATE['running']}, Step: {BOT_STATE['current_step']}")
-            print(f"💰 Current Lot: {BOT_STATE['current_lot']}")
+            print(f"🔍 BOT LOOP - Symbol: {BOT_STATE['symbol']}")
+            print(f"📊 Running: {BOT_STATE['running']}, Step: {BOT_STATE['current_step']}, Lot: {BOT_STATE['current_lot']}")
             print(f"{'='*50}")
 
             has_position, was_closed, pnl = check_position_and_detect_closure()
 
             if was_closed:
-                print(f"🎯 Position was closed! PnL: {pnl}")
+                print(f"🎯 Position closed! PnL: {pnl}")
                 print(f"📊 Result: {'PROFIT ✅' if pnl > 0 else 'LOSS ❌'}")
-                print(f"💰 Step already updated to: {BOT_STATE['current_step']} (Lot: {BOT_STATE['current_lot']})")
+                print(f"💰 Next Step: {BOT_STATE['current_step']}, Lot: {BOT_STATE['current_lot']}")
 
                 if pnl > 0 and BOT_STATE['stop_at_win']:
-                    print(f"🏆 PROFIT ACHIEVED - STOP AT WIN ACTIVATED!")
+                    print(f"🏆 PROFIT - STOP AT WIN ACTIVATED!")
                     BOT_STATE['running']     = False
                     BOT_STATE['stop_at_win'] = False
                     continue
 
-                # ✅ FIX: stop_at_max_step now checks CURRENT step (already advanced)
                 if pnl < 0 and BOT_STATE['current_step'] == 1 and BOT_STATE['stop_at_max_step']:
-                    # current_step reset to 1 means we just HIT max step and reset
                     print(f"🚨 MAX STEP HIT! - STOP AT MAX STEP ACTIVATED!")
                     BOT_STATE['running']          = False
                     BOT_STATE['stop_at_max_step'] = False
                     continue
 
             if has_position:
-                print("⏳ Active position found, waiting for closure...")
+                print("⏳ Active position - waiting for closure...")
                 time.sleep(0.5)
                 continue
 
             if BOT_STATE['force_stop']:
-                print("🛑 FORCE STOP ACTIVE - Skipping order placement")
+                print("🛑 FORCE STOP ACTIVE")
                 BOT_STATE['running'] = False
                 continue
+
+            # -----------------------------------------------------------------
+            # FIX 2: COOLDOWN CHECK
+            # -----------------------------------------------------------------
+            elapsed = time.time() - LAST_CLOSE_TIMESTAMP
+            if elapsed < COOLDOWN_SECONDS and LAST_CLOSE_TIMESTAMP > 0:
+                remaining = COOLDOWN_SECONDS - elapsed
+                print(f"⏱️ COOLDOWN: {remaining:.1f}s remaining before next order")
+                time.sleep(remaining)
+                continue
+
+            # -----------------------------------------------------------------
+            # FIX 3 + FIX 6 + FIX 8: DB VERIFICATION BEFORE EVERY ORDER
+            #
+            # GUARD: order_completed MUST be True here. If it is False for any
+            # reason (race condition), block immediately with a log message.
+            # This is the absolute last line of defense before order placement.
+            # -----------------------------------------------------------------
+            if not BOT_STATE['order_completed']:
+                pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
+                log_error(f"DB SYNC BLOCKED - CURRENT ORDER NOT FINISHED: {pending_order_id}")
+                time.sleep(0.5)
+                continue
+
+            print(f"\n🔍 [PRE-ORDER DB CHECK] Loading latest state from database...")
+
+            if fresh_start:
+                print(f"   ⚡ Fresh start session - skipping DB load to protect Step 1 reset")
+                print(f"   ✅ DB Step: {BOT_STATE['current_step']} (startup override)")
+                print(f"   ✅ DB Lot : {BOT_STATE['current_lot']} (startup override)")
+                fresh_start = False  # FIX 6: only skip once, normal DB sync from next trade onwards
+            else:
+                # ALWAYS trust DB before every new order (normal path)
+                # order_completed is True here (checked above), safe to load
+                load_bot_state_from_db()
+
+                # Optional verification
+                verify_and_sync_step_from_db()
+
+                print(f"   ✅ DB Step: {BOT_STATE['current_step']}")
+                print(f"   ✅ DB Lot : {BOT_STATE['current_lot']}")
 
             if BOT_STATE['stop_at_win']:
                 print("🎯 STOP AT WIN ACTIVE - Will stop after next profit")
 
             next_lot = calculate_next_lot()
-            print(f"💰 Next Lot Size: {next_lot}")
-            print(f"🎯 ORDER DETAILS:")
-            print(f"   📊 Base Lot: {BOT_STATE['base_lot']}")
-            print(f"   📊 Current Lot: {BOT_STATE['current_lot']}")
-            print(f"   📊 Next Lot: {next_lot}")
-            print(f"   📊 Current Step: {BOT_STATE['current_step']}")
+            print(f"\n💰 PLACING ORDER - Step: {BOT_STATE['current_step']}, Lot: {next_lot}")
 
             LAST_TRADE_RESULT['processed'] = False
 
             signal_result = get_trading_signal()
-            side        = signal_result[0] if signal_result else 'buy'
-            signal_data = signal_result[1] if signal_result and len(signal_result) > 1 else {}
+            side          = signal_result[0] if signal_result else 'buy'
+            signal_data   = signal_result[1] if signal_result and len(signal_result) > 1 else {}
 
             if side is None:
-                print("⏳ Waiting for bot decision - skipping this cycle")
+                print("⏳ No signal - skipping this cycle")
                 time.sleep(1)
                 continue
 
-            print(f"📈 Trading Signal: {side.upper()} order with {next_lot} lots")
+            print(f"📈 Signal: {side.upper()} | Lot: {next_lot}")
 
+            # Safety check: confirm no real position before placing order
             product_id = get_product_id(BOT_STATE['symbol'])
             if product_id:
                 current_pos = check_position_realtime(product_id)
                 if abs(current_pos.get('size', 0)) > 0.001:
                     print("⛔ SAFETY CHECK: Real position exists - SKIPPING ORDER")
-                    print(f"📊 Position Size: {current_pos.get('size', 0)} lots")
-
                     LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
                     LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
                     LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
-                    if abs(LAST_POSITION_STATE['size']) > 0.001:
-                        print("⏳ Active position found, waiting for closure...")
-                        continue
+                    continue
 
-            print(f"🎯 PLACING ORDER WITH CALCULATED LOT: {next_lot}")
+            # -----------------------------------------------------------------
+            # FIX 8: Final guard before order - if order_completed is False for
+            # any reason at this exact point, abort this cycle.
+            # -----------------------------------------------------------------
+            if not BOT_STATE['order_completed']:
+                pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
+                log_error(f"BLOCKING NEXT ORDER - CURRENT ORDER NOT FINISHED: {pending_order_id} (pre-placement final guard)")
+                time.sleep(0.5)
+                continue
+
+            print(f"🎯 PLACING ORDER: {side.upper()} {next_lot} lots")
+
+            # Mark order as pending BEFORE placing, so if placement partially
+            # succeeds but response parsing fails, we don't lose track.
+            BOT_STATE['order_completed']      = False
+            BOT_STATE['last_placed_order_id'] = None  # Will be set after success
 
             order_response = place_order_with_bracket(
                 BOT_STATE['symbol'],
@@ -2067,102 +2058,1397 @@ def auto_trading_bot_main():
             )
 
             if order_response and order_response.get('success'):
-                print(f"✅ Order placed successfully!")
-                print(f"📋 Order ID: {order_response.get('result', {}).get('id')}")
+                placed_order_id = order_response.get('result', {}).get('id')
+                log_trade(f"ORDER PLACED | {side.upper()} | Lot={next_lot} | OrderID={placed_order_id}")
+                log_trade(f"TRACKING ORDER: {placed_order_id}")
 
-                print("⚡ Quick position check (TP/SL already attached)...")
-                max_wait_time = 2
-                wait_start = time.time()
+                # ---------------------------------------------------------
+                # FIX 7 + FIX 8: Save exact order ID so find_trade_by_order_id()
+                # matches ONLY this order. order_completed stays False until
+                # _mark_order_complete() is called after pair+save+state.
+                # ---------------------------------------------------------
+                BOT_STATE['last_placed_order_id'] = placed_order_id
+                print(f"   🎯 Tracking order ID: {placed_order_id}")
+
+                # ---------------------------------------------------------
+                # FIX 9: POSITION CONFIRMATION BLOCK
+                #
+                # Fast-poll for up to 2 seconds to confirm the position
+                # opened. If found: update LAST_POSITION_STATE normally.
+                # If NOT found after timeout: perform ONE final authoritative
+                # REST check to determine the true state.
+                # ---------------------------------------------------------
+                print("⚡ Confirming position...")
+                max_wait_time    = 2
+                wait_start       = time.time()
+                position_found   = False
 
                 while time.time() - wait_start < max_wait_time:
                     time.sleep(0.05)
                     current_pos = check_position_realtime(product_id)
                     if abs(current_pos.get('size', 0)) > 0.001:
-                        print(f"⚡ Position confirmed: {current_pos.get('size', 0)} lots (TP/SL active)")
-                        break
-                else:
-                    print("⚠️ Position check timeout - continuing (TP/SL should be active)")
-
-                product_id = get_product_id(BOT_STATE['symbol'])
-                if product_id:
-                    current_pos = check_position_realtime(product_id)
-
-                    if current_pos.get('error'):
-                        print("⚠️ API FAILED - SKIPPING POSITION UPDATE")
-                        continue
-
-                    if current_pos.get('has_position') and abs(current_pos.get('size', 0)) > 0.001:
+                        print(f"⚡ Position confirmed: {current_pos.get('size', 0)} lots")
                         LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
                         LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
                         LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
+                        BOT_STATE['current_lot']           = abs(current_pos.get('size', 0))
+                        position_found = True
+                        break
 
-                        BOT_STATE['current_lot'] = abs(current_pos.get('size', 0))
+                if not position_found:
+                    # Fast-poll timed out. Do ONE final authoritative check.
+                    print("⚠️ Position not confirmed in fast-poll — doing final authoritative check...")
+                    final_pos = check_position_realtime(product_id)
 
-                        print(f"📊 Position State Updated: Size={LAST_POSITION_STATE['size']}, Entry={LAST_POSITION_STATE['entry_price']}")
-                        print(f"🔄 Current Lot Synced: {BOT_STATE['current_lot']}")
+                    if final_pos.get('error'):
+                        # API failure — cannot determine state, skip update
+                        print("⚠️ API error on final position check — skipping state update")
+                    elif abs(final_pos.get('size', 0)) > 0.001:
+                        # Position IS open (just slow to appear)
+                        print(f"✅ Final check: position confirmed {final_pos.get('size', 0)} lots")
+                        LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
+                        LAST_POSITION_STATE['size']        = final_pos.get('size', 0)
+                        LAST_POSITION_STATE['entry_price'] = final_pos.get('entry_price', 0)
+                        BOT_STATE['current_lot']           = abs(final_pos.get('size', 0))
                     else:
-                        print("⚠️ Position not found in real-time check")
-                else:
-                    print("❌ Could not get product_id for position update")
+                        # Position NOT found — possible micro-close.
+                        # LAST_POSITION_STATE stays at size=0.
+                        # Step 4 (dead reckoning) handles this via fill lookup.
+                        print(f"ℹ️ Final check: no position found for order {placed_order_id}")
+                        print(f"ℹ️ Possible micro-close — dead reckoning will detect via fills")
+
             else:
                 print("❌ Order failed!")
-                print(f"📋 Order Response: {order_response}")
+                print(f"📋 Response: {order_response}")
+                # Reset order_completed to True since no order was actually placed
+                BOT_STATE['order_completed']      = True
+                BOT_STATE['last_placed_order_id'] = None
                 time.sleep(0.5)
 
         except Exception as e:
-            print(f"🚨 TEMPORARY BOT ERROR: {e}")
+            print(f"🚨 BOT ERROR: {e}")
             import traceback
             traceback.print_exc()
-            print("🔄 Bot is staying alive... retrying in 5 seconds")
+            print("🔄 Retrying in 5 seconds...")
             time.sleep(5)
             continue
 
     print("🤖 Auto Trading Bot Stopped")
+
+
+# ========== TRADE COMPLETION MANAGEMENT ==========
+
+def wait_for_complete_trade(symbol, max_wait=15):
+    """
+    Wait up to max_wait seconds for a complete entry+exit pair.
+    Uses the optimised find_trade_by_order_id which fetches only 5 fills.
+    Called AFTER the 10-second post-closure sleep.
+    """
+    target_order_id = BOT_STATE.get('last_placed_order_id')
+    if not target_order_id:
+        log_error("wait_for_complete_trade: no last_placed_order_id set")
+        return 0, None
+
+    start = time.time()
+    while time.time() - start < max_wait:
+        pnl, data = find_trade_by_order_id(symbol, target_order_id)
+        if data:
+            return pnl, data
+        time.sleep(1)
+
+    log_error(f"Fills not received in {max_wait}s for order {target_order_id}")
+    return 0, None
+
+
+def get_trade_with_retry(symbol, retries=5):
+    """
+    Get trade data with retry logic using only 5 fills per attempt.
+    Delegates to wait_for_trade_fills.
+    """
+    target_order_id = BOT_STATE.get('last_placed_order_id')
+    return wait_for_trade_fills(symbol, target_order_id, max_retries=retries, retry_delay=2)
+
+
+def get_pnl_from_fills():
+    """Get PnL from fills using the optimised engine"""
+    pnl, _ = find_latest_closed_pair(BOT_STATE['symbol'])
+    return pnl
+
+
+def get_entry_exit_from_fills():
+    """Get entry/exit data using the optimised engine"""
+    _, entry_exit_data = find_latest_closed_pair(BOT_STATE['symbol'])
+    return entry_exit_data
+
+
+# =====================================================================
+# _apply_step_progression
+#
+# WIN  (pnl > 0) → reset to Step 1 (lot = 1)
+# LOSS (pnl <= 0) → advance one step; if beyond max, reset to Step 1
+#
+# This is called immediately when a trade closes (before next order).
+# After calling this, save_bot_state_to_db() is called to persist.
+# Then verify_and_sync_step_from_db() cross-checks before each order.
+# =====================================================================
+def _apply_step_progression(pnl):
+    """
+    Apply martingale step progression immediately when trade result is known.
+    Called right after fill detection - BEFORE next trade is placed.
+    """
+    global BOT_STATE
+
+    current_step = BOT_STATE['current_step']
+    current_lot  = BOT_STATE['current_lot']
+
+    result_type = 'PROFIT' if pnl > 0 else 'LOSS'
+    log_trade(f"POSITION CLOSED | PnL={pnl:.5f} | Result={result_type}")
+
+    if pnl > 0:
+        # WIN → Reset to Step 1
+        next_step = 1
+        next_lot  = LOT_STEPS[next_step]
+        BOT_STATE['current_step'] = next_step
+        BOT_STATE['current_lot']  = next_lot
+        log_state(f"STEP UPDATED | WIN → Step {next_step} | LOT UPDATED | Lot={next_lot}")
+    else:
+        # LOSS → Advance to next step
+        next_step = current_step + 1
+        if next_step > BOT_STATE['max_steps']:
+            # Max step reached → reset to Step 1
+            next_step = 1
+            next_lot  = LOT_STEPS[next_step]
+            BOT_STATE['current_step'] = next_step
+            BOT_STATE['current_lot']  = next_lot
+            log_state(f"STEP UPDATED | MAX STEP REACHED → Step {next_step} | LOT UPDATED | Lot={next_lot}")
+        else:
+            next_lot  = LOT_STEPS[next_step]
+            BOT_STATE['current_step'] = next_step
+            BOT_STATE['current_lot']  = next_lot
+            log_state(f"STEP UPDATED | LOSS → Step {next_step} | LOT UPDATED | Lot={next_lot}")
+
+    log_state(f"Next Trade => {BOT_STATE['symbol']} {BOT_STATE['current_lot']} Lots")
+
+
+# ========== WEBSOCKET FILL ENGINE (GLOBAL STATE) ==========
+# These globals are shared between the WS thread and the main bot thread.
+
+WS_FILL_QUEUE          = []          # Raw fill messages pushed by WS on_message
+WS_FILL_QUEUE_LOCK     = Lock()
+
+WS_POSITION_QUEUE      = []          # Raw position messages pushed by WS on_message
+WS_POSITION_QUEUE_LOCK = Lock()
+
+WS_APP             = None        # The websocket.WebSocketApp instance
+WS_THREAD          = None        # The daemon thread running ws.run_forever()
+WS_AUTHENTICATED   = False       # Set True after "Authenticated" message received
+WS_RUNNING         = False       # Set False to stop the WS reconnect loop
+WS_RECONNECT_DELAY = 3           # Seconds between reconnect attempts
+
+
+def _ws_generate_signature(secret, message):
+    """Generate HMAC-SHA256 signature for WebSocket auth (same algo as REST)"""
+    return hmac.new(
+        secret.encode('utf-8'),
+        message.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def _ws_send_auth(ws):
+    """Send authentication payload over WebSocket"""
+    method    = 'GET'
+    timestamp = str(int(time.time()))
+    path      = '/live'
+    sig_data  = method + timestamp + path
+    signature = _ws_generate_signature(DELTA_API_SECRET, sig_data)
+
+    auth_msg = {
+        "type": "auth",
+        "payload": {
+            "api-key":   DELTA_API_KEY,
+            "signature": signature,
+            "timestamp": timestamp
+        }
+    }
+    ws.send(json.dumps(auth_msg))
+    print("[WS] Auth payload sent")
+
+
+def _ws_subscribe(ws, channel, symbols):
+    """Subscribe to a private channel after authentication"""
+    sub_msg = {
+        "type": "subscribe",
+        "payload": {
+            "channels": [
+                {
+                    "name":    channel,
+                    "symbols": symbols
+                }
+            ]
+        }
+    }
+    ws.send(json.dumps(sub_msg))
+    print(f"[WS] Subscribed to channel='{channel}' symbols={symbols}")
+
+
+def _ws_on_open(ws):
+    print("[WS] Connection opened - sending auth...")
+    _ws_send_auth(ws)
+
+
+def _ws_on_message(ws, message):
+    """
+    Handle all incoming WebSocket messages.
+
+    - On 'Authenticated': subscribe to v2/user_trades and positions
+    - On 'v2/user_trades': push fill into WS_FILL_QUEUE
+    - On 'positions': push position update into WS_POSITION_QUEUE
+    """
+    global WS_AUTHENTICATED
+
+    try:
+        msg      = json.loads(message)
+        msg_type = msg.get('type', '')
+
+        # ── Authentication success ──────────────────────────────────────────
+        if msg_type == 'success' and msg.get('message') == 'Authenticated':
+            WS_AUTHENTICATED = True
+            print("[WS] Authenticated successfully")
+
+            symbol = BOT_STATE.get('symbol', 'ETHUSD')
+
+            # v2/user_trades is faster than user_trades and has no commission data
+            # but gives us fill_id, order_id, side, size, price instantly
+            _ws_subscribe(ws, 'v2/user_trades', [symbol])
+            _ws_subscribe(ws, 'positions',      [symbol])
+            return
+
+        # ── Fill update (v2/user_trades) ────────────────────────────────────
+        if msg_type == 'v2/user_trades':
+            # v2/user_trades payload fields:
+            #   sy=symbol, f=fill_id, o=order_id, S=side,
+            #   s=size, p=price, po=position_after_fill, t=timestamp_us
+            fill = {
+                'fill_id':             msg.get('f'),
+                'order_id':            str(msg.get('o', '')),
+                'side':                msg.get('S', ''),
+                'size':                float(msg.get('s', 0)),
+                'price':               float(msg.get('p', 0)),
+                'position_after_fill': float(msg.get('po', 0)),
+                'symbol':              msg.get('sy', ''),
+                'timestamp_us':        msg.get('t', 0),
+                'sequence_id':         msg.get('se', 0),
+                'source':              'websocket'
+            }
+            with WS_FILL_QUEUE_LOCK:
+                WS_FILL_QUEUE.append(fill)
+            print(f"[WS] FILL received: {fill['side'].upper()} "
+                  f"{fill['size']} @ {fill['price']} "
+                  f"| pos_after={fill['position_after_fill']} "
+                  f"| order_id={fill['order_id']}")
+            return
+
+        # ── Position update ─────────────────────────────────────────────────
+        if msg_type == 'positions':
+            action = msg.get('action', '')
+
+            # Snapshot comes as result list; incremental comes as flat fields
+            if action == 'snapshot':
+                for pos in msg.get('result', []):
+                    sym = pos.get('product_symbol') or pos.get('symbol', '')
+                    if sym == BOT_STATE.get('symbol'):
+                        update = {
+                            'symbol':      sym,
+                            'size':        float(pos.get('size', 0)),
+                            'entry_price': float(pos.get('entry_price', 0) or 0),
+                            'action':      'snapshot',
+                            'source':      'websocket'
+                        }
+                        with WS_POSITION_QUEUE_LOCK:
+                            WS_POSITION_QUEUE.append(update)
+                        print(f"[WS] POSITION snapshot: size={update['size']} "
+                              f"entry={update['entry_price']}")
+            else:
+                sym = msg.get('symbol', '')
+                if sym == BOT_STATE.get('symbol'):
+                    update = {
+                        'symbol':      sym,
+                        'size':        float(msg.get('size', 0)),
+                        'entry_price': float(msg.get('entry_price', 0) or 0),
+                        'action':      action,
+                        'source':      'websocket'
+                    }
+                    with WS_POSITION_QUEUE_LOCK:
+                        WS_POSITION_QUEUE.append(update)
+                    print(f"[WS] POSITION update ({action}): "
+                          f"size={update['size']} entry={update['entry_price']}")
+            return
+
+    except Exception as e:
+        print(f"[WS] on_message error: {e}")
+
+
+def _ws_on_error(ws, error):
+    print(f"[WS] Error: {error}")
+
+
+def _ws_on_close(ws, close_status_code, close_msg):
+    global WS_AUTHENTICATED
+    WS_AUTHENTICATED = False
+    print(f"[WS] Connection closed | code={close_status_code} msg={close_msg}")
+
+
+def _ws_reconnect_loop():
+    """
+    Persistent WebSocket loop with auto-reconnect.
+    Runs in a daemon thread. Reconnects every WS_RECONNECT_DELAY seconds
+    if the connection drops.
+    """
+    global WS_APP, WS_RUNNING, WS_AUTHENTICATED
+
+    print("[WS] Reconnect loop started")
+
+    while WS_RUNNING:
+        try:
+            print(f"[WS] Connecting to {WS_URL} ...")
+            WS_AUTHENTICATED = False
+
+            WS_APP = websocket.WebSocketApp(
+                WS_URL,
+                on_open    = _ws_on_open,
+                on_message = _ws_on_message,
+                on_error   = _ws_on_error,
+                on_close   = _ws_on_close
+            )
+
+            # run_forever blocks until connection drops
+            # ping_interval keeps the connection alive (Delta may drop idle sockets)
+            WS_APP.run_forever(ping_interval=20, ping_timeout=10)
+
+        except Exception as e:
+            print(f"[WS] run_forever exception: {e}")
+
+        if WS_RUNNING:
+            print(f"[WS] Reconnecting in {WS_RECONNECT_DELAY}s ...")
+            time.sleep(WS_RECONNECT_DELAY)
+
+    print("[WS] Reconnect loop exited")
+
+
+def start_websocket_engine():
+    """
+    Start the WebSocket engine in a background daemon thread.
+    Call this once when the bot starts (inside start_auto_trading_bot).
+    """
+    global WS_THREAD, WS_RUNNING
+
+    if WS_RUNNING and WS_THREAD and WS_THREAD.is_alive():
+        print("[WS] Engine already running")
+        return
+
+    WS_RUNNING = True
+    WS_THREAD  = threading.Thread(target=_ws_reconnect_loop, daemon=True, name="WS-Engine")
+    WS_THREAD.start()
+    print("[WS] Engine thread started")
+
+
+def stop_websocket_engine():
+    """
+    Stop the WebSocket engine cleanly.
+    Call this inside stop_auto_trading_bot.
+    """
+    global WS_RUNNING, WS_APP, WS_AUTHENTICATED
+
+    WS_RUNNING       = False
+    WS_AUTHENTICATED = False
+
+    if WS_APP:
+        try:
+            WS_APP.close()
+        except Exception:
+            pass
+        WS_APP = None
+
+    print("[WS] Engine stopped")
+
+
+def _drain_ws_fill_queue(symbol):
+    """
+    Drain all pending fills from WS_FILL_QUEUE for the given symbol.
+    Returns list of fill dicts sorted oldest-first by timestamp_us.
+    """
+    with WS_FILL_QUEUE_LOCK:
+        symbol_fills = [f for f in WS_FILL_QUEUE if f.get('symbol') == symbol]
+        # Keep fills for other symbols in the queue
+        WS_FILL_QUEUE[:] = [f for f in WS_FILL_QUEUE if f.get('symbol') != symbol]
+
+    symbol_fills.sort(key=lambda x: x.get('timestamp_us', 0))
+    return symbol_fills
+
+
+def _drain_ws_position_queue(symbol):
+    """
+    Drain all pending position updates from WS_POSITION_QUEUE for the given symbol.
+    Returns the LATEST position update (highest timestamp / last in list).
+    """
+    with WS_POSITION_QUEUE_LOCK:
+        symbol_pos = [p for p in WS_POSITION_QUEUE if p.get('symbol') == symbol]
+        WS_POSITION_QUEUE[:] = [p for p in WS_POSITION_QUEUE if p.get('symbol') != symbol]
+
+    if not symbol_pos:
+        return None
+    # Return the most recent one
+    return symbol_pos[-1]
+
+
+def _pair_ws_fills(fills, symbol):
+    """
+    Pair WS fills into entry+exit trades.
+    Groups by order_id (handles split fills), then pairs opposite-side orders.
+    Only processes fills related to BOT_STATE['last_placed_order_id'].
+
+    DUPLICATE FIX: Checks PROCESSED_ORDER_IDS at the very start, and marks
+    the entry order_id in PROCESSED_ORDER_IDS atomically before returning a
+    completed trade. This ensures the WS path and the REST/dead-reckoning
+    path cannot both process the same entry order.
+
+    Returns list of completed trade dicts:
+    {
+        'side', 'entry_price', 'exit_price', 'quantity',
+        'entry_time', 'exit_time', 'pnl',
+        'entry_order_id', 'exit_order_id'
+    }
+    """
+    if not fills:
+        return []
+
+    target_order_id = str(BOT_STATE.get('last_placed_order_id', ''))
+
+    # ── DUPLICATE CHECK: if target order is already processed, skip all WS work
+    if target_order_id and target_order_id != 'RESUMED':
+        with PROCESSED_ORDER_IDS_LOCK:
+            if target_order_id in PROCESSED_ORDER_IDS:
+                log_trade(f"WS PAIR SKIPPED | order {target_order_id} already in PROCESSED_ORDER_IDS")
+                return []
+
+    # Group fills by order_id
+    order_groups = {}
+    for fill in fills:
+        oid   = fill['order_id']
+        side  = fill['side']
+        size  = fill['size']
+        price = fill['price']
+        ts    = fill['timestamp_us']
+
+        if oid not in order_groups:
+            order_groups[oid] = {
+                'order_id':     oid,
+                'side':         side,
+                'total_size':   0.0,
+                'total_value':  0.0,
+                'avg_price':    0.0,
+                'timestamp_us': ts,
+                'fills_count':  0
+            }
+
+        grp = order_groups[oid]
+        grp['total_size']  += size
+        grp['total_value'] += price * size
+        grp['fills_count'] += 1
+        if ts < grp['timestamp_us']:
+            grp['timestamp_us'] = ts
+
+    for grp in order_groups.values():
+        if grp['total_size'] > 0:
+            grp['avg_price'] = grp['total_value'] / grp['total_size']
+
+    sorted_orders = sorted(order_groups.values(), key=lambda x: x['timestamp_us'])
+
+    # If we have a target order ID, only pair fills involving that order
+    if target_order_id and target_order_id != 'RESUMED':
+        entry_order = order_groups.get(target_order_id)
+        if not entry_order:
+            return []
+
+        with USED_FILL_IDS_LOCK:
+            already_used = set(USED_FILL_IDS)
+
+        exit_order = None
+        for grp in sorted_orders:
+            if grp['order_id'] == target_order_id:
+                continue
+            if grp['order_id'] in already_used:
+                continue
+            if grp['side'] != entry_order['side']:
+                if grp['timestamp_us'] >= entry_order['timestamp_us']:
+                    exit_order = grp
+                    break
+
+        if not exit_order:
+            return []
+
+        entry_side  = entry_order['side']
+        entry_price = entry_order['avg_price']
+        exit_price  = exit_order['avg_price']
+        trade_size  = min(entry_order['total_size'], exit_order['total_size'])
+
+        lot_size        = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
+        actual_quantity = trade_size * lot_size
+
+        if entry_side == 'buy':
+            pnl = (exit_price - entry_price) * actual_quantity
+        else:
+            pnl = (entry_price - exit_price) * actual_quantity
+
+        entry_ts_iso = datetime.utcfromtimestamp(
+            entry_order['timestamp_us'] / 1_000_000
+        ).isoformat() + 'Z'
+        exit_ts_iso  = datetime.utcfromtimestamp(
+            exit_order['timestamp_us'] / 1_000_000
+        ).isoformat() + 'Z'
+
+        log_trade(f"PNL CALCULATED | {entry_side.upper()} | Entry={entry_price:.6f} | Exit={exit_price:.6f} | PnL={pnl:.6f}")
+        log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
+
+        # ── ATOMIC MARK: add to PROCESSED_ORDER_IDS and USED_FILL_IDS before
+        # returning, so no second path can re-pair this order ────────────────
+        with PROCESSED_ORDER_IDS_LOCK:
+            PROCESSED_ORDER_IDS.add(target_order_id)
+
+        with USED_FILL_IDS_LOCK:
+            USED_FILL_IDS.add(target_order_id)
+            USED_FILL_IDS.add(exit_order['order_id'])
+
+        return [{
+            'side':           entry_side,
+            'entry_price':    entry_price,
+            'exit_price':     exit_price,
+            'quantity':       trade_size,
+            'entry_time':     entry_ts_iso,
+            'exit_time':      exit_ts_iso,
+            'pnl':            pnl,
+            'entry_order_id': entry_order['order_id'],
+            'exit_order_id':  exit_order['order_id']
+        }]
+
+    # Fallback: no target order ID - pair all (FIFO, same as before)
+    completed_trades = []
+    pending_entries  = []
+
+    for order in sorted_orders:
+        if not pending_entries:
+            pending_entries.append(order)
+            continue
+
+        last_entry = pending_entries[-1]
+
+        if last_entry['side'] != order['side']:
+            entry_order = pending_entries.pop()
+            exit_order  = order
+
+            # Skip if already processed
+            with PROCESSED_ORDER_IDS_LOCK:
+                if entry_order['order_id'] in PROCESSED_ORDER_IDS:
+                    continue
+
+            entry_side  = entry_order['side']
+            entry_price = entry_order['avg_price']
+            exit_price  = exit_order['avg_price']
+            trade_size  = min(entry_order['total_size'], exit_order['total_size'])
+
+            lot_size        = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
+            actual_quantity = trade_size * lot_size
+
+            if entry_side == 'buy':
+                pnl = (exit_price - entry_price) * actual_quantity
+            else:
+                pnl = (entry_price - exit_price) * actual_quantity
+
+            entry_ts_iso = datetime.utcfromtimestamp(
+                entry_order['timestamp_us'] / 1_000_000
+            ).isoformat() + 'Z'
+            exit_ts_iso  = datetime.utcfromtimestamp(
+                exit_order['timestamp_us'] / 1_000_000
+            ).isoformat() + 'Z'
+
+            with PROCESSED_ORDER_IDS_LOCK:
+                PROCESSED_ORDER_IDS.add(entry_order['order_id'])
+
+            with USED_FILL_IDS_LOCK:
+                USED_FILL_IDS.add(entry_order['order_id'])
+                USED_FILL_IDS.add(exit_order['order_id'])
+
+            completed_trades.append({
+                'side':           entry_side,
+                'entry_price':    entry_price,
+                'exit_price':     exit_price,
+                'quantity':       trade_size,
+                'entry_time':     entry_ts_iso,
+                'exit_time':      exit_ts_iso,
+                'pnl':            pnl,
+                'entry_order_id': entry_order['order_id'],
+                'exit_order_id':  exit_order['order_id']
+            })
+        else:
+            pending_entries.append(order)
+
+    return completed_trades
+
+
+# ========== IMPROVED POSITION TRACKING (WEBSOCKET + POLLING HYBRID) ==========
+def check_position_and_detect_closure():
+    """
+    Hybrid WebSocket + REST polling + Dead-Reckoning position tracker.
+
+    Detection priority:
+      1. WebSocket v2/user_trades fills  → catches micro-second open+close trades
+      2. WebSocket positions channel     → catches close even if fills are delayed.
+      3. REST polling fallback           → safety net if WS is disconnected.
+      4. DEAD RECKONING                  → when order_completed=False, no position
+                                           found anywhere, but fills exist on exchange.
+                                           This handles the "position timeout" case
+                                           where LAST_POSITION_STATE['size'] stayed 0.
+
+    DUPLICATE FIX: Every closure path now passes entry_order_id through to
+    save_closed_position(). Combined with PROCESSED_ORDER_IDS checks in
+    find_trade_by_order_id() and _pair_ws_fills(), and the DB UNIQUE KEY on
+    entry_order_id, it is impossible for the same trade to be processed twice.
+
+    On close detected:
+      1. Record LAST_CLOSE_TIMESTAMP (FIX 2: cooldown)
+      2. Immediately zero out LAST_POSITION_STATE size (prevents double-detection)
+      3. Wait exactly 10 seconds for fills to propagate (REST/WS-POS paths only)
+      4. Fetch only the 5 most recent fills (never 100)
+      5. Match entry+exit using BOT_STATE['last_placed_order_id']
+      6. Retry up to 5 times with 2-second gaps if fill not found
+      7. Apply step progression
+      8. Save to DB and verify
+      9. Call _mark_order_complete() so bot loop unblocks
+    """
+    # ── ALL global declarations at the very top ──────────────────────────────
+    global LAST_POSITION_STATE, LAST_CLOSE_TIMESTAMP
+    global WAITING_FOR_FILL, TRADE_COMPLETED, CURRENT_SIGNAL
+    # ────────────────────────────────────────────────────────────────────────
+
+    try:
+        symbol = BOT_STATE['symbol']
+
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 1: Drain WebSocket fill queue
+        # ──────────────────────────────────────────────────────────────────
+        ws_fills = _drain_ws_fill_queue(symbol)
+
+        if ws_fills:
+            print(f"[WS] {len(ws_fills)} new fill(s) drained from WS queue")
+
+            # Filter out already-used fill order_ids
+            with USED_FILL_IDS_LOCK:
+                fresh_fills = [
+                    f for f in ws_fills
+                    if f['order_id'] not in USED_FILL_IDS
+                ]
+
+            if fresh_fills:
+                completed_trades = _pair_ws_fills(fresh_fills, symbol)
+
+                if completed_trades:
+                    # Process ALL completed trades found in this batch
+                    for trade in completed_trades:
+                        print(f"[WS] Processing WS-detected trade: "
+                              f"{trade['side'].upper()} PnL={trade['pnl']:.6f}")
+
+                        completed_order_id = trade.get('entry_order_id', BOT_STATE.get('last_placed_order_id'))
+
+                        # Record close timestamp and zero position state
+                        LAST_CLOSE_TIMESTAMP               = time.time()
+                        prev_size                          = LAST_POSITION_STATE['size']
+                        LAST_POSITION_STATE['size']        = 0
+                        LAST_POSITION_STATE['entry_price'] = 0
+
+                        pnl             = trade['pnl']
+                        entry_exit_data = {
+                            'side':           trade['side'],
+                            'entry_price':    trade['entry_price'],
+                            'exit_price':     trade['exit_price'],
+                            'quantity':       trade['quantity'],
+                            'entry_time':     trade['entry_time'],
+                            'exit_time':      trade['exit_time'],
+                            'entry_order_id': trade.get('entry_order_id'),
+                            'exit_order_id':  trade.get('exit_order_id')
+                        }
+
+                        # Update memory
+                        LAST_TRADE_RESULT['profit_loss'] = pnl
+                        LAST_TRADE_RESULT['timestamp']   = datetime.now().isoformat()
+                        LAST_TRADE_RESULT['lot_used']    = trade['quantity']
+                        LAST_TRADE_RESULT['processed']   = True
+
+                        BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
+                        BOT_STATE['last_pnl']    = pnl
+
+                        # Apply step progression
+                        _apply_step_progression(pnl)
+
+                        # Save state
+                        save_bot_state_to_db()
+                        log_state(f"STATE SAVED FOR ORDER: {completed_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
+
+                        # Save trade to DB — pass entry_order_id for dedup
+                        save_closed_position({
+                            'symbol':          symbol,
+                            'side':            entry_exit_data['side'],
+                            'entry_price':     entry_exit_data['entry_price'],
+                            'exit_price':      entry_exit_data['exit_price'],
+                            'quantity':        entry_exit_data['quantity'],
+                            'pnl':             pnl,
+                            'entry_time':      entry_exit_data['entry_time'],
+                            'exit_time':       entry_exit_data['exit_time'],
+                            'entry_order_id':  entry_exit_data.get('entry_order_id')
+                        })
+                        log_trade(f"TRADE SAVED FOR ORDER: {completed_order_id}")
+
+                        if BOT_STATE['session_start_time']:
+                            BOT_STATE['session_total_pnl'] += pnl
+
+                        result_type    = "PROFIT" if pnl > 0 else "LOSS"
+                        reason         = f"after_{result_type.lower()}_pnl={pnl:.5f}"
+                        CURRENT_SIGNAL = generate_smart_signal(reason=reason)
+
+                        WAITING_FOR_FILL = True
+                        TRADE_COMPLETED  = True
+                        log_system("Trade paired (WS)")
+
+                        # FIX 8: Mark order complete so bot loop unblocks
+                        _mark_order_complete(completed_order_id)
+
+                    # After processing all WS trades, sync position state
+                    ws_pos = _drain_ws_position_queue(symbol)
+                    if ws_pos:
+                        LAST_POSITION_STATE = {
+                            'symbol':      symbol,
+                            'size':        ws_pos['size'],
+                            'entry_price': ws_pos['entry_price']
+                        }
+                        has_position = abs(ws_pos['size']) > 0.001
+                    else:
+                        product_id = get_product_id(symbol)
+                        if product_id:
+                            current_pos = check_position_realtime(product_id)
+                            if not current_pos.get('error'):
+                                LAST_POSITION_STATE = {
+                                    'symbol':      symbol,
+                                    'size':        current_pos.get('size', 0),
+                                    'entry_price': current_pos.get('entry_price', 0)
+                                }
+                        has_position = abs(LAST_POSITION_STATE.get('size', 0)) > 0.001
+
+                    return has_position, True, completed_trades[-1]['pnl']
+
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 2: Check WebSocket position queue for closure signal
+        # ──────────────────────────────────────────────────────────────────
+        ws_pos = _drain_ws_position_queue(symbol)
+
+        if ws_pos:
+            print(f"[WS] Position update from WS: size={ws_pos['size']} "
+                  f"entry={ws_pos['entry_price']} action={ws_pos['action']}")
+
+            prev_size = LAST_POSITION_STATE['size']
+
+            # Update LAST_POSITION_STATE from WS
+            LAST_POSITION_STATE = {
+                'symbol':      symbol,
+                'size':        ws_pos['size'],
+                'entry_price': ws_pos['entry_price']
+            }
+
+            # Detect closure via WS position channel
+            if abs(prev_size) > 0.001 and abs(ws_pos['size']) <= 0.001:
+                log_trade("POSITION CLOSED | Detected via WS positions channel")
+
+                LAST_CLOSE_TIMESTAMP               = time.time()
+                prev_entry_price                   = LAST_POSITION_STATE['entry_price']
+                LAST_POSITION_STATE['size']        = 0
+                LAST_POSITION_STATE['entry_price'] = 0
+
+                target_order_id = BOT_STATE.get('last_placed_order_id')
+                log_trade(f"TRACKING ORDER: {target_order_id}")
+
+                # Wait 10s then fetch only 5 fills
+                print("⏳ Waiting 10 seconds for fills to propagate...")
+                time.sleep(10)
+
+                pnl, entry_exit_data = wait_for_trade_fills(
+                    symbol, target_order_id, max_retries=5, retry_delay=2
+                )
+
+                if entry_exit_data:
+                    log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
+
+                    LAST_TRADE_RESULT['profit_loss'] = pnl
+                    LAST_TRADE_RESULT['timestamp']   = datetime.now().isoformat()
+                    LAST_TRADE_RESULT['lot_used']    = prev_size
+                    LAST_TRADE_RESULT['processed']   = True
+
+                    BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
+                    BOT_STATE['last_pnl']    = pnl
+
+                    _apply_step_progression(pnl)
+                    save_bot_state_to_db()
+                    log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
+
+                    save_closed_position({
+                        'symbol':         symbol,
+                        'side':           entry_exit_data['side'],
+                        'entry_price':    entry_exit_data['entry_price'],
+                        'exit_price':     entry_exit_data['exit_price'],
+                        'quantity':       entry_exit_data['quantity'],
+                        'pnl':            pnl,
+                        'entry_time':     entry_exit_data['entry_time'],
+                        'exit_time':      entry_exit_data['exit_time'],
+                        'entry_order_id': entry_exit_data.get('entry_order_id')
+                    })
+                    log_trade(f"TRADE SAVED FOR ORDER: {target_order_id}")
+
+                    if BOT_STATE['session_start_time']:
+                        BOT_STATE['session_total_pnl'] += pnl
+
+                    result_type    = "PROFIT" if pnl > 0 else "LOSS"
+                    reason         = f"after_{result_type.lower()}_pnl={pnl:.5f}"
+                    CURRENT_SIGNAL = generate_smart_signal(reason=reason)
+
+                    WAITING_FOR_FILL = True
+                    TRADE_COMPLETED  = True
+                    log_system("Trade paired (WS-POS)")
+
+                    # FIX 8: Mark order complete so bot loop unblocks
+                    _mark_order_complete(target_order_id)
+
+                else:
+                    # Fallback: fills not found after all retries
+                    log_error(f"Fills not found after retries for order {target_order_id} - using fallback")
+                    pnl = 0
+
+                    LAST_TRADE_RESULT['profit_loss'] = pnl
+                    LAST_TRADE_RESULT['timestamp']   = datetime.now().isoformat()
+                    LAST_TRADE_RESULT['lot_used']    = prev_size
+                    LAST_TRADE_RESULT['processed']   = True
+
+                    BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
+                    BOT_STATE['last_pnl']    = pnl
+
+                    _apply_step_progression(pnl)
+                    save_bot_state_to_db()
+                    log_state(f"STATE SAVED FOR ORDER: {target_order_id} (fallback) | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
+
+                    fallback_data = {
+                        'side':        'buy' if prev_size > 0 else 'sell',
+                        'entry_price': prev_entry_price,
+                        'exit_price':  prev_entry_price,
+                        'quantity':    abs(prev_size),
+                        'entry_time':  datetime.now().isoformat(),
+                        'exit_time':   datetime.now().isoformat()
+                    }
+                    save_closed_position({
+                        'symbol':         symbol,
+                        'side':           fallback_data['side'],
+                        'entry_price':    fallback_data['entry_price'],
+                        'exit_price':     fallback_data['exit_price'],
+                        'quantity':       fallback_data['quantity'],
+                        'pnl':            pnl,
+                        'entry_time':     fallback_data['entry_time'],
+                        'exit_time':      fallback_data['exit_time'],
+                        'entry_order_id': str(target_order_id) if target_order_id else None
+                    })
+                    log_trade(f"TRADE SAVED FOR ORDER: {target_order_id} (fallback)")
+
+                    WAITING_FOR_FILL = True
+                    TRADE_COMPLETED  = True
+
+                    # FIX 8: Mark order complete even in fallback path
+                    _mark_order_complete(target_order_id)
+
+                has_position = abs(ws_pos['size']) > 0.001
+                return has_position, True, pnl
+
+            has_position = abs(ws_pos['size']) > 0.001
+            return has_position, False, 0
+
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 3: REST polling fallback
+        # ──────────────────────────────────────────────────────────────────
+        product_id = get_product_id(symbol)
+        if not product_id:
+            return False, False, 0
+
+        current_pos = check_position_realtime(product_id)
+
+        if current_pos.get('error'):
+            return True, False, 0
+
+        was_closed = False
+        pnl        = 0
+
+        if abs(LAST_POSITION_STATE['size']) > 0.001 and abs(current_pos.get('size', 0)) <= 0.001:
+            log_trade("POSITION CLOSED | Detected via REST polling")
+
+            LAST_CLOSE_TIMESTAMP = time.time()
+            prev_size        = LAST_POSITION_STATE['size']
+            prev_entry_price = LAST_POSITION_STATE['entry_price']
+            LAST_POSITION_STATE['size']        = 0
+            LAST_POSITION_STATE['entry_price'] = 0
+
+            was_closed       = True
+            WAITING_FOR_FILL = True
+            TRADE_COMPLETED  = False
+
+            target_order_id = BOT_STATE.get('last_placed_order_id')
+            log_trade(f"TRACKING ORDER: {target_order_id}")
+
+            # Wait 10s then fetch only 5 fills
+            print("⏳ Waiting 10 seconds for fills to propagate...")
+            time.sleep(10)
+
+            pnl, entry_exit_data = wait_for_trade_fills(
+                symbol, target_order_id, max_retries=5, retry_delay=2
+            )
+
+            if entry_exit_data:
+                log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
+
+                LAST_TRADE_RESULT['profit_loss'] = pnl
+                LAST_TRADE_RESULT['timestamp']   = datetime.now().isoformat()
+                LAST_TRADE_RESULT['lot_used']    = prev_size
+                LAST_TRADE_RESULT['processed']   = True
+
+                BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
+                BOT_STATE['last_pnl']    = pnl
+
+                _apply_step_progression(pnl)
+                save_bot_state_to_db()
+                log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
+
+                save_closed_position({
+                    'symbol':         symbol,
+                    'side':           entry_exit_data['side'],
+                    'entry_price':    entry_exit_data['entry_price'],
+                    'exit_price':     entry_exit_data['exit_price'],
+                    'quantity':       entry_exit_data['quantity'],
+                    'pnl':            pnl,
+                    'entry_time':     entry_exit_data['entry_time'],
+                    'exit_time':      entry_exit_data['exit_time'],
+                    'entry_order_id': entry_exit_data.get('entry_order_id')
+                })
+                log_trade(f"TRADE SAVED FOR ORDER: {target_order_id}")
+
+                if BOT_STATE['session_start_time']:
+                    BOT_STATE['session_total_pnl'] += pnl
+
+                result_type    = "PROFIT" if pnl > 0 else "LOSS"
+                reason         = f"after_{result_type.lower()}_pnl={pnl:.5f}"
+                CURRENT_SIGNAL = generate_smart_signal(reason=reason)
+                TRADE_COMPLETED = True
+                log_system("Trade paired (REST)")
+
+                # FIX 8: Mark order complete so bot loop unblocks
+                _mark_order_complete(target_order_id)
+
+            else:
+                log_error(f"Fills not found after retries for order {target_order_id} - using fallback (REST)")
+
+                LAST_TRADE_RESULT['profit_loss'] = pnl
+                LAST_TRADE_RESULT['timestamp']   = datetime.now().isoformat()
+                LAST_TRADE_RESULT['lot_used']    = prev_size
+                LAST_TRADE_RESULT['processed']   = True
+
+                BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
+                BOT_STATE['last_pnl']    = pnl
+
+                _apply_step_progression(pnl)
+                save_bot_state_to_db()
+                log_state(f"STATE SAVED FOR ORDER: {target_order_id} (fallback) | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
+
+                fallback_data = {
+                    'side':        'buy' if prev_size > 0 else 'sell',
+                    'entry_price': prev_entry_price,
+                    'exit_price':  prev_entry_price,
+                    'quantity':    abs(prev_size),
+                    'entry_time':  datetime.now().isoformat(),
+                    'exit_time':   datetime.now().isoformat()
+                }
+                save_closed_position({
+                    'symbol':         symbol,
+                    'side':           fallback_data['side'],
+                    'entry_price':    fallback_data['entry_price'],
+                    'exit_price':     fallback_data['exit_price'],
+                    'quantity':       fallback_data['quantity'],
+                    'pnl':            pnl,
+                    'entry_time':     fallback_data['entry_time'],
+                    'exit_time':      fallback_data['exit_time'],
+                    'entry_order_id': str(target_order_id) if target_order_id else None
+                })
+                log_trade(f"TRADE SAVED FOR ORDER: {target_order_id} (fallback)")
+                TRADE_COMPLETED = True
+
+                # FIX 8: Mark order complete even in fallback path
+                _mark_order_complete(target_order_id)
+
+        # ──────────────────────────────────────────────────────────────────
+        # STEP 4: DEAD RECKONING
+        # Handles the case where position confirmation timed out after order
+        # placement, leaving LAST_POSITION_STATE['size']=0, so Step 3's
+        # closure check can never fire (requires prev size > 0).
+        # ──────────────────────────────────────────────────────────────────
+        if (not was_closed
+                and not BOT_STATE['order_completed']
+                and BOT_STATE.get('last_placed_order_id')
+                and BOT_STATE['last_placed_order_id'] != 'RESUMED'
+                and abs(current_pos.get('size', 0)) <= 0.001
+                and abs(LAST_POSITION_STATE.get('size', 0)) <= 0.001):
+
+            target_order_id = BOT_STATE['last_placed_order_id']
+            log_trade(f"DEAD RECKONING CHECK | No position found but order pending: {target_order_id}")
+            log_trade(f"TRACKING ORDER: {target_order_id}")
+
+            # Attempt fill lookup immediately — no pre-sleep
+            pnl, entry_exit_data = wait_for_trade_fills(
+                symbol, target_order_id, max_retries=5, retry_delay=2
+            )
+
+            if entry_exit_data:
+                log_trade(f"DEAD RECKONING: PAIR FOUND FOR ORDER: {target_order_id}")
+                log_trade("POSITION CLOSED | Detected via dead reckoning (fill-based)")
+
+                LAST_CLOSE_TIMESTAMP               = time.time()
+                LAST_POSITION_STATE['size']        = 0
+                LAST_POSITION_STATE['entry_price'] = 0
+
+                LAST_TRADE_RESULT['profit_loss'] = pnl
+                LAST_TRADE_RESULT['timestamp']   = datetime.now().isoformat()
+                LAST_TRADE_RESULT['lot_used']    = entry_exit_data['quantity']
+                LAST_TRADE_RESULT['processed']   = True
+
+                BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
+                BOT_STATE['last_pnl']    = pnl
+
+                _apply_step_progression(pnl)
+                save_bot_state_to_db()
+                log_state(f"STATE SAVED FOR ORDER: {target_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
+
+                save_closed_position({
+                    'symbol':         symbol,
+                    'side':           entry_exit_data['side'],
+                    'entry_price':    entry_exit_data['entry_price'],
+                    'exit_price':     entry_exit_data['exit_price'],
+                    'quantity':       entry_exit_data['quantity'],
+                    'pnl':            pnl,
+                    'entry_time':     entry_exit_data['entry_time'],
+                    'exit_time':      entry_exit_data['exit_time'],
+                    'entry_order_id': entry_exit_data.get('entry_order_id')
+                })
+                log_trade(f"TRADE SAVED FOR ORDER: {target_order_id}")
+
+                if BOT_STATE['session_start_time']:
+                    BOT_STATE['session_total_pnl'] += pnl
+
+                result_type    = "PROFIT" if pnl > 0 else "LOSS"
+                reason         = f"after_{result_type.lower()}_pnl={pnl:.5f}"
+                CURRENT_SIGNAL = generate_smart_signal(reason=reason)
+
+                WAITING_FOR_FILL = True
+                TRADE_COMPLETED  = True
+                log_system("Trade paired (DEAD-RECKONING)")
+
+                _mark_order_complete(target_order_id)
+
+                return False, True, pnl
+
+            log_trade(f"DEAD RECKONING: fills not found yet for order {target_order_id} - will retry next cycle")
+
+        # ──────────────────────────────────────────────────────────────────
+        # Normal path: update position state from REST and return
+        # ──────────────────────────────────────────────────────────────────
+        LAST_POSITION_STATE = {
+            'symbol':      symbol,
+            'size':        current_pos.get('size', 0),
+            'entry_price': current_pos.get('entry_price', 0)
+        }
+
+        has_position = abs(current_pos.get('size', 0)) > 0.001
+        return has_position, was_closed, pnl
+
+    except Exception as e:
+        log_error(f"Position processing error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, False, 0
+
+
+# ========== TRADING LOGIC ==========
+CURRENT_SIGNAL = None
+
+
+def get_trading_signal():
+    """Generate completely new unbiased trading signal on every call"""
+    global CURRENT_SIGNAL
+    try:
+        CURRENT_SIGNAL = generate_smart_signal(reason="trade_decision")
+        signal = CURRENT_SIGNAL.get('signal', '')
+
+        if signal.upper() == "BUY":
+            return 'buy', CURRENT_SIGNAL
+        elif signal.upper() == "SELL":
+            return 'sell', CURRENT_SIGNAL
+        else:
+            print(f"⏳ Signal WAIT — 30s sleep before retry...")
+            time.sleep(10)
+            return None, CURRENT_SIGNAL
+
+    except Exception as e:
+        log_error(f"Getting signal: {e}")
+        return None, None
+
+def start_signal_bot():
+    """Start the signal bot"""
+    try:
+        print("🤖 Signal bot ready - will generate unbiased random signals on demand")
+        return True
+    except Exception as e:
+        print(f"❌ Error starting signal bot: {e}")
+        return False
+
+
+def stop_signal_bot():
+    """Stop the signal bot"""
+    try:
+        print("🛑 Signal bot stopped")
+    except Exception as e:
+        print(f"❌ Error stopping signal bot: {e}")
+
+
+def detect_current_step_from_lot(lot_size):
+    """Detect current step based on lot size"""
+    lot_size = abs(lot_size)
+    for step, lot in LOT_STEPS.items():
+        if lot == lot_size:
+            return step
+    for step, lot in LOT_STEPS.items():
+        if lot >= lot_size:
+            return step
+    return 1
+
+
+def detect_current_step_from_live_position():
+    """Detect current step from live position lot size"""
+    try:
+        has_position = abs(LAST_POSITION_STATE['size']) > 0.001
+        if has_position:
+            current_lot  = abs(LAST_POSITION_STATE['size'])
+            current_step = detect_current_step_from_lot(current_lot)
+            print(f"🔍 Live position detected: Lot {current_lot} = Step {current_step}")
+            return current_step, current_lot
+        else:
+            print("🔍 No live position detected - using Step 1")
+            return 1, LOT_STEPS[1]
+    except Exception as e:
+        print(f"❌ Error detecting step from live position: {e}")
+        return 1, LOT_STEPS[1]
+
+
+def calculate_next_lot():
+    """
+    Calculate next lot to use.
+    Step progression is already applied in _apply_step_progression()
+    and verified by verify_and_sync_step_from_db().
+    This function just reads the pre-calculated value.
+    """
+    global LOT_CALCULATION_LOCK
+
+    if LOT_CALCULATION_LOCK:
+        return BOT_STATE['current_lot']
+
+    LOT_CALCULATION_LOCK = True
+    try:
+        # Verify lot matches step
+        expected_lot = LOT_STEPS.get(BOT_STATE['current_step'], LOT_STEPS[1])
+        if BOT_STATE['current_lot'] != expected_lot:
+            BOT_STATE['current_lot'] = expected_lot
+
+        next_lot = BOT_STATE['current_lot']
+        LAST_TRADE_RESULT['processed'] = False
+        return next_lot
+    finally:
+        LOT_CALCULATION_LOCK = False
+
+
+def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
+    try:
+        PRODUCT_CONFIG = {
+            "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},
+            "BTCUSD": {"id": 84,    "tick": Decimal("0.5")},
+            # "ETHUSD": {"id": 1320,  "tick": Decimal("0.05")},
+            "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
+        }
+
+        config = PRODUCT_CONFIG.get(symbol)
+        if not config:
+            log_error(f"Symbol {symbol} not in config!")
+            return None
+
+        p_id = config["id"]
+        tick = config["tick"]
+
+        ticker = make_api_request('GET', f'/tickers/{symbol}')
+        if not ticker or not ticker.get('result'):
+            log_error(f"Ticker fetch failed for {symbol}")
+            return None
+
+        result     = ticker['result']
+        mark_price = float(result.get('mark_price') or result.get('close'))
+
+        def to_tick(val):
+            d = Decimal(str(val))
+            return (d / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+
+        base_dec = to_tick(mark_price)
+
+        if side == 'buy':
+            tp_dec = to_tick(mark_price * (1 + tp_pct / 100))
+            sl_dec = to_tick(mark_price * (1 - sl_pct / 100))
+        else:
+            tp_dec = to_tick(mark_price * (1 - tp_pct / 100))
+            sl_dec = to_tick(mark_price * (1 + sl_pct / 100))
+
+        MIN_TICKS = Decimal("3")
+        min_gap   = tick * MIN_TICKS
+
+        if side == 'buy':
+            if tp_dec <= base_dec:
+                tp_dec = base_dec + min_gap
+            if sl_dec >= base_dec:
+                sl_dec = base_dec - min_gap
+        else:
+            if tp_dec >= base_dec:
+                tp_dec = base_dec - min_gap
+            if sl_dec <= base_dec:
+                sl_dec = base_dec + min_gap
+
+        tp_price = str(tp_dec)
+        sl_price = str(sl_dec)
+
+        order_data = {
+            "product_id"                    : p_id,
+            "side"                          : side,
+            "order_type"                    : "market_order",
+            "size"                          : int(size),
+            "bracket_take_profit_price"     : tp_price,
+            "bracket_take_profit_order_type": "market_order",
+            "bracket_stop_loss_price"       : sl_price,
+            "bracket_stop_loss_order_type"  : "market_order",
+            "bracket_stop_trigger_method"   : "mark_price",
+        }
+
+        response = make_api_request('POST', '/orders', order_data)
+
+        if response and response.get('success') and 'result' in response:
+            oid     = response['result'].get('id')
+            actual_entry = float(
+                response['result'].get('average_fill_price') or
+                response['result'].get('limit_price') or
+                mark_price
+            )
+            log_trade(f"ORDER PLACED | {side.upper()} | Lot={size} | Entry={actual_entry} | OrderID={oid}")
+
+            if actual_entry != mark_price:
+                actual_base = to_tick(actual_entry)
+                if side == 'buy':
+                    tp_dec = to_tick(actual_entry * (1 + tp_pct / 100))
+                    sl_dec = to_tick(actual_entry * (1 - sl_pct / 100))
+                else:
+                    tp_dec = to_tick(actual_entry * (1 - tp_pct / 100))
+                    sl_dec = to_tick(actual_entry * (1 + sl_pct / 100))
+
+                if side == 'buy':
+                    if tp_dec <= actual_base: tp_dec = actual_base + min_gap
+                    if sl_dec >= actual_base: sl_dec = actual_base - min_gap
+                else:
+                    if tp_dec >= actual_base: tp_dec = actual_base - min_gap
+                    if sl_dec <= actual_base: sl_dec = actual_base + min_gap
+
+                tp_price = str(tp_dec)
+                sl_price = str(sl_dec)
+
+            if not response['result'].get('bracket_orders', []):
+                bracket_payload = {
+                    "product_id": p_id,
+                    "take_profit_order": {"order_type": "market_order", "stop_price": tp_price},
+                    "stop_loss_order": {"order_type": "market_order", "stop_price": sl_price},
+                    "bracket_stop_trigger_method": "mark_price"
+                }
+                make_api_request('POST', '/orders/bracket', bracket_payload)
+        else:
+            err = response.get('error') if response else 'No response'
+            log_error(f"ORDER FAILED: {err}")
+
+        return response
+
+    except Exception as e:
+        log_error(f"Order placement exception: {e}")
+        return None
+
 
 def start_auto_trading_bot():
     """Start the bot"""
     if BOT_STATE['running']:
         return False
 
-    global LAST_POSITION_STATE
+    global LAST_POSITION_STATE, LAST_CLOSE_TIMESTAMP
     LAST_POSITION_STATE = {
         'symbol': BOT_STATE['symbol'],
         'size': 0,
         'entry_price': 0
     }
 
-    BOT_STATE['stop_at_win']      = False
-    BOT_STATE['stop_at_max_step'] = False
-    BOT_STATE['force_stop']       = False
+    # Reset cooldown on fresh start
+    LAST_CLOSE_TIMESTAMP = 0.0
 
-    BOT_STATE['session_start_time'] = datetime.now().isoformat()
-    BOT_STATE['session_total_pnl']  = 0.0
-    print(f"Session started at {BOT_STATE['session_start_time']}")
+    BOT_STATE['stop_at_win']          = False
+    BOT_STATE['stop_at_max_step']     = False
+    BOT_STATE['force_stop']           = False
+    BOT_STATE['session_start_time']   = datetime.now().isoformat()
+    BOT_STATE['session_total_pnl']    = 0.0
+    BOT_STATE['order_completed']      = True   # No pending order on fresh start
+    BOT_STATE['last_placed_order_id'] = None
+    log_system(f"Session started at {BOT_STATE['session_start_time']}")
 
     BOT_STATE['running'] = True
     BOT_STATE['thread']  = threading.Thread(target=auto_trading_bot_main, daemon=True)
     BOT_STATE['thread'].start()
     return True
 
+
 def stop_auto_trading_bot():
     """Stop the bot"""
+    if not BOT_STATE['running']:
+        return False
     BOT_STATE['running'] = False
     if BOT_STATE['thread']:
         BOT_STATE['thread'].join(timeout=5)
 
     if BOT_STATE['session_start_time']:
-        print(f"Session ended. Final P&L: ${BOT_STATE['session_total_pnl']:.2f}")
-        BOT_STATE['session_start_time'] = None
-        BOT_STATE['session_total_pnl']  = 0.0
+        log_system(f"Session ended. Final P&L: ${BOT_STATE['session_total_pnl']:.2f}")
 
+    BOT_STATE['session_start_time'] = None
+    BOT_STATE['session_total_pnl']  = 0.0
     return True
+
 
 def clear_stuck_trade_result():
     """Clear stuck trade result to fix bot"""
     global LAST_TRADE_RESULT
 
-    print("🔧 CLEARING STUCK TRADE RESULT...")
-    print(f"   Previous result: P&L={LAST_TRADE_RESULT['profit_loss']}, Processed={LAST_TRADE_RESULT['processed']}")
+    log_system("CLEARING STUCK TRADE RESULT...")
 
     LAST_TRADE_RESULT = {
         'profit_loss': None,
@@ -2171,8 +3457,13 @@ def clear_stuck_trade_result():
         'processed': False
     }
 
-    print("   ✅ Trade result cleared - Bot can continue")
+    # Also reset order completion flag so bot can proceed
+    BOT_STATE['order_completed']      = True
+    BOT_STATE['last_placed_order_id'] = None
+
+    log_system("Trade result cleared")
     return True
+
 
 def reconcile_stuck_trades_from_database():
     """Check MySQL database for trades that might be stuck and auto-clear them"""
@@ -2180,39 +3471,33 @@ def reconcile_stuck_trades_from_database():
 
     try:
         query = '''
-            SELECT symbol, side, entry_price, exit_price, quantity, pnl, entry_time, exit_time, created_at
+            SELECT symbol, side, entry_price, exit_price, quantity, pnl,
+                   entry_time, exit_time, created_at
             FROM closed_positions
             WHERE exit_time IS NOT NULL
             ORDER BY created_at DESC
             LIMIT 3
         '''
-
         recent_trades = execute_mysql_query(query, fetch_all=True)
 
         if not recent_trades:
-            print("   ℹ️ No recent trades found in MySQL database")
             return
 
         if (LAST_TRADE_RESULT['profit_loss'] is not None and
-            not LAST_TRADE_RESULT['processed']):
-
-            print(f"   🔍 Found {len(recent_trades)} recent trades in MySQL database")
+                not LAST_TRADE_RESULT['processed']):
 
             for trade in recent_trades:
                 db_pnl = trade['pnl']
                 if abs(float(db_pnl) - LAST_TRADE_RESULT['profit_loss']) < 0.01:
-                    print(f"   🎯 Found matching trade in MySQL DB: P&L={db_pnl}")
-                    print("   🆕 AUTO-CLEARING stuck result based on database match")
+                    log_system(f"Matched trade in DB: PnL={db_pnl}. Auto-clearing.")
                     clear_stuck_trade_result()
                     return
 
-            print("   ⚠️ No exact match found - AUTO-CLEARING to unstick bot")
+            log_system("No match - AUTO-CLEARING to unstick bot")
             clear_stuck_trade_result()
-        else:
-            print("   ✅ No stuck result detected")
 
     except Exception as e:
-        print(f"   ❌ Error in database reconciliation: {e}")
+        log_error(f"Reconciliation error: {e}")
         clear_stuck_trade_result()
 
 
@@ -2220,6 +3505,7 @@ def reconcile_stuck_trades_from_database():
 @app.route('/')
 def index():
     return render_template('index.html')
+
 
 @app.route('/ping')
 def ping():
@@ -2231,23 +3517,21 @@ def ping():
         'uptime': 'running'
     })
 
+
 @app.route('/api/system-ip', methods=['GET'])
 def get_system_ip():
     """Get current system IP address"""
     try:
         import socket
-
         try:
             public_ip = requests.get('https://ipinfo.io/ip', timeout=5).text.strip()
         except:
             public_ip = "Unknown"
-
         try:
             hostname = socket.gethostname()
             local_ip = socket.gethostbyname(hostname)
         except:
             local_ip = "Unknown"
-
         return jsonify({
             'success': True,
             'public_ip': public_ip,
@@ -2256,6 +3540,7 @@ def get_system_ip():
         })
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error getting IP: {str(e)}'}), 500
+
 
 @app.route('/api/start-bot', methods=['POST'])
 def start_bot():
@@ -2268,8 +3553,7 @@ def start_bot():
         tp_percent = data.get('tp_percent', 2.0)
         sl_percent = data.get('sl_percent', 1.0)
         symbol     = data.get('symbol', 'ADAUSD')
-
-        max_steps = max(LOT_STEPS.keys())
+        max_steps  = max(LOT_STEPS.keys())
 
         if not isinstance(leverage, int) or leverage < 1 or leverage > 200:
             return jsonify({'success': False, 'message': 'Leverage must be integer between 1-200'}), 400
@@ -2289,12 +3573,11 @@ def start_bot():
         BOT_STATE['max_steps']  = max_steps
         BOT_STATE['symbol']     = symbol.upper()
 
-        # ✅ FIX: Load saved step/lot/PnL from database on start
-        print(f"\n🔍 LOADING SAVED BOT STATE FROM DATABASE...")
+        log_system("LOADING SAVED BOT STATE FROM DATABASE...")
         state_loaded = load_bot_state_from_db()
 
-        print(f"\n🔍 CHECKING FOR EXISTING LIVE POSITION BEFORE START...")
-        product_id = get_product_id(symbol)
+        log_system("CHECKING FOR EXISTING LIVE POSITION...")
+        product_id            = get_product_id(symbol)
         has_existing_position = False
 
         if product_id:
@@ -2304,41 +3587,27 @@ def start_bot():
                 current_lot   = abs(current_pos.get('size', 0))
                 detected_step = detect_current_step_from_lot(current_lot)
 
-                # ✅ FIX: Only override DB state with live position if they conflict
                 if state_loaded and BOT_STATE['current_step'] != detected_step:
-                    print(f"⚠️ DB step={BOT_STATE['current_step']} conflicts with live position step={detected_step}")
-                    print(f"   Using LIVE POSITION as ground truth (position is real)")
+                    log_system(f"Step mismatch: DB={BOT_STATE['current_step']} vs live={detected_step}. Using LIVE.")
                     BOT_STATE['current_step'] = detected_step
                     BOT_STATE['current_lot']  = current_lot
                 elif not state_loaded:
                     BOT_STATE['current_step'] = detected_step
                     BOT_STATE['current_lot']  = current_lot
 
-                print(f"🚨 EXISTING POSITION FOUND: {current_lot} lots")
-                print(f"🔄 STEP DETECTION: Lot {current_lot} = Step {detected_step}")
+                log_system(f"EXISTING POSITION: {current_lot} lots = Step {detected_step}")
             else:
                 if not state_loaded:
                     BOT_STATE['current_step'] = 1
                     BOT_STATE['current_lot']  = LOT_STEPS[1]
-                    print(f"✅ No existing position & no DB state - starting fresh at Step 1, Lot {LOT_STEPS[1]}")
                 else:
-                    print(f"✅ No existing position - using DB state: Step {BOT_STATE['current_step']}, Lot {BOT_STATE['current_lot']}")
+                    log_system(f"No position - using DB state: Step {BOT_STATE['current_step']}, Lot {BOT_STATE['current_lot']}")
         else:
             if not state_loaded:
                 BOT_STATE['current_step'] = 1
                 BOT_STATE['current_lot']  = LOT_STEPS[1]
-                print(f"⚠️ Could not check position & no DB state - starting fresh at Step 1, Lot {LOT_STEPS[1]}")
-            else:
-                print(f"⚠️ Could not check position - using DB state: Step {BOT_STATE['current_step']}, Lot {BOT_STATE['current_lot']}")
 
-        print(f"🎯 BOT STARTING WITH STEP-BASED SYSTEM:")
-        print(f"   📊 Current Step: {BOT_STATE['current_step']}")
-        print(f"   📊 Current Lot:  {BOT_STATE['current_lot']}")
-        print(f"   📊 Max Steps:    {BOT_STATE['max_steps']}")
-        print(f"   📊 Symbol:       {symbol}")
-        print(f"   📊 Leverage:     {BOT_STATE['leverage']}")
-        print(f"   📊 TP%:          {BOT_STATE['tp_percent']}")
-        print(f"   📊 SL%:          {BOT_STATE['sl_percent']}")
+        log_system(f"BOT STARTING: Step={BOT_STATE['current_step']}, Lot={BOT_STATE['current_lot']}, TP={BOT_STATE['tp_percent']}%, SL={BOT_STATE['sl_percent']}%")
 
         if start_auto_trading_bot():
             return jsonify({
@@ -2353,15 +3622,17 @@ def start_bot():
     except Exception as e:
         return jsonify({'success': False, 'message': f'Invalid request: {str(e)}'}), 400
 
+
 @app.route('/api/force-stop', methods=['POST'])
 def force_stop_bot():
     """Force stop bot immediately"""
     try:
         BOT_STATE['force_stop'] = True
-        print("🛑 FORCE STOP ACTIVATED - Bot will stop immediately")
+        log_system("FORCE STOP ACTIVATED")
         return jsonify({'success': True, 'message': 'Force stop activated'})
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
 
 @app.route('/api/stop-at-win', methods=['POST'])
 def stop_at_win():
@@ -2369,10 +3640,11 @@ def stop_at_win():
     try:
         BOT_STATE['stop_at_win'] = True
         BOT_STATE['force_stop']  = False
-        print("🎯 STOP AT WIN ACTIVATED - Bot will stop after next profit")
+        log_system("STOP AT WIN ACTIVATED")
         return jsonify({'success': True, 'message': 'Stop at win activated'})
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
 
 @app.route('/api/stop-at-max-streak', methods=['POST'])
 def stop_at_max_streak():
@@ -2381,10 +3653,11 @@ def stop_at_max_streak():
         BOT_STATE['stop_at_max_step'] = True
         BOT_STATE['force_stop']       = False
         BOT_STATE['stop_at_win']      = False
-        print(f"⚠️ STOP AT MAX STEP ACTIVATED")
+        log_system("STOP AT MAX STEP ACTIVATED")
         return jsonify({'success': True, 'message': 'Stop at max step activated'})
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
 
 @app.route('/api/clear-stop-conditions', methods=['POST'])
 def clear_stop_conditions():
@@ -2393,10 +3666,11 @@ def clear_stop_conditions():
         BOT_STATE['stop_at_win']      = False
         BOT_STATE['stop_at_max_step'] = False
         BOT_STATE['force_stop']       = False
-        print("✅ STOP CONDITIONS CLEARED - Bot will run normally")
+        log_system("STOP CONDITIONS CLEARED")
         return jsonify({'success': True, 'message': 'Stop conditions cleared'})
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
 
 @app.route('/api/update-symbol', methods=['POST'])
 def update_symbol():
@@ -2408,17 +3682,17 @@ def update_symbol():
         if not new_symbol:
             return jsonify({'success': False, 'message': 'Symbol is required'}), 400
 
-        valid_symbols = ['ADAUSD']
+        valid_symbols = ['ETHUSD']
         if new_symbol not in valid_symbols:
-            return jsonify({'success': False, 'message': f'Invalid symbol. Valid symbols: {valid_symbols}'}), 400
+            return jsonify({'success': False, 'message': f'Invalid symbol. Valid: {valid_symbols}'}), 400
 
-        old_symbol        = BOT_STATE['symbol']
+        old_symbol          = BOT_STATE['symbol']
         BOT_STATE['symbol'] = new_symbol
-
-        print(f"📊 Trading symbol updated: {old_symbol} → {new_symbol}")
+        print(f"📊 Symbol updated: {old_symbol} → {new_symbol}")
         return jsonify({'success': True, 'message': f'Symbol updated to {new_symbol}'})
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error updating symbol: {str(e)}'}), 500
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
 
 @app.route('/api/stop-bot', methods=['POST'])
 def stop_bot():
@@ -2427,24 +3701,26 @@ def stop_bot():
             return jsonify({'success': True, 'message': 'Bot stopped successfully'})
         return jsonify({'success': False, 'message': 'Bot was not running'})
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error stopping bot: {str(e)}'}), 500
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
 
 @app.route('/api/reset-bot-state', methods=['POST'])
 def reset_bot_state():
     """
-    ✅ NEW: Reset bot state completely - clear DB state and restart from Step 1.
-    Use this when you want to start fresh (e.g., after manual position close).
+    Reset bot state completely - clear DB state and restart from Step 1.
+    Also clears USED_FILL_IDS and PROCESSED_ORDER_IDS so fills are
+    re-evaluated fresh.
     """
     try:
-        global LAST_TRADE_RESULT
+        global LAST_TRADE_RESULT, USED_FILL_IDS, LAST_CLOSE_TIMESTAMP
 
-        # Clear DB state
         clear_bot_state_from_db()
 
-        # Reset in-memory state
-        BOT_STATE['current_step'] = 1
-        BOT_STATE['current_lot']  = LOT_STEPS[1]
-        BOT_STATE['last_result']  = None
+        BOT_STATE['current_step']         = 1
+        BOT_STATE['current_lot']          = LOT_STEPS[1]
+        BOT_STATE['last_result']          = None
+        BOT_STATE['order_completed']      = True
+        BOT_STATE['last_placed_order_id'] = None
         BOT_STATE.pop('last_pnl', None)
 
         LAST_TRADE_RESULT = {
@@ -2454,7 +3730,15 @@ def reset_bot_state():
             'processed': False
         }
 
-        print("🔄 Bot state fully reset - will start from Step 1 on next start")
+        with USED_FILL_IDS_LOCK:
+            USED_FILL_IDS = set()
+
+        with PROCESSED_ORDER_IDS_LOCK:
+            PROCESSED_ORDER_IDS.clear()
+
+        LAST_CLOSE_TIMESTAMP = 0.0
+
+        log_system("Bot state fully reset - Step 1 on next start")
         return jsonify({
             'success': True,
             'message': 'Bot state reset to Step 1',
@@ -2462,7 +3746,8 @@ def reset_bot_state():
             'current_lot': LOT_STEPS[1]
         })
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error resetting state: {str(e)}'}), 500
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
 
 @app.route('/api/bot-status', methods=['GET'])
 def get_bot_status():
@@ -2475,7 +3760,9 @@ def get_bot_status():
             next_step = 1
         next_lot = LOT_STEPS[next_step]
 
-        current_lot_size = LOT_SIZES.get(BOT_STATE['symbol'], 10)
+        current_lot_size    = LOT_SIZES.get(BOT_STATE['symbol'], 10)
+        elapsed_since_close = time.time() - LAST_CLOSE_TIMESTAMP if LAST_CLOSE_TIMESTAMP > 0 else None
+        cooldown_remaining  = max(0.0, COOLDOWN_SECONDS - elapsed_since_close) if elapsed_since_close is not None else 0.0
 
         return jsonify({
             'success': True,
@@ -2498,11 +3785,16 @@ def get_bot_status():
                 'current_lot_size': current_lot_size,
                 'session_start_time': BOT_STATE['session_start_time'],
                 'session_total_pnl': BOT_STATE['session_total_pnl'],
-                'lot_steps': LOT_STEPS
+                'lot_steps': LOT_STEPS,
+                'cooldown_remaining_seconds': round(cooldown_remaining, 1),
+                'cooldown_seconds': COOLDOWN_SECONDS,
+                'order_completed': BOT_STATE['order_completed'],
+                'last_placed_order_id': BOT_STATE.get('last_placed_order_id')
             }
         })
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error getting status: {str(e)}'}), 500
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
 
 @app.route('/api/clear-stuck-result', methods=['POST'])
 def clear_stuck_result():
@@ -2513,12 +3805,34 @@ def clear_stuck_result():
         else:
             return jsonify({'success': False, 'message': 'Failed to clear stuck result'})
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error clearing stuck result: {str(e)}'}), 500
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
+
+@app.route('/api/logs', methods=['GET'])
+def get_logs():
+    """Fetch the last N lines from trade.log (clean logs)"""
+    try:
+        limit = int(request.args.get('limit', 100))
+        log_file = "trade.log"
+        if not os.path.exists(log_file):
+            return jsonify({'success': True, 'logs': 'No trade logs found yet.'})
+
+        with open(log_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            last_lines = lines[-limit:]
+            return jsonify({
+                'success': True,
+                'logs': "".join(last_lines),
+                'total_lines': len(lines)
+            })
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/wallet-balance', methods=['GET'])
 def wallet_balance():
     balance_data = get_wallet_balance()
     return jsonify(balance_data)
+
 
 @app.route('/api/trade-history', methods=['GET'])
 def trade_history():
@@ -2531,7 +3845,8 @@ def trade_history():
         total_trades = count_result['total'] if count_result else 0
 
         query = '''
-            SELECT id, symbol, side, entry_price, exit_price, quantity, pnl, entry_time, exit_time
+            SELECT id, symbol, side, entry_price, exit_price, quantity,
+                   pnl, entry_time, exit_time
             FROM closed_positions
             ORDER BY created_at DESC
             LIMIT %s OFFSET %s
@@ -2540,14 +3855,14 @@ def trade_history():
 
         return jsonify({
             'trades': [{
-                'symbol': t['symbol'],
-                'side': t['side'],
+                'symbol':      t['symbol'],
+                'side':        t['side'],
                 'entry_price': float(t['entry_price']) if t['entry_price'] else None,
-                'exit_price': float(t['exit_price']) if t['exit_price'] else None,
-                'quantity': float(t['quantity']) if t['quantity'] else None,
-                'pnl': float(t['pnl']) if t['pnl'] else None,
-                'entry_time': t['entry_time'],
-                'exit_time': t['exit_time'],
+                'exit_price':  float(t['exit_price'])  if t['exit_price']  else None,
+                'quantity':    float(t['quantity'])     if t['quantity']    else None,
+                'pnl':         float(t['pnl'])          if t['pnl']         else None,
+                'entry_time':  t['entry_time'],
+                'exit_time':   t['exit_time'],
                 'id': str(t['id']) if t.get('id') else f"trade_{hash(t['entry_time'] + t['symbol'])}"
             } for t in trades],
             'pagination': {
@@ -2562,6 +3877,7 @@ def trade_history():
 
     except Exception as e:
         return jsonify({'success': False, 'message': str(e), 'trades': [], 'pagination': None})
+
 
 @app.route('/api/delete-trades', methods=['POST'])
 def delete_trades():
@@ -2588,13 +3904,10 @@ def delete_trades():
         delete_query = f'DELETE FROM closed_positions WHERE id IN ({placeholders})'
         execute_mysql_query(delete_query, numeric_ids, commit=True)
 
-        return jsonify({
-            'success': True,
-            'message': f'Successfully deleted {len(numeric_ids)} trade(s)'
-        })
+        return jsonify({'success': True, 'message': f'Successfully deleted {len(numeric_ids)} trade(s)'})
 
     except Exception as e:
-        return jsonify({'success': False, 'message': f'Error deleting trades: {str(e)}'})
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'})
 
 
 # ========== TP/SL GUARDIAN ==========
@@ -2602,19 +3915,13 @@ def auto_tp_sl_guardian():
     """
     🛡️ SAFE TP/SL GUARDIAN
     - Runs every 2 seconds
-    - Edits wrong TP/SL (No Deletion)
+    - Edits wrong TP/SL (no deletion)
     - Places missing TP/SL immediately
-    - Uses Tolerance to avoid constant editing
+    - Uses dynamic tolerance to avoid constant editing
     """
-    print("🛡️ SAFE TP/SL GUARDIAN STARTED (EDIT ONLY)...")
-
     while True:
         try:
             time.sleep(2)
-
-            print(f"\n{'='*80}")
-            print(f"🛡️ GUARDIAN CHECK - {datetime.now().strftime('%H:%M:%S')}")
-            print(f"{'='*80}")
 
             positions_response = make_api_request('GET', '/positions/margined')
             if not positions_response or not positions_response.get('success'):
@@ -2626,7 +3933,6 @@ def auto_tp_sl_guardian():
             ]
 
             if not active_positions:
-                print("ℹ️ No active positions")
                 continue
 
             for pos in active_positions:
@@ -2639,8 +3945,6 @@ def auto_tp_sl_guardian():
                     if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
                         continue
 
-                    print(f"\n📍 [GUARDIAN] {symbol} | Size: {size} | Entry: {entry}")
-
                     if size > 0:  # LONG
                         expected_tp = entry * (1 + LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 - LIVE_SL_PERCENTAGE / 100)
@@ -2649,7 +3953,6 @@ def auto_tp_sl_guardian():
                         expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
 
                     dynamic_tolerance = entry * 0.0005
-                    print(f"   💡 Expected TP: {expected_tp:.6f} | Expected SL: {expected_sl:.6f} | Tolerance: {dynamic_tolerance:.6f}")
 
                     orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
                     if not orders_response or not orders_response.get('success'):
@@ -2668,7 +3971,6 @@ def auto_tp_sl_guardian():
                         stop_price = float(tp_order.get("stop_price", 0))
                         if abs(stop_price - expected_tp) < dynamic_tolerance:
                             tp_valid = True
-                            print(f"   ✅ TP Order {tp_order.get('id')} is CORRECT")
                         else:
                             wrong_tp_orders.append(tp_order)
 
@@ -2676,7 +3978,6 @@ def auto_tp_sl_guardian():
                         stop_price = float(sl_order.get("stop_price", 0))
                         if abs(stop_price - expected_sl) < dynamic_tolerance:
                             sl_valid = True
-                            print(f"   ✅ SL Order {sl_order.get('id')} is CORRECT")
                         else:
                             wrong_sl_orders.append(sl_order)
 
@@ -2686,13 +3987,24 @@ def auto_tp_sl_guardian():
                     if wrong_tp_orders and not tp_valid:
                         for tp_order in wrong_tp_orders:
                             order_id     = tp_order.get("id")
-                            print(f"   🔧 EDITING TP order {order_id}...")
-                            edit_payload = {"id": order_id, "product_id": int(product_id), "order_type": "market_order", "stop_price": "{:.6f}".format(expected_tp), "size": abs(int(size))}
-                            edit_body    = json.dumps(edit_payload)
+                            log_system(f"EDITING TP order {order_id}...")
+                            edit_payload = {
+                                "id": order_id,
+                                "product_id": int(product_id),
+                                "order_type": "market_order",
+                                "stop_price": "{:.6f}".format(expected_tp),
+                                "size": abs(int(size))
+                            }
+                            edit_body = json.dumps(edit_payload)
                             try:
-                                edit_res = requests.put(BASE_URL + "/v2/orders", headers=sign_request("PUT", "/v2/orders", edit_body), data=edit_body, timeout=10)
+                                edit_res = requests.put(
+                                    BASE_URL + "/v2/orders",
+                                    headers=sign_request("PUT", "/v2/orders", edit_body),
+                                    data=edit_body,
+                                    timeout=10
+                                )
                                 if edit_res.status_code == 200:
-                                    print(f"   ✅ TP EDITED successfully")
+                                    log_system(f"TP EDITED")
                                     tp_edited = True
                                     break
                             except:
@@ -2701,13 +4013,24 @@ def auto_tp_sl_guardian():
                     if wrong_sl_orders and not sl_valid:
                         for sl_order in wrong_sl_orders:
                             order_id     = sl_order.get("id")
-                            print(f"   🔧 EDITING SL order {order_id}...")
-                            edit_payload = {"id": order_id, "product_id": int(product_id), "order_type": "market_order", "stop_price": "{:.6f}".format(expected_sl), "size": abs(int(size))}
-                            edit_body    = json.dumps(edit_payload)
+                            log_system(f"EDITING SL order {order_id}...")
+                            edit_payload = {
+                                "id": order_id,
+                                "product_id": int(product_id),
+                                "order_type": "market_order",
+                                "stop_price": "{:.6f}".format(expected_sl),
+                                "size": abs(int(size))
+                            }
+                            edit_body = json.dumps(edit_payload)
                             try:
-                                edit_res = requests.put(BASE_URL + "/v2/orders", headers=sign_request("PUT", "/v2/orders", edit_body), data=edit_body, timeout=10)
+                                edit_res = requests.put(
+                                    BASE_URL + "/v2/orders",
+                                    headers=sign_request("PUT", "/v2/orders", edit_body),
+                                    data=edit_body,
+                                    timeout=10
+                                )
                                 if edit_res.status_code == 200:
-                                    print(f"   ✅ SL EDITED successfully")
+                                    log_system(f"SL EDITED")
                                     sl_edited = True
                                     break
                             except:
@@ -2729,30 +4052,39 @@ def auto_tp_sl_guardian():
                                     is_safe = False
 
                             if not is_safe:
-                                print(f"   ⚠️ Price too close to TP/SL. Skipping placement to avoid error.")
                                 continue
 
-                        print(f"   📤 Placing missing TP/SL...")
+                        log_system(f"Placing missing TP/SL for {symbol}")
                         payload = {
                             "product_id": int(product_id),
-                            "take_profit_order": {"order_type": "market_order", "stop_price": "{:.6f}".format(expected_tp)},
-                            "stop_loss_order":   {"order_type": "market_order", "stop_price": "{:.6f}".format(expected_sl)}
+                            "take_profit_order": {
+                                "order_type": "market_order",
+                                "stop_price": "{:.6f}".format(expected_tp)
+                            },
+                            "stop_loss_order": {
+                                "order_type": "market_order",
+                                "stop_price": "{:.6f}".format(expected_sl)
+                            }
                         }
                         body = json.dumps(payload)
                         try:
-                            res = requests.post(BASE_URL + "/v2/orders/bracket", headers=sign_request("POST", "/v2/orders/bracket", body), data=body, timeout=10)
+                            res = requests.post(
+                                BASE_URL + "/v2/orders/bracket",
+                                headers=sign_request("POST", "/v2/orders/bracket", body),
+                                data=body,
+                                timeout=10
+                            )
                             if res.status_code == 200:
-                                print(f"   ✅ Bracket placed successfully")
+                                log_system(f"Bracket placed for {symbol}")
                         except:
                             pass
 
                     time.sleep(0.3)
 
                 except Exception as e:
-                    print(f"   ❌ Error: {e}")
+                    pass
 
         except Exception as e:
-            print(f"❌ Guardian error: {e}")
             time.sleep(2)
 
 
