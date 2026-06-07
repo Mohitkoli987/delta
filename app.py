@@ -1953,11 +1953,22 @@ def make_api_request(method, endpoint, data=None):
         if response.status_code == 200:
             return response.json()
         else:
+            # ── FIX: Log the actual HTTP error so we know WHY it failed ──
+            try:
+                err_body = response.json()
+            except Exception:
+                err_body = response.text
+            log_error(f"API HTTP {response.status_code} | {method} {endpoint} | {err_body}")
             return None
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        log_error(f"API TIMEOUT | {method} {endpoint}")
         return None
-
-
+    except requests.exceptions.ConnectionError as e:
+        log_error(f"API CONNECTION ERROR | {method} {endpoint} | {e}")
+        return None
+    except Exception as e:
+        log_error(f"API EXCEPTION | {method} {endpoint} | {e}")
+        return None
 def place_order(symbol, side, quantity, order_type='market_order'):
     """Place order with correct Delta Exchange parameters"""
     order_data = {
@@ -3872,8 +3883,8 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
         PRODUCT_CONFIG = {
             "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},
             "BTCUSD": {"id": 84,    "tick": Decimal("0.5")},
-            # "ETHUSD": {"id": 1320,  "tick": Decimal("0.05")},
-            "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
+            "ETHUSD": {"id": 3136,  "tick": Decimal("0.05")},
+            # "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
         }
 
         config = PRODUCT_CONFIG.get(symbol)
