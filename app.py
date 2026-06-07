@@ -629,209 +629,140 @@ def verify_and_sync_step_from_db():
 #  ORIGINAL INDICATORS (unchanged)
 # ─────────────────────────────────────────────────────────────
 """
-SIGNAL ENGINE v6 — TREND-FOLLOWING FIX
-========================================
-ROOT CAUSE FIXED:
-  v5 mein 4H SELL tha, 1H BUY tha (lagging) → forever WAIT
-  
-v6 LOGIC:
-  4H = MASTER TREND — isko follow karo
-  1H = confirmation chahiye 4H ke direction mein
-  15M = entry timing
+SIGNAL ENGINE v7 — 4H MASTER, NO 1H WAIT
+==========================================
+CORE LOGIC (simple):
+  1. 4H decides direction (SELL = short, BUY = long)
+  2. 15M must agree with 4H
+  3. 15M net >= 4 required
+  4. Done — signal fire karo
 
-  Agar 4H SELL hai:
-    → 1H bhi SELL hona chahiye (ya neutral)
-    → 15M SELL hona chahiye
-    → Tab SELL signal do
-  
-  Agar 4H BUY hai:
-    → 1H bhi BUY hona chahiye
-    → 15M BUY hona chahiye  
-    → Tab BUY signal do
+  4H NEUTRAL hone par: 1H + 15M dono agree + net >= 5
 
-  4H ke AGAINST kabhi signal mat do (yeh v5 ka hard block sahi tha)
-  Lekin 4H ke SAATH signal do jab 1H agree kare
-
-KEY CHANGES vs v5:
-  1. 4H is now MASTER — signal must follow 4H direction
-  2. 1H conflict with 4H = WAIT (not just block opposite)
-  3. 15M net threshold lowered: 4 (was 6) — 4H+1H already strong filter
-  4. 1H net threshold: 4 (was 3)
-  5. Removed strict mode complexity (was causing extra WAIT)
+NO MORE waiting for 1H to flip.
+1H is only used for confidence boost, not blocking.
 """
 
 import random
 from datetime import datetime
 
 
-# ─────────────────────────────────────────────────────────────
-#  ALL INDICATORS (same as v5 — no changes needed here)
-# ─────────────────────────────────────────────────────────────
-
 def _ema(prices, period):
-    if len(prices) < period:
-        return None
+    if len(prices) < period: return None
     k = 2.0 / (period + 1)
     val = sum(prices[:period]) / period
-    for p in prices[period:]:
-        val = p * k + val * (1 - k)
+    for p in prices[period:]: val = p * k + val * (1 - k)
     return val
 
 def _sma(prices, period):
-    if len(prices) < period:
-        return None
+    if len(prices) < period: return None
     return sum(prices[-period:]) / period
 
 def _rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
+    if len(closes) < period + 1: return 50.0
     gains, losses = [], []
     for i in range(1, period + 1):
         d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag = sum(gains) / period
-    al = sum(losses) / period
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
+    ag = sum(gains) / period; al = sum(losses) / period
     for i in range(period + 1, len(closes)):
         d = closes[i] - closes[i - 1]
         ag = (ag * (period - 1) + max(d, 0)) / period
         al = (al * (period - 1) + max(-d, 0)) / period
-    if al == 0:
-        return 100.0
+    if al == 0: return 100.0
     return 100 - (100 / (1 + ag / al))
 
 def _macd(closes, fast=12, slow=26, signal=9):
-    if len(closes) < slow + signal:
-        return None, None, None
-    ema_fast = _ema(closes, fast)
-    ema_slow = _ema(closes, slow)
-    if ema_fast is None or ema_slow is None:
-        return None, None, None
-    macd_line = ema_fast - ema_slow
-    macd_series = []
+    if len(closes) < slow + signal: return None, None, None
+    ef = _ema(closes, fast); es = _ema(closes, slow)
+    if ef is None or es is None: return None, None, None
+    ml = ef - es
+    series = []
     for i in range(slow - 1, len(closes)):
-        ef = _ema(closes[:i + 1], fast)
-        es = _ema(closes[:i + 1], slow)
-        if ef and es:
-            macd_series.append(ef - es)
-    if len(macd_series) < signal:
-        return macd_line, None, None
-    signal_line = _ema(macd_series, signal)
-    histogram = macd_line - signal_line if signal_line else None
-    return macd_line, signal_line, histogram
+        ef2 = _ema(closes[:i+1], fast); es2 = _ema(closes[:i+1], slow)
+        if ef2 and es2: series.append(ef2 - es2)
+    if len(series) < signal: return ml, None, None
+    sl_ = _ema(series, signal)
+    return ml, sl_, (ml - sl_) if sl_ else None
 
 def _bollinger(closes, period=20, std_dev=2.0):
-    if len(closes) < period:
-        return None, None, None
-    recent = closes[-period:]
-    mid = sum(recent) / period
-    variance = sum((x - mid) ** 2 for x in recent) / period
-    std = variance ** 0.5
+    if len(closes) < period: return None, None, None
+    recent = closes[-period:]; mid = sum(recent) / period
+    std = (sum((x - mid) ** 2 for x in recent) / period) ** 0.5
     return mid + std_dev * std, mid, mid - std_dev * std
 
 def _atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
+    if len(candles) < period + 1: return None
     trs = []
     for i in range(1, len(candles)):
-        high = candles[i]['high']
-        low  = candles[i]['low']
-        prev_close = candles[i - 1]['close']
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    if len(trs) < period:
-        return None
+        h = candles[i]['high']; l = candles[i]['low']; pc = candles[i-1]['close']
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    if len(trs) < period: return None
     atr = sum(trs[:period]) / period
-    for tr in trs[period:]:
-        atr = (atr * (period - 1) + tr) / period
+    for tr in trs[period:]: atr = (atr * (period - 1) + tr) / period
     return atr
 
 def _candle_strength(candles, lookback=5):
-    if len(candles) < lookback:
-        return 0
+    if len(candles) < lookback: return 0
     recent = candles[-lookback:]
     bull = sum(1 for c in recent if c['close'] > c['open'])
     bear = sum(1 for c in recent if c['close'] < c['open'])
-    last = candles[-1]
-    rng  = last['high'] - last['low']
+    last = candles[-1]; rng = last['high'] - last['low']
     body = abs(last['close'] - last['open'])
-    body_pct = (body / rng) if rng > 0 else 0
-    if bull >= 3 and body_pct > 0.5 and last['close'] > last['open']:
-        return 1
-    if bear >= 3 and body_pct > 0.5 and last['close'] < last['open']:
-        return -1
+    bp = (body / rng) if rng > 0 else 0
+    if bull >= 3 and bp > 0.5 and last['close'] > last['open']: return 1
+    if bear >= 3 and bp > 0.5 and last['close'] < last['open']: return -1
     return 0
 
 def _wma(prices, period):
-    if len(prices) < period:
-        return None
-    weights = list(range(1, period + 1))
-    subset  = prices[-period:]
-    total   = sum(w * p for w, p in zip(weights, subset))
-    return total / sum(weights)
+    if len(prices) < period: return None
+    w = list(range(1, period + 1))
+    return sum(wi * p for wi, p in zip(w, prices[-period:])) / sum(w)
 
 def _hma(prices, period=9):
-    half   = max(period // 2, 1)
-    sqrt_p = max(int(period ** 0.5), 1)
-    if len(prices) < period:
-        return None
-    raw_series = []
-    start = max(period, half)
-    for i in range(start, len(prices) + 1):
-        wh = _wma(prices[:i], half)
-        wf = _wma(prices[:i], period)
-        if wh is not None and wf is not None:
-            raw_series.append(2 * wh - wf)
-    if len(raw_series) < sqrt_p:
-        return None
-    return _wma(raw_series, sqrt_p)
+    half = max(period // 2, 1); sq = max(int(period ** 0.5), 1)
+    if len(prices) < period: return None
+    raw = []
+    for i in range(max(period, half), len(prices) + 1):
+        wh = _wma(prices[:i], half); wf = _wma(prices[:i], period)
+        if wh and wf: raw.append(2 * wh - wf)
+    return _wma(raw, sq) if len(raw) >= sq else None
 
 def _ultimate_oscillator(candles, p1=7, p2=14, p3=28):
-    if len(candles) < p3 + 1:
-        return None
+    if len(candles) < p3 + 1: return None
     def _avg(sl):
         bps, trs = [], []
         for i in range(1, len(sl)):
-            pc = sl[i-1]['close']
-            h, l, c = sl[i]['high'], sl[i]['low'], sl[i]['close']
-            bps.append(c - min(l, pc))
-            trs.append(max(h, pc) - min(l, pc))
+            pc = sl[i-1]['close']; h = sl[i]['high']; l = sl[i]['low']; c = sl[i]['close']
+            bps.append(c - min(l, pc)); trs.append(max(h, pc) - min(l, pc))
         return sum(bps)/sum(trs) if sum(trs) else 0
     return 100 * (4*_avg(candles[-(p1+1):]) + 2*_avg(candles[-(p2+1):]) + _avg(candles[-(p3+1):])) / 7
 
 def _adx(candles, period=14):
-    if len(candles) < period * 2 + 1:
-        return None, None, None
-    trs, plus_dms, minus_dms = [], [], []
+    if len(candles) < period * 2 + 1: return None, None, None
+    trs, pdms, mdms = [], [], []
     for i in range(1, len(candles)):
-        h, l   = candles[i]['high'], candles[i]['low']
-        ph, pl, pc = candles[i-1]['high'], candles[i-1]['low'], candles[i-1]['close']
+        h=candles[i]['high']; l=candles[i]['low']; ph=candles[i-1]['high']
+        pl=candles[i-1]['low']; pc=candles[i-1]['close']
         trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-        plus_dms.append(max(h-ph, 0) if (h-ph) > (pl-l) else 0)
-        minus_dms.append(max(pl-l, 0) if (pl-l) > (h-ph) else 0)
-    def _smooth(vals, p):
-        s = sum(vals[:p]); res = [s]
-        for v in vals[p:]: s = s - s/p + v; res.append(s)
-        return res
-    st = _smooth(trs, period); sp = _smooth(plus_dms, period); sm = _smooth(minus_dms, period)
-    if not st or st[-1] == 0: return None, None, None
-    plus_di  = 100 * sp[-1] / st[-1]
-    minus_di = 100 * sm[-1] / st[-1]
-    dx = []
-    for p, m, t in zip(sp, sm, st):
-        if t == 0: continue
-        pdi, mdi = 100*p/t, 100*m/t
-        d = pdi + mdi
-        if d: dx.append(100*abs(pdi-mdi)/d)
-    if len(dx) < period: return None, plus_di, minus_di
-    return sum(dx[-period:])/period, plus_di, minus_di
+        pdms.append(max(h-ph, 0) if (h-ph) > (pl-l) else 0)
+        mdms.append(max(pl-l, 0) if (pl-l) > (h-ph) else 0)
+    def _sm(v, p):
+        s = sum(v[:p]); r = [s]
+        for x in v[p:]: s = s - s/p + x; r.append(s)
+        return r
+    st=_sm(trs,period); sp=_sm(pdms,period); sm=_sm(mdms,period)
+    if not st or st[-1]==0: return None, None, None
+    pdi=100*sp[-1]/st[-1]; mdi=100*sm[-1]/st[-1]
+    dx = [100*abs(100*p/t - 100*m/t)/(100*p/t + 100*m/t)
+          for p,m,t in zip(sp,sm,st) if t and (100*p/t + 100*m/t)]
+    return (sum(dx[-period:])/period if len(dx)>=period else None), pdi, mdi
 
 def _bull_bear_power(candles, period=13):
     if len(candles) < period: return None, None
-    closes = [c['close'] for c in candles]
-    ema_val = _ema(closes, period)
-    if ema_val is None: return None, None
-    return candles[-1]['high'] - ema_val, candles[-1]['low'] - ema_val
+    ev = _ema([c['close'] for c in candles], period)
+    if ev is None: return None, None
+    return candles[-1]['high'] - ev, candles[-1]['low'] - ev
 
 def _momentum(closes, period=20):
     if len(closes) < period + 1: return None
@@ -839,244 +770,199 @@ def _momentum(closes, period=20):
 
 def _ppo(closes, fast=12, slow=26, signal=9):
     if len(closes) < slow + signal: return None, None, None
-    ef, es = _ema(closes, fast), _ema(closes, slow)
-    if ef is None or es is None or es == 0: return None, None, None
-    ppo_line = ((ef - es) / es) * 100
-    series = []
-    for i in range(slow-1, len(closes)):
-        ef2, es2 = _ema(closes[:i+1], fast), _ema(closes[:i+1], slow)
-        if ef2 and es2 and es2 != 0: series.append(((ef2-es2)/es2)*100)
-    if len(series) < signal: return ppo_line, None, None
+    ef=_ema(closes,fast); es=_ema(closes,slow)
+    if not ef or not es or es==0: return None, None, None
+    ppo = ((ef-es)/es)*100
+    series = [((ef2-es2)/es2)*100 for i in range(slow-1, len(closes))
+              for ef2,es2 in [(_ema(closes[:i+1],fast), _ema(closes[:i+1],slow))]
+              if ef2 and es2 and es2!=0]
+    if len(series) < signal: return ppo, None, None
     sig = _ema(series, signal)
-    return ppo_line, sig, (ppo_line - sig) if sig else None
+    return ppo, sig, (ppo-sig) if sig else None
 
-def _stoch_rsi(closes, period=14, smooth_k=3, smooth_d=3):
-    if len(closes) < period*2 + smooth_k + smooth_d: return None, None
-    rsi_s = [_rsi(closes[:i], period) for i in range(period, len(closes)+1)]
-    if len(rsi_s) < period: return None, None
-    stoch = []
-    for i in range(period-1, len(rsi_s)):
-        w = rsi_s[i-period+1:i+1]; mn, mx = min(w), max(w)
-        stoch.append(((rsi_s[i]-mn)/(mx-mn)*100) if (mx-mn) else 50.0)
-    if len(stoch) < smooth_k + smooth_d: return None, None
-    ks = [sum(stoch[i-smooth_k+1:i+1])/smooth_k for i in range(smooth_k-1, len(stoch))]
-    if len(ks) < smooth_d: return None, None
-    return ks[-1], sum(ks[-smooth_d:])/smooth_d
+def _stoch_rsi(closes, period=14, sk=3, sd=3):
+    if len(closes) < period*2+sk+sd: return None, None
+    rs = [_rsi(closes[:i], period) for i in range(period, len(closes)+1)]
+    if len(rs) < period: return None, None
+    st = []
+    for i in range(period-1, len(rs)):
+        w=rs[i-period+1:i+1]; mn=min(w); mx=max(w)
+        st.append(((rs[i]-mn)/(mx-mn)*100) if (mx-mn) else 50.0)
+    if len(st) < sk+sd: return None, None
+    ks = [sum(st[i-sk+1:i+1])/sk for i in range(sk-1, len(st))]
+    return (ks[-1], sum(ks[-sd:])/sd) if len(ks)>=sd else (None, None)
 
-def _ichimoku(candles, tenkan=9, kijun=26, senkou_b_period=52):
-    if len(candles) < senkou_b_period: return None
-    def _mid(sl): return (max(c['high'] for c in sl) + min(c['low'] for c in sl)) / 2
-    t = _mid(candles[-tenkan:])
-    k = _mid(candles[-kijun:])
-    return {
-        'tenkan': t, 'kijun': k,
-        'senkou_a': (t+k)/2, 'senkou_b': _mid(candles[-senkou_b_period:]),
-        'chikou': candles[-1]['close'],
-        'price_ago': candles[-kijun]['close'] if len(candles) >= kijun else None
-    }
+def _ichimoku(candles, t=9, k=26, sb=52):
+    if len(candles) < sb: return None
+    def _m(sl): return (max(c['high'] for c in sl)+min(c['low'] for c in sl))/2
+    tn=_m(candles[-t:]); kj=_m(candles[-k:])
+    return {'tenkan':tn,'kijun':kj,'senkou_a':(tn+kj)/2,'senkou_b':_m(candles[-sb:]),
+            'chikou':candles[-1]['close'],
+            'price_ago':candles[-k]['close'] if len(candles)>=k else None}
 
 def _cci(candles, period=20):
     if len(candles) < period: return None
-    recent = candles[-period:]
-    tp = [(c['high']+c['low']+c['close'])/3 for c in recent]
-    sma = sum(tp)/period
-    md  = sum(abs(t-sma) for t in tp)/period
-    return 0 if md == 0 else (tp[-1]-sma)/(0.015*md)
+    rc=candles[-period:]; tp=[(c['high']+c['low']+c['close'])/3 for c in rc]
+    sma=sum(tp)/period; md=sum(abs(t-sma) for t in tp)/period
+    return 0 if md==0 else (tp[-1]-sma)/(0.015*md)
 
 def _awesome_oscillator(candles, fast=5, slow=34):
     if len(candles) < slow: return None
-    mids = [(c['high']+c['low'])/2 for c in candles]
-    sf, ss = _sma(mids, fast), _sma(mids, slow)
-    return (sf - ss) if (sf and ss) else None
+    mids=[(c['high']+c['low'])/2 for c in candles]
+    sf=_sma(mids,fast); ss=_sma(mids,slow)
+    return (sf-ss) if (sf and ss) else None
 
 def _williams_r(candles, period=14):
     if len(candles) < period: return None
-    recent = candles[-period:]
-    hh = max(c['high'] for c in recent)
-    ll = min(c['low']  for c in recent)
-    close = candles[-1]['close']
-    if hh == ll: return -50.0
-    return ((hh - close) / (hh - ll)) * -100
+    rc=candles[-period:]; hh=max(c['high'] for c in rc); ll=min(c['low'] for c in rc)
+    close=candles[-1]['close']
+    return -50.0 if hh==ll else ((hh-close)/(hh-ll))*-100
 
 def _ma_suite_score(closes, label=""):
-    periods = [5, 10, 20, 50, 100, 200]
     sb, ss, det = 0, 0, []
     price = closes[-1]
-    for p in periods:
-        sv = _sma(closes, p)
-        ev = _ema(closes, p)
-        if sv:
-            if price > sv: sb += 1; det.append(f"[{label}] Price>SMA{p} → BUY +1")
-            else:          ss += 1; det.append(f"[{label}] Price<SMA{p} → SELL +1")
-        if ev:
-            if price > ev: sb += 1; det.append(f"[{label}] Price>EMA{p} → BUY +1")
-            else:          ss += 1; det.append(f"[{label}] Price<EMA{p} → SELL +1")
+    for p in [5, 10, 20, 50, 100, 200]:
+        for fn, nm in [(_sma, 'SMA'), (_ema, 'EMA')]:
+            v = fn(closes, p)
+            if v:
+                if price > v: sb+=1; det.append(f"[{label}] Price>{nm}{p} → BUY +1")
+                else:         ss+=1; det.append(f"[{label}] Price<{nm}{p} → SELL +1")
     return sb, ss, det
 
 
 # ─────────────────────────────────────────────────────────────
-#  TIMEFRAME SCORER v6
+#  SCORER
 # ─────────────────────────────────────────────────────────────
 
 def _score_timeframe(candles, label=""):
     if len(candles) < 30:
-        return {'bias': 'NEUTRAL', 'score': 0, 'details': ['Not enough candles'],
-                'score_buy': 0, 'score_sell': 0, 'net': 0,
-                'rsi': 50, 'ema9': None, 'ema21': None, 'ema50': None,
-                'adx': None, 'cci': None, 'ao': None, 'williams_r': None,
-                'uo': None, 'ppo': None, 'stoch_k': None, 'hma': None}
+        return {'bias':'NEUTRAL','score':0,'details':[],'score_buy':0,'score_sell':0,'net':0,
+                'rsi':50,'ema9':None,'ema21':None,'ema50':None,'adx':None,'cci':None,
+                'ao':None,'williams_r':None,'uo':None,'ppo':None,'stoch_k':None,'hma':None}
 
-    closes = [c['close'] for c in candles]
-    sb, ss, det = 0, 0, []
+    closes=[c['close'] for c in candles]; sb=0; ss=0; det=[]
 
-    # EMA 9 vs 21
-    e9, e21 = _ema(closes, 9), _ema(closes, 21)
+    e9=_ema(closes,9); e21=_ema(closes,21)
     if e9 and e21:
-        if e9 > e21: sb += 2; det.append(f"[{label}] EMA9>EMA21 → BUY +2")
-        else:        ss += 2; det.append(f"[{label}] EMA9<EMA21 → SELL +2")
+        if e9>e21: sb+=2; det.append(f"[{label}] EMA9>EMA21 → BUY +2")
+        else:      ss+=2; det.append(f"[{label}] EMA9<EMA21 → SELL +2")
 
-    # EMA 21 vs 50
-    e50 = _ema(closes, 50) if len(closes) >= 50 else None
+    e50=_ema(closes,50) if len(closes)>=50 else None
     if e21 and e50:
-        if e21 > e50: sb += 1; det.append(f"[{label}] EMA21>EMA50 → BUY +1")
-        else:         ss += 1; det.append(f"[{label}] EMA21<EMA50 → SELL +1")
+        if e21>e50: sb+=1; det.append(f"[{label}] EMA21>EMA50 → BUY +1")
+        else:       ss+=1; det.append(f"[{label}] EMA21<EMA50 → SELL +1")
 
-    # RSI
-    rsi = _rsi(closes, 14)
-    if   rsi < 30: sb += 3; det.append(f"[{label}] RSI={rsi:.1f} OVERSOLD → BUY +3")
-    elif rsi > 70: ss += 3; det.append(f"[{label}] RSI={rsi:.1f} OVERBOUGHT → SELL +3")
-    elif rsi < 45: sb += 1; det.append(f"[{label}] RSI={rsi:.1f} <45 → BUY +1")
-    elif rsi > 55: ss += 1; det.append(f"[{label}] RSI={rsi:.1f} >55 → SELL +1")
+    rsi=_rsi(closes,14)
+    if   rsi<30: sb+=3; det.append(f"[{label}] RSI={rsi:.1f} OVERSOLD → BUY +3")
+    elif rsi>70: ss+=3; det.append(f"[{label}] RSI={rsi:.1f} OVERBOUGHT → SELL +3")
+    elif rsi<45: sb+=1; det.append(f"[{label}] RSI={rsi:.1f} <45 → BUY +1")
+    elif rsi>55: ss+=1; det.append(f"[{label}] RSI={rsi:.1f} >55 → SELL +1")
 
-    # MACD
-    ml, sl_, hist = _macd(closes)
-    if hist is not None and ml is not None and sl_ is not None:
-        thr = abs(closes[-1]) * 0.00005
-        if abs(hist) > thr and hist > 0 and ml > sl_:
-            sb += 3; det.append(f"[{label}] MACD strong BUY → +3")
-        elif abs(hist) > thr and hist < 0 and ml < sl_:
-            ss += 3; det.append(f"[{label}] MACD strong SELL → +3")
-        elif ml > sl_: sb += 1; det.append(f"[{label}] MACD above signal → BUY +1")
-        elif ml < sl_: ss += 1; det.append(f"[{label}] MACD below signal → SELL +1")
+    ml,sl_,hist=_macd(closes)
+    if hist is not None and ml and sl_:
+        thr=abs(closes[-1])*0.00005
+        if   abs(hist)>thr and hist>0 and ml>sl_: sb+=3; det.append(f"[{label}] MACD strong BUY → +3")
+        elif abs(hist)>thr and hist<0 and ml<sl_: ss+=3; det.append(f"[{label}] MACD strong SELL → +3")
+        elif ml>sl_: sb+=1; det.append(f"[{label}] MACD>signal → BUY +1")
+        elif ml<sl_: ss+=1; det.append(f"[{label}] MACD<signal → SELL +1")
 
-    # Bollinger
-    bbu, _, bbl = _bollinger(closes)
+    bbu,_,bbl=_bollinger(closes)
     if bbu and bbl:
-        price = closes[-1]
-        rng = bbu - bbl
-        if rng > 0:
-            pos = (price - bbl) / rng
-            if   pos < 0.15: sb += 2; det.append(f"[{label}] BB lower extreme → BUY +2")
-            elif pos > 0.85: ss += 2; det.append(f"[{label}] BB upper extreme → SELL +2")
+        rng=bbu-bbl
+        if rng>0:
+            pos=(closes[-1]-bbl)/rng
+            if   pos<0.15: sb+=2; det.append(f"[{label}] BB lower extreme → BUY +2")
+            elif pos>0.85: ss+=2; det.append(f"[{label}] BB upper extreme → SELL +2")
 
-    # Candle strength
-    cs = _candle_strength(candles, 5)
-    if cs == 1:  sb += 1; det.append(f"[{label}] Bullish candles → BUY +1")
-    elif cs ==-1:ss += 1; det.append(f"[{label}] Bearish candles → SELL +1")
+    cs=_candle_strength(candles,5)
+    if cs==1:  sb+=1; det.append(f"[{label}] Bullish candles → BUY +1")
+    elif cs==-1:ss+=1; det.append(f"[{label}] Bearish candles → SELL +1")
 
-    # HMA
-    hma = _hma(closes, 9)
+    hma=_hma(closes,9)
     if hma:
-        if closes[-1] > hma: sb += 1; det.append(f"[{label}] Price>HMA9 → BUY +1")
-        else:                 ss += 1; det.append(f"[{label}] Price<HMA9 → SELL +1")
+        if closes[-1]>hma: sb+=1; det.append(f"[{label}] Price>HMA9 → BUY +1")
+        else:               ss+=1; det.append(f"[{label}] Price<HMA9 → SELL +1")
 
-    # UO
-    uo = _ultimate_oscillator(candles, 7, 14, 28)
+    uo=_ultimate_oscillator(candles,7,14,28)
     if uo:
-        if   uo < 30: sb += 2; det.append(f"[{label}] UO={uo:.1f} OVERSOLD → BUY +2")
-        elif uo > 70: ss += 2; det.append(f"[{label}] UO={uo:.1f} OVERBOUGHT → SELL +2")
-        elif uo > 50: sb += 1; det.append(f"[{label}] UO={uo:.1f} >50 → BUY +1")
-        else:         ss += 1; det.append(f"[{label}] UO={uo:.1f} <50 → SELL +1")
+        if   uo<30: sb+=2; det.append(f"[{label}] UO={uo:.1f} OVERSOLD → BUY +2")
+        elif uo>70: ss+=2; det.append(f"[{label}] UO={uo:.1f} OVERBOUGHT → SELL +2")
+        elif uo>50: sb+=1; det.append(f"[{label}] UO={uo:.1f} >50 → BUY +1")
+        else:       ss+=1; det.append(f"[{label}] UO={uo:.1f} <50 → SELL +1")
 
-    # ADX
-    adx, pdi, mdi = _adx(candles, 14)
-    if adx and pdi and mdi and adx > 25:
-        if pdi > mdi: sb += 2; det.append(f"[{label}] ADX={adx:.1f} DI+ dominant → BUY +2")
-        else:         ss += 2; det.append(f"[{label}] ADX={adx:.1f} DI- dominant → SELL +2")
+    adx,pdi,mdi=_adx(candles,14)
+    if adx and pdi and mdi and adx>25:
+        if pdi>mdi: sb+=2; det.append(f"[{label}] ADX={adx:.1f} DI+ → BUY +2")
+        else:       ss+=2; det.append(f"[{label}] ADX={adx:.1f} DI- → SELL +2")
 
-    # Bull Bear Power
-    bp, brp = _bull_bear_power(candles, 13)
+    bp,brp=_bull_bear_power(candles,13)
     if bp is not None and brp is not None:
-        if   bp > 0 and brp > 0: sb += 2; det.append(f"[{label}] Both powers>0 → BUY +2")
-        elif bp < 0 and brp < 0: ss += 2; det.append(f"[{label}] Both powers<0 → SELL +2")
-        elif bp > 0:              sb += 1; det.append(f"[{label}] Bull power>0 → BUY +1")
-        elif brp < 0:             ss += 1; det.append(f"[{label}] Bear power<0 → SELL +1")
+        if   bp>0 and brp>0: sb+=2; det.append(f"[{label}] Both powers>0 → BUY +2")
+        elif bp<0 and brp<0: ss+=2; det.append(f"[{label}] Both powers<0 → SELL +2")
+        elif bp>0:            sb+=1; det.append(f"[{label}] Bull power>0 → BUY +1")
+        elif brp<0:           ss+=1; det.append(f"[{label}] Bear power<0 → SELL +1")
 
-    # Momentum
-    mom = _momentum(closes, 20)
+    mom=_momentum(closes,20)
     if mom is not None:
-        if mom > 0: sb += 1; det.append(f"[{label}] Momentum+ → BUY +1")
-        else:       ss += 1; det.append(f"[{label}] Momentum- → SELL +1")
+        if mom>0: sb+=1; det.append(f"[{label}] Momentum+ → BUY +1")
+        else:     ss+=1; det.append(f"[{label}] Momentum- → SELL +1")
 
-    # PPO
-    ppo, psig, phist = _ppo(closes, 12, 26, 9)
+    ppo,psig,phist=_ppo(closes,12,26,9)
     if ppo is not None:
-        if ppo > 0:   sb += 1; det.append(f"[{label}] PPO>0 → BUY +1")
-        else:         ss += 1; det.append(f"[{label}] PPO<0 → SELL +1")
-        if phist is not None:
-            if phist > 0: sb += 1; det.append(f"[{label}] PPO hist+ → BUY +1")
-            else:         ss += 1; det.append(f"[{label}] PPO hist- → SELL +1")
+        if ppo>0:   sb+=1; det.append(f"[{label}] PPO>0 → BUY +1")
+        else:       ss+=1; det.append(f"[{label}] PPO<0 → SELL +1")
+        if phist:
+            if phist>0: sb+=1; det.append(f"[{label}] PPO hist+ → BUY +1")
+            else:       ss+=1; det.append(f"[{label}] PPO hist- → SELL +1")
 
-    # StochRSI
-    sk, sd = _stoch_rsi(closes, 14)
-    if sk is not None:
-        if   sk < 20: sb += 2; det.append(f"[{label}] StochRSI OVERSOLD → BUY +2")
-        elif sk > 80: ss += 2; det.append(f"[{label}] StochRSI OVERBOUGHT → SELL +2")
-        elif sd and sk > sd: sb += 1; det.append(f"[{label}] StochRSI K>D → BUY +1")
-        elif sd and sk < sd: ss += 1; det.append(f"[{label}] StochRSI K<D → SELL +1")
+    sk_v,sd_v=_stoch_rsi(closes,14)
+    if sk_v is not None:
+        if   sk_v<20: sb+=2; det.append(f"[{label}] StochRSI OVERSOLD → BUY +2")
+        elif sk_v>80: ss+=2; det.append(f"[{label}] StochRSI OVERBOUGHT → SELL +2")
+        elif sd_v and sk_v>sd_v: sb+=1; det.append(f"[{label}] StochRSI K>D → BUY +1")
+        elif sd_v and sk_v<sd_v: ss+=1; det.append(f"[{label}] StochRSI K<D → SELL +1")
 
-    # Ichimoku
-    ichi = _ichimoku(candles, 9, 26, 52)
+    ichi=_ichimoku(candles,9,26,52)
     if ichi:
-        price = closes[-1]
-        ct = max(ichi['senkou_a'], ichi['senkou_b'])
-        cb = min(ichi['senkou_a'], ichi['senkou_b'])
-        if   price > ct: sb += 2; det.append(f"[{label}] Ichimoku above cloud → BUY +2")
-        elif price < cb: ss += 2; det.append(f"[{label}] Ichimoku below cloud → SELL +2")
-        if ichi['tenkan'] > ichi['kijun']: sb += 1; det.append(f"[{label}] Tenkan>Kijun → BUY +1")
-        else:                              ss += 1; det.append(f"[{label}] Tenkan<Kijun → SELL +1")
+        price=closes[-1]; ct=max(ichi['senkou_a'],ichi['senkou_b']); cb=min(ichi['senkou_a'],ichi['senkou_b'])
+        if   price>ct: sb+=2; det.append(f"[{label}] Ichimoku above cloud → BUY +2")
+        elif price<cb: ss+=2; det.append(f"[{label}] Ichimoku below cloud → SELL +2")
+        if ichi['tenkan']>ichi['kijun']: sb+=1; det.append(f"[{label}] Tenkan>Kijun → BUY +1")
+        else:                             ss+=1; det.append(f"[{label}] Tenkan<Kijun → SELL +1")
         if ichi['price_ago']:
-            if ichi['chikou'] > ichi['price_ago']: sb += 1; det.append(f"[{label}] Chikou above → BUY +1")
-            else:                                   ss += 1; det.append(f"[{label}] Chikou below → SELL +1")
+            if ichi['chikou']>ichi['price_ago']: sb+=1; det.append(f"[{label}] Chikou above → BUY +1")
+            else:                                 ss+=1; det.append(f"[{label}] Chikou below → SELL +1")
 
-    # CCI
-    cci = _cci(candles, 20)
+    cci=_cci(candles,20)
     if cci is not None:
-        if   cci < -100: sb += 2; det.append(f"[{label}] CCI OVERSOLD → BUY +2")
-        elif cci >  100: ss += 2; det.append(f"[{label}] CCI OVERBOUGHT → SELL +2")
-        elif cci >    0: sb += 1; det.append(f"[{label}] CCI>0 → BUY +1")
-        else:            ss += 1; det.append(f"[{label}] CCI<0 → SELL +1")
+        if   cci<-100: sb+=2; det.append(f"[{label}] CCI OVERSOLD → BUY +2")
+        elif cci>100:  ss+=2; det.append(f"[{label}] CCI OVERBOUGHT → SELL +2")
+        elif cci>0:    sb+=1; det.append(f"[{label}] CCI>0 → BUY +1")
+        else:          ss+=1; det.append(f"[{label}] CCI<0 → SELL +1")
 
-    # Awesome Oscillator
-    ao = _awesome_oscillator(candles, 5, 34)
+    ao=_awesome_oscillator(candles,5,34)
     if ao is not None:
-        if ao > 0: sb += 1; det.append(f"[{label}] AO>0 → BUY +1")
-        else:      ss += 1; det.append(f"[{label}] AO<0 → SELL +1")
+        if ao>0: sb+=1; det.append(f"[{label}] AO>0 → BUY +1")
+        else:    ss+=1; det.append(f"[{label}] AO<0 → SELL +1")
 
-    # Williams %R — FIXED (was inverted in v4)
-    wr = _williams_r(candles, 14)
+    wr=_williams_r(candles,14)
     if wr is not None:
-        if   wr < -80: sb += 2; det.append(f"[{label}] W%R={wr:.1f} OVERSOLD → BUY +2")
-        elif wr > -20: ss += 2; det.append(f"[{label}] W%R={wr:.1f} OVERBOUGHT → SELL +2")
-        elif wr < -50: ss += 1; det.append(f"[{label}] W%R={wr:.1f} bearish zone → SELL +1")
-        else:          sb += 1; det.append(f"[{label}] W%R={wr:.1f} bullish zone → BUY +1")
+        if   wr<-80: sb+=2; det.append(f"[{label}] W%R OVERSOLD → BUY +2")
+        elif wr>-20: ss+=2; det.append(f"[{label}] W%R OVERBOUGHT → SELL +2")
+        elif wr<-50: ss+=1; det.append(f"[{label}] W%R bearish → SELL +1")
+        else:        sb+=1; det.append(f"[{label}] W%R bullish → BUY +1")
 
-    # MA Suite
-    mb, ms, md = _ma_suite_score(closes, label)
-    sb += mb; ss += ms; det += md
+    mb,ms,md=_ma_suite_score(closes,label)
+    sb+=mb; ss+=ms; det+=md
 
-    net = sb - ss
-    if   net > 0: bias, score = 'BUY',  sb
-    elif net < 0: bias, score = 'SELL', ss
-    else:         bias, score = 'NEUTRAL', 0
+    net=sb-ss
+    if   net>0: bias,score='BUY',sb
+    elif net<0: bias,score='SELL',ss
+    else:       bias,score='NEUTRAL',0
 
-    return {
-        'bias': bias, 'score': score,
-        'score_buy': sb, 'score_sell': ss, 'net': net,
-        'rsi': rsi, 'ema9': e9, 'ema21': e21, 'ema50': e50,
-        'details': det, 'adx': adx, 'cci': cci, 'ao': ao,
-        'williams_r': wr, 'uo': uo, 'ppo': ppo, 'stoch_k': sk, 'hma': hma,
-    }
+    return {'bias':bias,'score':score,'score_buy':sb,'score_sell':ss,'net':net,
+            'rsi':rsi,'ema9':e9,'ema21':e21,'ema50':e50,'details':det,
+            'adx':adx,'cci':cci,'ao':ao,'williams_r':wr,'uo':uo,'ppo':ppo,'stoch_k':sk_v,'hma':hma}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1085,93 +971,67 @@ def _score_timeframe(candles, label=""):
 
 def _fetch_candles(symbol, resolution, num_candles):
     try:
-        res_seconds = {'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400}
-        sec        = res_seconds.get(resolution, 300)
-        end_time   = int(_time.time())
-        start_time = end_time - (num_candles * sec)
-        response   = make_api_request('GET',
-            f'/history/candles?resolution={resolution}&symbol={symbol}&start={start_time}&end={end_time}')
-        if not response or not response.get('result'):
-            print(f"⚠️ No candles for {symbol} @ {resolution}")
-            return []
-        parsed = []
-        for c in response['result']:
-            try:
-                parsed.append({'open': float(c.get('open',0)), 'high': float(c.get('high',0)),
-                               'low': float(c.get('low',0)), 'close': float(c.get('close',0)),
-                               'time': c.get('time',0)})
-            except: continue
-        parsed.sort(key=lambda x: x['time'])
+        sec={'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400}.get(resolution,300)
+        end=int(_time.time()); start=end-(num_candles*sec)
+        resp=make_api_request('GET',f'/history/candles?resolution={resolution}&symbol={symbol}&start={start}&end={end}')
+        if not resp or not resp.get('result'): print(f"⚠️ No candles {symbol}@{resolution}"); return []
+        parsed=[{'open':float(c.get('open',0)),'high':float(c.get('high',0)),
+                 'low':float(c.get('low',0)),'close':float(c.get('close',0)),'time':c.get('time',0)}
+                for c in resp['result'] if c]
+        parsed.sort(key=lambda x:x['time'])
         print(f"📊 {symbol} @ {resolution}: {len(parsed)} candles fetched")
         return parsed
     except Exception as e:
-        print(f"❌ Error fetching {resolution} candles: {e}")
-        return []
-
-
-# ─────────────────────────────────────────────────────────────
-#  ATR FILTER
-# ─────────────────────────────────────────────────────────────
+        print(f"❌ Error {resolution}: {e}"); return []
 
 def _is_market_tradeable(candles_15m):
     if len(candles_15m) < 15: return True
-    atr_val = _atr(candles_15m, 14)
-    closes  = [c['close'] for c in candles_15m]
-    price   = closes[-1]
-    if atr_val is None or price <= 0: return True
-    atr_pct = (atr_val / price) * 100
-    if atr_pct < 0.02:
-        print(f"⚠️ Market too flat: ATR={atr_pct:.4f}% — SKIPPING")
-        return False
-    print(f"✅ Market volatility OK: ATR={atr_pct:.4f}%")
-    return True
+    atr_val=_atr(candles_15m,14); price=candles_15m[-1]['close']
+    if not atr_val or price<=0: return True
+    pct=(atr_val/price)*100
+    if pct<0.02: print(f"⚠️ Too flat ATR={pct:.4f}%"); return False
+    print(f"✅ ATR OK: {pct:.4f}%"); return True
 
 
 # ─────────────────────────────────────────────────────────────
-#  MAIN SIGNAL — v6
+#  MAIN SIGNAL — v7
 # ─────────────────────────────────────────────────────────────
 
 def generate_smart_signal(reason="trade_decision"):
     """
-    SIGNAL ENGINE v6 — 4H IS MASTER TREND
+    SIGNAL ENGINE v7
 
-    FLOW:
-    1. Score 4H, 1H, 15M
-    2. 4H decides direction — agar 4H SELL hai toh SELL dhundho, BUY nahi
-    3. 1H must AGREE with 4H direction (both same bias)
-    4. 15M must also agree AND net >= 4
-    5. Signal = direction of 4H
-
-    Agar 4H NEUTRAL hai:
-      → 1H + 15M must agree strongly (net >= 6 each)
-
-    Yeh solve karta hai: 4H SELL, 1H BUY (lagging) → SELL wait karo
-    jab 1H bhi SELL ho jaye → signal do
+    RULES (simple):
+    ┌─────────────────────────────────────────────────┐
+    │  4H = MASTER DIRECTION                          │
+    │  15M must agree with 4H + net >= 4              │
+    │  1H = confidence only (not a blocker)           │
+    │                                                 │
+    │  4H SELL + 15M SELL + net>=4  →  SELL ✅        │
+    │  4H BUY  + 15M BUY  + net>=4  →  BUY  ✅        │
+    │  4H SELL + 15M BUY            →  WAIT ⏳        │
+    │  4H BUY  + 15M SELL           →  WAIT ⏳        │
+    │  4H NEUTRAL: need 1H+15M agree + net>=5         │
+    └─────────────────────────────────────────────────┘
     """
 
     symbol = BOT_STATE.get('symbol', 'ETHUSD')
     print(f"\n{'='*60}")
-    print(f"🧠 SIGNAL ENGINE v6 — {symbol} — {datetime.now().strftime('%H:%M:%S')}")
+    print(f"🧠 SIGNAL ENGINE v7 — {symbol} — {datetime.now().strftime('%H:%M:%S')}")
     print(f"{'='*60}")
 
-    # Step 1: Fetch
     candles_4h  = _fetch_candles(symbol, '4h',  120)
     candles_1h  = _fetch_candles(symbol, '1h',  120)
     candles_15m = _fetch_candles(symbol, '15m', 120)
 
-    if len(candles_4h) < 20:
-        print(f"⚠️ Not enough 4h candles — using 1H+15M only")
-        candles_4h = None
-
+    if len(candles_4h) < 20:  candles_4h = None
     if len(candles_1h) < 20 or len(candles_15m) < 20:
-        direction = random.choice(['BUY', 'SELL'])
-        return _make_signal(direction, 50, 'RANDOM_FALLBACK', 0, reason, {}, {}, {}, candles_15m or [])
+        d = random.choice(['BUY','SELL'])
+        return _make_signal(d, 50, 'RANDOM_FALLBACK', 0, reason, {}, {}, {}, candles_15m or [])
 
-    # Step 2: ATR filter
     if not _is_market_tradeable(candles_15m):
-        return _make_wait_signal(reason, "Market too flat (low ATR)")
+        return _make_wait_signal(reason, "Market too flat")
 
-    # Step 3: Score
     r4h  = _score_timeframe(candles_4h,  '4H') if candles_4h else None
     r1h  = _score_timeframe(candles_1h,  '1H')
     r15m = _score_timeframe(candles_15m, '15M')
@@ -1180,78 +1040,67 @@ def generate_smart_signal(reason="trade_decision"):
     b1h  = r1h['bias']
     b15m = r15m['bias']
 
-    print(f"\n📊 TIMEFRAME SCORES:")
+    print(f"\n📊 SCORES:")
     if r4h:
-        print(f"   4H  → {b4h:7s} | BUY={r4h['score_buy']:2d} SELL={r4h['score_sell']:2d} | Net={r4h['net']:+3d}  ← MASTER TREND")
-    print(f"   1H  → {b1h:7s} | BUY={r1h['score_buy']:2d} SELL={r1h['score_sell']:2d} | Net={r1h['net']:+3d}")
-    print(f"   15M → {b15m:7s} | BUY={r15m['score_buy']:2d} SELL={r15m['score_sell']:2d} | Net={r15m['net']:+3d}")
+        print(f"   4H  → {b4h:7s} | BUY={r4h['score_buy']:2d} SELL={r4h['score_sell']:2d} Net={r4h['net']:+3d}  ← MASTER")
+    print(f"   1H  → {b1h:7s} | BUY={r1h['score_buy']:2d} SELL={r1h['score_sell']:2d} Net={r1h['net']:+3d}  (confidence only)")
+    print(f"   15M → {b15m:7s} | BUY={r15m['score_buy']:2d} SELL={r15m['score_sell']:2d} Net={r15m['net']:+3d}  ← ENTRY")
 
-    # ─────────────────────────────────────────────
-    # STEP 4: v6 CORE LOGIC — 4H IS MASTER
-    # ─────────────────────────────────────────────
+    # ── CORE DECISION ──────────────────────────────────────
 
-    # Case A: 4H has clear direction
+    MIN_15M_NET = 4  # minimum entry signal strength
+
     if b4h in ('BUY', 'SELL'):
         master = b4h
-        print(f"\n🎯 4H MASTER TREND: {master}")
 
-        # 1H must agree with 4H
-        if b1h != master:
-            print(f"⏳ 1H ({b1h}) not yet aligned with 4H ({master}) — waiting for 1H to turn")
-            return _make_wait_signal(reason, f"1H not aligned: 1H={b1h}, 4H={master} — wait for 1H to confirm")
-
-        # 15M must agree with 4H
+        # 15M must agree with 4H direction
         if b15m != master:
-            print(f"⏳ 15M ({b15m}) not aligned with 4H ({master}) — waiting for entry")
-            return _make_wait_signal(reason, f"15M not aligned: 15M={b15m}, 4H={master}")
+            print(f"⏳ 15M={b15m} not aligned with 4H={master} — wait for 15M entry")
+            return _make_wait_signal(reason, f"Waiting for 15M to align with 4H {master}")
 
-        # 15M net must be meaningful
-        MIN_15M = 4
-        if abs(r15m['net']) < MIN_15M:
-            print(f"📉 15M net too weak ({r15m['net']}) — need >={MIN_15M}")
-            return _make_wait_signal(reason, f"15M weak: net={r15m['net']} need >={MIN_15M}")
+        # 15M net must be strong enough
+        if abs(r15m['net']) < MIN_15M_NET:
+            print(f"⏳ 15M net={r15m['net']} too weak (need >={MIN_15M_NET})")
+            return _make_wait_signal(reason, f"15M weak: net={r15m['net']} need >={MIN_15M_NET}")
 
-        # All 3 aligned → SIGNAL
         direction = master
+        print(f"\n✅ 4H {master} + 15M {b15m} aligned — SIGNAL: {direction}")
 
-    # Case B: 4H NEUTRAL — use 1H+15M agreement
     else:
-        print(f"\n⚖️ 4H NEUTRAL — using 1H+15M confluence")
-        if b1h == 'NEUTRAL' or b15m == 'NEUTRAL':
-            return _make_wait_signal(reason, f"4H neutral + 1H/15M neutral: {b1h}/{b15m}")
-        if b1h != b15m:
-            return _make_wait_signal(reason, f"4H neutral + 1H/15M conflict: {b1h} vs {b15m}")
-        # Both 1H and 15M agree — need stronger signal without 4H
-        if abs(r1h['net']) < 6 or abs(r15m['net']) < 6:
-            return _make_wait_signal(reason, f"4H neutral, need stronger 1H/15M (1H net={r1h['net']}, 15M net={r15m['net']})")
+        # 4H neutral — need 1H + 15M both strong
+        print(f"⚖️ 4H NEUTRAL — checking 1H+15M")
+        if b1h == 'NEUTRAL' or b15m == 'NEUTRAL' or b1h != b15m:
+            return _make_wait_signal(reason, f"4H neutral, 1H={b1h} 15M={b15m} not aligned")
+        if abs(r1h['net']) < 5 or abs(r15m['net']) < 5:
+            return _make_wait_signal(reason, f"4H neutral, signals too weak 1H={r1h['net']} 15M={r15m['net']}")
         direction = b15m
+        print(f"\n✅ 4H neutral but 1H+15M both {direction} — SIGNAL: {direction}")
 
-    # ─────────────────────────────────────────────
-    # STEP 5: Confidence
-    # ─────────────────────────────────────────────
+    # ── CONFIDENCE ─────────────────────────────────────────
     MAX_SCORE = 75.0
-    conf_raw = (r1h['score'] * 0.40 + r15m['score'] * 0.40 + (r4h['score'] if r4h else 0) * 0.20) / MAX_SCORE
+    w_4h = 0.35 if r4h else 0.0
+    w_1h = 0.30
+    w_15 = 0.35
 
-    # 4H boost
-    if r4h:
-        if b4h == direction:
-            conf_raw = min(conf_raw * 1.20, 1.0)
-            print(f"   ✅ All 3 TF aligned — confidence boosted")
+    score_4h = r4h['score'] if r4h else 0
+    conf_raw = (score_4h * w_4h + r1h['score'] * w_1h + r15m['score'] * w_15) / MAX_SCORE
+
+    # 1H agreeing = boost
+    if b1h == direction:
+        conf_raw = min(conf_raw * 1.15, 1.0)
+        print(f"   ✅ 1H also agrees ({b1h}) — confidence boosted")
+    else:
+        conf_raw = conf_raw * 0.90
+        print(f"   ⚠️ 1H disagrees ({b1h}) — slight confidence reduction")
 
     confidence = int(min(50 + conf_raw * 50, 95))
 
-    # Layer
     net15 = abs(r15m['net'])
-    if   net15 >= 15: layer = 'STRONG_BUY'    if direction == 'BUY' else 'STRONG_SELL'
-    elif net15 >= 8:  layer = 'MODERATE_BUY'  if direction == 'BUY' else 'MODERATE_SELL'
-    else:             layer = 'WEAK_BUY'       if direction == 'BUY' else 'WEAK_SELL'
+    if   net15 >= 15: layer = 'STRONG_BUY'   if direction=='BUY' else 'STRONG_SELL'
+    elif net15 >= 8:  layer = 'MODERATE_BUY' if direction=='BUY' else 'MODERATE_SELL'
+    else:             layer = 'WEAK_BUY'      if direction=='BUY' else 'WEAK_SELL'
 
-    if r4h and b4h == direction and net15 >= 6:
-        layer = 'STRONG_BUY' if direction == 'BUY' else 'STRONG_SELL'
-
-    print(f"\n✅ CONFIRMED SIGNAL: {direction}")
-    print(f"   4H={b4h}  1H={b1h}  15M={b15m}")
-    print(f"   15M net={r15m['net']}  Confidence={confidence}%  Layer={layer}")
+    print(f"   Confidence={confidence}%  Layer={layer}")
 
     return _make_signal(direction, confidence, layer,
                         r15m['net'], reason, r4h or {}, r1h, r15m, candles_15m)
@@ -1263,57 +1112,42 @@ def generate_smart_signal(reason="trade_decision"):
 
 def _make_signal(direction, confidence, layer, net_score, reason,
                  r4h, r1h, r15m, candles_15m):
-    price   = candles_15m[-1]['close'] if candles_15m else 0
-    atr_val = _atr(candles_15m, 14) if candles_15m else None
+    price=candles_15m[-1]['close'] if candles_15m else 0
+    atr_val=_atr(candles_15m,14) if candles_15m else None
     if atr_val and price:
-        if direction == 'BUY':
-            ref_sl = round(price - 1.5 * atr_val, 4)
-            ref_tp = round(price + 3.0 * atr_val, 4)
-        else:
-            ref_sl = round(price + 1.5 * atr_val, 4)
-            ref_tp = round(price - 3.0 * atr_val, 4)
-    else:
-        ref_sl = ref_tp = None
-
-    print(f"   📍 Entry={price} | ref_SL={ref_sl} | ref_TP={ref_tp}")
-
+        ref_sl=round(price-(1.5*atr_val),4) if direction=='BUY' else round(price+(1.5*atr_val),4)
+        ref_tp=round(price+(3.0*atr_val),4) if direction=='BUY' else round(price-(3.0*atr_val),4)
+    else: ref_sl=ref_tp=None
+    print(f"   📍 Entry={price} SL={ref_sl} TP={ref_tp}")
     return {
-        'signal': direction, 'timestamp': datetime.now().isoformat(),
-        'confidence': confidence, 'layer': layer,
-        'score': net_score, 'score_buy': r15m.get('score_buy', 0),
-        'score_sell': r15m.get('score_sell', 0), 'source': 'smart_signal_v6',
-        'entry_price': price, 'ref_sl': ref_sl, 'ref_tp': ref_tp,
-        'reason': (f"MTF: 4H={r4h.get('bias','?')} 1H={r1h.get('bias','?')} "
-                   f"15M={r15m.get('bias','?')} Net15m={net_score}"),
-        'decision_ready': True, 'decision_confidence': confidence/100,
-        'wait': False, 'position_analysis': {'has_position': False},
-        'backtest_results': {
-            'ema9': r15m.get('ema9'), 'ema21': r15m.get('ema21'),
-            'ema50': r15m.get('ema50'), 'rsi': r15m.get('rsi'),
-            'adx': r15m.get('adx'), 'cci': r15m.get('cci'),
-            'ao': r15m.get('ao'), 'williams_r': r15m.get('williams_r'),
-            'uo': r15m.get('uo'), 'ppo': r15m.get('ppo'),
-            'stoch_k': r15m.get('stoch_k'), 'hma': r15m.get('hma'),
-            'price': price, 'ref_sl': ref_sl, 'ref_tp': ref_tp,
-            'factors': r15m.get('details', []),
-            '4h_bias': r4h.get('bias','?'), '1h_bias': r1h.get('bias','?'),
-            '15m_bias': r15m.get('bias','?'),
+        'signal':direction,'timestamp':datetime.now().isoformat(),
+        'confidence':confidence,'layer':layer,'score':net_score,
+        'score_buy':r15m.get('score_buy',0),'score_sell':r15m.get('score_sell',0),
+        'source':'smart_signal_v7','entry_price':price,'ref_sl':ref_sl,'ref_tp':ref_tp,
+        'reason':f"4H={r4h.get('bias','?')} 1H={r1h.get('bias','?')} 15M={r15m.get('bias','?')} Net={net_score}",
+        'decision_ready':True,'decision_confidence':confidence/100,'wait':False,
+        'position_analysis':{'has_position':False},
+        'backtest_results':{
+            'ema9':r15m.get('ema9'),'ema21':r15m.get('ema21'),'ema50':r15m.get('ema50'),
+            'rsi':r15m.get('rsi'),'adx':r15m.get('adx'),'cci':r15m.get('cci'),
+            'ao':r15m.get('ao'),'williams_r':r15m.get('williams_r'),'uo':r15m.get('uo'),
+            'ppo':r15m.get('ppo'),'stoch_k':r15m.get('stoch_k'),'hma':r15m.get('hma'),
+            'price':price,'ref_sl':ref_sl,'ref_tp':ref_tp,'factors':r15m.get('details',[]),
+            '4h_bias':r4h.get('bias','?'),'1h_bias':r1h.get('bias','?'),'15m_bias':r15m.get('bias','?'),
         },
-        'last_trade_result': reason,
+        'last_trade_result':reason,
     }
-
 
 def _make_wait_signal(reason, why):
     print(f"⏸️ WAIT: {why}")
     return {
-        'signal': 'WAIT', 'timestamp': datetime.now().isoformat(),
-        'confidence': 0, 'layer': 'WAIT', 'score': 0,
-        'score_buy': 0, 'score_sell': 0, 'source': 'smart_signal_v6',
-        'reason': why, 'entry_price': None, 'ref_sl': None, 'ref_tp': None,
-        'decision_ready': False, 'decision_confidence': 0,
-        'wait': True, 'position_analysis': {'has_position': False},
-        'backtest_results': {}, 'last_trade_result': reason,
+        'signal':'WAIT','timestamp':datetime.now().isoformat(),
+        'confidence':0,'layer':'WAIT','score':0,'score_buy':0,'score_sell':0,
+        'source':'smart_signal_v7','reason':why,'entry_price':None,'ref_sl':None,'ref_tp':None,
+        'decision_ready':False,'decision_confidence':0,'wait':True,
+        'position_analysis':{'has_position':False},'backtest_results':{},'last_trade_result':reason,
     }
+
 
 
 def save_closed_position(trade_data):
