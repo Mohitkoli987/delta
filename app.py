@@ -169,18 +169,18 @@ def cleanup_old_trades(target_size_mb=8.5):
         return False
 
 # API Configuration
-# BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-BASE_URL = "https://api.india.delta.exchange"
+BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+# BASE_URL = "https://api.india.delta.exchange"
 
-WS_URL = "wss://socket.india.delta.exchange"
-# WS_URL ="wss://testnet-socket.india.delta.exchange"
+# WS_URL = "wss://socket.india.delta.exchange"
+WS_URL ="wss://testnet-socket.india.delta.exchange"
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
 # ---------- LIVE POSITION TP/SL CONFIGURATION ----------
-LIVE_TP_PERCENTAGE = 0.5   # Take Profit %
-LIVE_SL_PERCENTAGE = 0.22  # Stop Loss %
+LIVE_TP_PERCENTAGE = 1.5   # Take Profit %
+LIVE_SL_PERCENTAGE = 0.6  # Stop Loss %
 
 processing_lock = threading.Lock()
 last_processed = {}
@@ -199,8 +199,8 @@ LOT_STEPS = {
     4: 8,
     5: 16,
     6: 32,
-    # 7: 64,
-    # 8: 128,
+    7: 64,
+    8: 128,
     # 9: 256,
     # 10: 512,
     # 11: 1056
@@ -276,54 +276,12 @@ USED_FILL_IDS_LOCK = Lock()
 
 # =====================================================================
 # DUPLICATE TRADE FIX: PROCESSED_ORDER_IDS
-#
-# WHY THE DUPLICATE HAPPENED:
-#   The WS path (_pair_ws_fills) and the dead reckoning path
-#   (find_trade_by_order_id) both ran in the same or back-to-back
-#   check_position_and_detect_closure() calls on the same entry order_id.
-#
-#   _pair_ws_fills() marks USED_FILL_IDS at the END of pairing.
-#   find_trade_by_order_id() reads USED_FILL_IDS at the START with a
-#   snapshot copy (already_used = set(USED_FILL_IDS)). If both functions
-#   run before either one has finished writing back to USED_FILL_IDS, the
-#   snapshot in find_trade_by_order_id() does NOT contain the WS-marked IDs
-#   yet, and the same entry fill gets paired a second time, producing a
-#   fake trade identical to the real one (same timestamp = 05:14:29).
-#
-#   Additionally, save_closed_position() only deduped on (symbol,
-#   entry_time) which is a timestamp string. Two paths completing within
-#   the same second produce identical entry_time strings, so the in-memory
-#   LAST_SAVED_TRADE_KEY check passes for the second call, and the DB
-#   INSERT hits the UNIQUE KEY (symbol, entry_time, side) — but the
-#   pymysql IntegrityError is silently caught, meaning the second fake
-#   trade is dropped at the DB level. HOWEVER: _apply_step_progression()
-#   and save_bot_state_to_db() already ran for the second path BEFORE
-#   save_closed_position() was called, corrupting the step/lot state.
-#
-# THE FIX:
-#   PROCESSED_ORDER_IDS is a set of entry order_ids that have been fully
-#   processed (pair found + state saved + DB saved). It is checked at the
-#   very top of EVERY pairing path — WS, REST, and dead reckoning — under
-#   PROCESSED_ORDER_IDS_LOCK before any pairing work begins.
-#
-#   The entry order_id is added to PROCESSED_ORDER_IDS atomically BEFORE
-#   _apply_step_progression() and save_bot_state_to_db() are called, so
-#   even if a second path runs concurrently, it will see the ID as already
-#   processed and return immediately without touching step/lot state or DB.
-#
-#   This is a separate set from USED_FILL_IDS:
-#   - USED_FILL_IDS: tracks individual fill order_ids (entry AND exit)
-#                    to prevent the same fill appearing in two trades.
-#   - PROCESSED_ORDER_IDS: tracks entry order_ids to prevent the same
-#                           TRADE from being processed twice from any path.
 # =====================================================================
 PROCESSED_ORDER_IDS      = set()
 PROCESSED_ORDER_IDS_LOCK = Lock()
 
 # =====================================================================
 # FIX 2: COOLDOWN
-# LAST_CLOSE_TIMESTAMP is set the instant a position close is detected.
-# The bot loop enforces COOLDOWN_SECONDS gap before the next order.
 # =====================================================================
 LAST_CLOSE_TIMESTAMP = 0.0
 COOLDOWN_SECONDS = 15
@@ -384,15 +342,13 @@ def init_database():
         '''
         execute_mysql_query(create_table_query, commit=True)
 
-        # Add entry_order_id column to existing tables that may not have it
-        # This is safe to run on existing tables — ALTER COLUMN IF NOT EXISTS
         try:
             execute_mysql_query(
                 "ALTER TABLE closed_positions ADD COLUMN entry_order_id VARCHAR(100) DEFAULT NULL",
                 commit=True
             )
         except Exception:
-            pass  # Column already exists — that is fine
+            pass
 
         try:
             execute_mysql_query(
@@ -400,7 +356,7 @@ def init_database():
                 commit=True
             )
         except Exception:
-            pass  # Index already exists — that is fine
+            pass
 
         try:
             execute_mysql_query(
@@ -408,7 +364,7 @@ def init_database():
                 commit=True
             )
         except Exception:
-            pass  # Index already exists — that is fine
+            pass
 
         create_state_table_query = '''
             CREATE TABLE IF NOT EXISTS bot_state (
@@ -512,7 +468,6 @@ def verify_and_sync_step_from_db():
     DB is ground truth. Memory is just cache.
 
     SAFETY: Caller MUST check BOT_STATE['order_completed'] == True before calling.
-    This function does NOT check it itself; the guard is in auto_trading_bot_main().
     """
     try:
         query = '''
@@ -535,24 +490,18 @@ def verify_and_sync_step_from_db():
         print(f"   PnL: {db_pnl:.5f} → Result: {db_result}")
         print(f"   Memory Step BEFORE sync: {BOT_STATE['current_step']} | Lot: {BOT_STATE['current_lot']}")
 
-        # Only re-sync if the DB result differs from what memory thinks
         memory_pnl = LAST_TRADE_RESULT.get('profit_loss')
 
-        # If memory already matches DB, no correction needed
         if memory_pnl is not None and abs(memory_pnl - db_pnl) < 0.001:
             print(f"   ✅ Memory matches DB - no correction needed")
             return True
 
-        # DB result is different from memory (or memory is empty) - correct step
         print(f"   ⚠️ DB PnL ({db_pnl:.5f}) differs from memory ({memory_pnl}) - CORRECTING STEP")
 
-        # Update memory to match DB
         LAST_TRADE_RESULT['profit_loss'] = db_pnl
         LAST_TRADE_RESULT['processed']   = True
         BOT_STATE['last_result']         = db_result
 
-        # Now recompute: what SHOULD the step be based on DB result?
-        # We read current step from DB state (saved after last trade)
         saved_state = execute_mysql_query(
             "SELECT state_value FROM bot_state WHERE state_key = %s",
             ('martingale_state',),
@@ -565,7 +514,6 @@ def verify_and_sync_step_from_db():
             correct_lot   = float(state_data.get('current_lot', LOT_STEPS[1]))
             print(f"   ✅ Corrected from DB state: Step={correct_step}, Lot={correct_lot}")
         else:
-            # No saved state - derive step from PnL directly
             if db_pnl > 0:
                 correct_step = 1
                 correct_lot  = LOT_STEPS[1]
@@ -588,60 +536,7 @@ def verify_and_sync_step_from_db():
         return False
 
 
-# def generate_random_signal(reason="trade_result"):
-#     """Pure random BUY/SELL signal - no candles, no indicators"""
-#     direction = random.choice(["BUY", "SELL"])
-#     return {
-#         'signal': direction,
-#         'timestamp': datetime.now().isoformat(),
-#         'confidence': 50,
-#         'layer': 'RANDOM',
-#         'score': 0,
-#         'score_buy': 0,
-#         'score_sell': 0,
-#         'source': 'random_signal',
-#         'reason': f'Random signal ({direction})',
-#         'decision_ready': True,
-#         'decision_confidence': 0.5,
-#         'wait': False,
-#         'position_analysis': {'has_position': False},
-#         'backtest_results': {},
-#         'last_trade_result': reason
-#     }
-
-# ========== SIGNAL GENERATION — v4 (FULL INDICATOR SUITE) ==========
-# Added vs v3:
-#   - HMA (Hull Moving Average)
-#   - Ultimate Oscillator (7,14,28)
-#   - ADX + DI+/DI- (14)
-#   - Bull Bear Power (Elder Ray, 13)
-#   - Momentum (20)
-#   - PPO (12,26,9)
-#   - Stochastic RSI (14)
-#   - Ichimoku Cloud (9,26,52)
-#   - CCI (20)
-#   - Awesome Oscillator (5,34)
-#   - Williams %R (14)
-#   - MA Suite scoring: SMA+EMA 5/10/20/50/100/200 vs price
-
-
-# ─────────────────────────────────────────────────────────────
-#  ORIGINAL INDICATORS (unchanged)
-# ─────────────────────────────────────────────────────────────
-"""
-SIGNAL ENGINE v7 — 4H MASTER, NO 1H WAIT
-==========================================
-CORE LOGIC (simple):
-  1. 4H decides direction (SELL = short, BUY = long)
-  2. 15M must agree with 4H
-  3. 15M net >= 4 required
-  4. Done — signal fire karo
-
-  4H NEUTRAL hone par: 1H + 15M dono agree + net >= 5
-
-NO MORE waiting for 1H to flip.
-1H is only used for confidence boost, not blocking.
-"""
+# ========== SIGNAL GENERATION — v7 (FULL INDICATOR SUITE) ==========
 
 import random
 from datetime import datetime
@@ -830,10 +725,6 @@ def _ma_suite_score(closes, label=""):
     return sb, ss, det
 
 
-# ─────────────────────────────────────────────────────────────
-#  SCORER
-# ─────────────────────────────────────────────────────────────
-
 def _score_timeframe(candles, label=""):
     if len(candles) < 30:
         return {'bias':'NEUTRAL','score':0,'details':[],'score_buy':0,'score_sell':0,'net':0,
@@ -965,10 +856,6 @@ def _score_timeframe(candles, label=""):
             'adx':adx,'cci':cci,'ao':ao,'williams_r':wr,'uo':uo,'ppo':ppo,'stoch_k':sk_v,'hma':hma}
 
 
-# ─────────────────────────────────────────────────────────────
-#  CANDLE FETCHER
-# ─────────────────────────────────────────────────────────────
-
 def _fetch_candles(symbol, resolution, num_candles):
     try:
         sec={'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400}.get(resolution,300)
@@ -993,15 +880,11 @@ def _is_market_tradeable(candles_15m):
     print(f"✅ ATR OK: {pct:.4f}%"); return True
 
 
-# ─────────────────────────────────────────────────────────────
-#  MAIN SIGNAL — v7
-# ─────────────────────────────────────────────────────────────
-
 def generate_smart_signal(reason="trade_decision"):
     """
     SIGNAL ENGINE v7
 
-    RULES (simple):
+    RULES:
     ┌─────────────────────────────────────────────────┐
     │  4H = MASTER DIRECTION                          │
     │  15M must agree with 4H + net >= 4              │
@@ -1046,19 +929,15 @@ def generate_smart_signal(reason="trade_decision"):
     print(f"   1H  → {b1h:7s} | BUY={r1h['score_buy']:2d} SELL={r1h['score_sell']:2d} Net={r1h['net']:+3d}  (confidence only)")
     print(f"   15M → {b15m:7s} | BUY={r15m['score_buy']:2d} SELL={r15m['score_sell']:2d} Net={r15m['net']:+3d}  ← ENTRY")
 
-    # ── CORE DECISION ──────────────────────────────────────
-
-    MIN_15M_NET = 4  # minimum entry signal strength
+    MIN_15M_NET = 4
 
     if b4h in ('BUY', 'SELL'):
         master = b4h
 
-        # 15M must agree with 4H direction
         if b15m != master:
             print(f"⏳ 15M={b15m} not aligned with 4H={master} — wait for 15M entry")
             return _make_wait_signal(reason, f"Waiting for 15M to align with 4H {master}")
 
-        # 15M net must be strong enough
         if abs(r15m['net']) < MIN_15M_NET:
             print(f"⏳ 15M net={r15m['net']} too weak (need >={MIN_15M_NET})")
             return _make_wait_signal(reason, f"15M weak: net={r15m['net']} need >={MIN_15M_NET}")
@@ -1067,7 +946,6 @@ def generate_smart_signal(reason="trade_decision"):
         print(f"\n✅ 4H {master} + 15M {b15m} aligned — SIGNAL: {direction}")
 
     else:
-        # 4H neutral — need 1H + 15M both strong
         print(f"⚖️ 4H NEUTRAL — checking 1H+15M")
         if b1h == 'NEUTRAL' or b15m == 'NEUTRAL' or b1h != b15m:
             return _make_wait_signal(reason, f"4H neutral, 1H={b1h} 15M={b15m} not aligned")
@@ -1076,7 +954,6 @@ def generate_smart_signal(reason="trade_decision"):
         direction = b15m
         print(f"\n✅ 4H neutral but 1H+15M both {direction} — SIGNAL: {direction}")
 
-    # ── CONFIDENCE ─────────────────────────────────────────
     MAX_SCORE = 75.0
     w_4h = 0.35 if r4h else 0.0
     w_1h = 0.30
@@ -1085,7 +962,6 @@ def generate_smart_signal(reason="trade_decision"):
     score_4h = r4h['score'] if r4h else 0
     conf_raw = (score_4h * w_4h + r1h['score'] * w_1h + r15m['score'] * w_15) / MAX_SCORE
 
-    # 1H agreeing = boost
     if b1h == direction:
         conf_raw = min(conf_raw * 1.15, 1.0)
         print(f"   ✅ 1H also agrees ({b1h}) — confidence boosted")
@@ -1105,10 +981,6 @@ def generate_smart_signal(reason="trade_decision"):
     return _make_signal(direction, confidence, layer,
                         r15m['net'], reason, r4h or {}, r1h, r15m, candles_15m)
 
-
-# ─────────────────────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────────────────────
 
 def _make_signal(direction, confidence, layer, net_score, reason,
                  r4h, r1h, r15m, candles_15m):
@@ -1149,15 +1021,9 @@ def _make_wait_signal(reason, why):
     }
 
 
-
 def save_closed_position(trade_data):
     """
     Save closed trade to MySQL database with strong duplicate protection.
-
-    DUPLICATE FIX: Now accepts and stores entry_order_id. The DB has a
-    UNIQUE KEY on entry_order_id, so any second attempt to insert the same
-    trade is rejected at the database level even if all in-memory checks
-    somehow passed. This is the final safety net.
     """
     global LAST_SAVED_TRADE_KEY
 
@@ -1173,7 +1039,6 @@ def save_closed_position(trade_data):
                 log_trade(f"SAVE SKIPPED | Duplicate trade_key in memory: {trade_key}")
                 return
 
-            # Check entry_order_id dedup first (strongest guard)
             entry_order_id = trade_data.get('entry_order_id')
             if entry_order_id:
                 order_id_check = execute_mysql_query(
@@ -1236,8 +1101,6 @@ def save_closed_position(trade_data):
             log_trade(f"TRADE SAVED | DB write completed | entry_order_id={entry_order_id}")
 
     except pymysql.err.IntegrityError as e:
-        # DB-level unique constraint caught a duplicate that slipped past all
-        # in-memory checks. This is expected and safe — just log and move on.
         log_trade(f"SAVE SKIPPED | DB IntegrityError (duplicate blocked at DB level): {e}")
         LAST_SAVED_TRADE_KEY = trade_key
     except Exception as e:
@@ -1357,7 +1220,6 @@ def make_api_request(method, endpoint, data=None):
         if response.status_code == 200:
             return response.json()
         else:
-            # ── FIX: Log the actual HTTP error so we know WHY it failed ──
             try:
                 err_body = response.json()
             except Exception:
@@ -1373,6 +1235,8 @@ def make_api_request(method, endpoint, data=None):
     except Exception as e:
         log_error(f"API EXCEPTION | {method} {endpoint} | {e}")
         return None
+
+
 def place_order(symbol, side, quantity, order_type='market_order'):
     """Place order with correct Delta Exchange parameters"""
     order_data = {
@@ -1469,13 +1333,8 @@ def get_wallet_balance():
 # ========== OPTIMIZED FILL RETRIEVAL ENGINE ==========
 
 def get_fills_page(page_size=5):
-    """
-    Fetch only the most recent fills from API.
-    page_size is capped at 5 - we only need the latest fills
-    for the current trade, never historical data.
-    """
+    """Fetch only the most recent fills from API. Hard cap at 5."""
     try:
-        # Hard cap: never fetch more than 5 fills
         safe_page_size = min(page_size, 5)
         fills = make_api_request('GET', f'/fills?page_size={safe_page_size}')
         if not fills or not fills.get('result'):
@@ -1491,26 +1350,12 @@ def find_trade_by_order_id(symbol, target_order_id):
     Fetch the 5 most recent fills and find the entry fill matching
     target_order_id, then find its paired exit fill.
 
-    DUPLICATE FIX: Before doing ANY pairing work, this function checks
-    PROCESSED_ORDER_IDS under lock. If target_order_id is already in that
-    set, it means a previous call (from WS, REST, or dead reckoning) already
-    completed the full pair+save+state sequence for this order. Return
-    immediately with (0, None) so no duplicate processing occurs.
-
-    The entry order_id is added to PROCESSED_ORDER_IDS atomically (under
-    lock) immediately after a valid pair is found — before _apply_step_
-    progression() or save_bot_state_to_db() are called by the caller.
-    This ensures that even if two paths call this function concurrently,
-    only one will find the pair; the second will see the ID in
-    PROCESSED_ORDER_IDS and return (0, None).
-
     Returns: (pnl, entry_exit_data) or (0, None) if not found / duplicate.
     """
     if not target_order_id:
         log_error("find_trade_by_order_id called with no target_order_id")
         return 0, None
 
-    # ── DUPLICATE CHECK: bail out immediately if already processed ────────
     with PROCESSED_ORDER_IDS_LOCK:
         if str(target_order_id) in PROCESSED_ORDER_IDS:
             log_trade(f"DUPLICATE BLOCKED | order {target_order_id} already in PROCESSED_ORDER_IDS")
@@ -1520,15 +1365,12 @@ def find_trade_by_order_id(symbol, target_order_id):
     if not fills:
         return 0, None
 
-    # Filter to this symbol only
     symbol_fills = [f for f in fills if f.get('product_symbol') == symbol]
     if not symbol_fills:
         return 0, None
 
-    # Sort oldest-first by created_at
     symbol_fills_sorted = sorted(symbol_fills, key=lambda x: x.get('created_at', ''))
 
-    # Group fills by order_id (handles split fills under same order_id)
     order_groups = {}
     for fill in symbol_fills_sorted:
         order_id   = str(fill.get('order_id') or fill.get('id', ''))
@@ -1562,12 +1404,10 @@ def find_trade_by_order_id(symbol, target_order_id):
         if grp['total_size'] > 0:
             grp['avg_price'] = grp['total_value'] / grp['total_size']
 
-    # Find the entry order matching target_order_id
     entry_order = order_groups.get(str(target_order_id))
     if not entry_order:
         return 0, None
 
-    # Find the exit order: opposite side, not the entry itself, not already used
     with USED_FILL_IDS_LOCK:
         already_used = set(USED_FILL_IDS)
 
@@ -1578,7 +1418,6 @@ def find_trade_by_order_id(symbol, target_order_id):
         if oid in already_used:
             continue
         if grp['side'] != entry_order['side']:
-            # Opposite side after the entry → this is the exit
             if grp['timestamp'] >= entry_order['timestamp']:
                 exit_order = grp
                 break
@@ -1586,7 +1425,6 @@ def find_trade_by_order_id(symbol, target_order_id):
     if not exit_order:
         return 0, None
 
-    # Calculate PnL
     entry_side  = entry_order['side']
     entry_price = entry_order['avg_price']
     exit_price  = exit_order['avg_price']
@@ -1614,8 +1452,6 @@ def find_trade_by_order_id(symbol, target_order_id):
     log_trade(f"PNL CALCULATED | {entry_side.upper()} | Entry={entry_price:.4f} | Exit={exit_price:.4f} | PnL={pnl:.5f} | Result={'PROFIT' if pnl > 0 else 'LOSS'}")
     log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
 
-    # ── ATOMIC MARK: add to both sets BEFORE returning so no second caller
-    # can pair the same fills again ────────────────────────────────────────
     with PROCESSED_ORDER_IDS_LOCK:
         PROCESSED_ORDER_IDS.add(str(target_order_id))
 
@@ -1628,9 +1464,7 @@ def find_trade_by_order_id(symbol, target_order_id):
 
 def wait_for_trade_fills(symbol, target_order_id, max_retries=5, retry_delay=2):
     """
-    After 10-second post-closure wait, attempt to find the closed trade
-    using only the 5 most recent fills.
-
+    After post-closure wait, attempt to find the closed trade.
     Retries up to max_retries times with retry_delay seconds between each.
     Returns (pnl, entry_exit_data) or (0, None) if not found after all retries.
     """
@@ -1654,16 +1488,10 @@ def wait_for_trade_fills(symbol, target_order_id, max_retries=5, retry_delay=2):
 
 # =====================================================================
 # LEGACY COMPATIBILITY WRAPPERS
-# The functions below are kept so that any code path that still calls
-# the old names continues to work. They all delegate to the new
-# optimised engine above.
 # =====================================================================
 
 def group_fills_by_order(fills, symbol):
-    """
-    Legacy wrapper - kept for compatibility.
-    Groups fills by order_id. Used only in fallback WS pairing paths.
-    """
+    """Legacy wrapper - kept for compatibility."""
     symbol_fills = [f for f in fills if f.get('product_symbol') == symbol]
     order_groups = {}
 
@@ -1704,13 +1532,7 @@ def group_fills_by_order(fills, symbol):
 
 
 def find_latest_closed_pair(symbol):
-    """
-    Legacy wrapper - delegates to find_trade_by_order_id using
-    BOT_STATE['last_placed_order_id'].
-
-    Returns (pnl, entry_exit_data) matching the current session order only.
-    Fetches at most 5 fills - never 100.
-    """
+    """Legacy wrapper - delegates to find_trade_by_order_id."""
     target_order_id = BOT_STATE.get('last_placed_order_id', None)
     if not target_order_id:
         log_error("find_latest_closed_pair: no last_placed_order_id - cannot match trade")
@@ -1719,17 +1541,6 @@ def find_latest_closed_pair(symbol):
     return find_trade_by_order_id(symbol, target_order_id)
 
 
-# =====================================================================
-# _mark_order_complete
-#
-# Called ONLY after all three steps complete for the current order:
-#   1. Pair found (find_trade_by_order_id returned data)
-#   2. Trade saved (save_closed_position completed)
-#   3. State saved (save_bot_state_to_db completed)
-#
-# Sets BOT_STATE['order_completed'] = True and clears last_placed_order_id.
-# Until this is called, no DB load, no DB sync, no new order is allowed.
-# =====================================================================
 def _mark_order_complete(order_id):
     """
     Mark the current tracked order as fully processed.
@@ -1744,47 +1555,20 @@ def auto_trading_bot_main():
     """
     Main bot loop.
 
-    Key fixes applied here:
-    1. FIX 1: USED_FILL_IDS prevents any fill being used in two trades
-    2. FIX 2: COOLDOWN enforced via LAST_CLOSE_TIMESTAMP
-    3. FIX 3: verify_and_sync_step_from_db() called BEFORE every order
-               to cross-check DB truth against memory step/lot
-    4. FIX 4: WAITING_FOR_FILL loop no longer calls find_latest_closed_pair()
-               — only checks TRADE_COMPLETED flag set inside
-               check_position_and_detect_closure(). This prevents a second
-               call to _apply_step_progression() for the same trade.
-    5. FIX 5: On startup with no open position, ALWAYS reset to Step 1.
-    6. FIX 6: fresh_start flag prevents load_bot_state_from_db() from
-               overwriting the Step 1 reset on the very first PRE-ORDER DB CHECK.
-    7. FIX 7: BOT_STATE['last_placed_order_id'] is set immediately after
-               every successful order placement.
-    8. FIX 8: BOT_STATE['order_completed'] MUST be True before:
-               - load_bot_state_from_db()
-               - verify_and_sync_step_from_db()
-               - place_order_with_bracket()
-               If False, the loop blocks with a clear log message until the
-               current order's pair+save+state sequence completes and
-               _mark_order_complete() is called by check_position_and_detect_closure().
-    9. FIX 9: After order placement, the position confirmation block
-               now performs one authoritative final REST check when the
-               fast-poll loop times out. This ensures LAST_POSITION_STATE
-               reflects reality before check_position_and_detect_closure()
-               runs. If the position has ALREADY closed by the time we check
-               (micro-close), LAST_POSITION_STATE stays at 0 — but Step 4
-               (dead reckoning) in check_position_and_detect_closure()
-               handles that case via direct fill lookup.
-    10. FIX 10 (DUPLICATE TRADE FIX): PROCESSED_ORDER_IDS set prevents any
-               entry order_id from being processed more than once across ALL
-               detection paths (WS, REST, dead reckoning). Combined with
-               entry_order_id stored in DB with UNIQUE KEY constraint.
+    STARTUP LOGIC (THE FIX):
+    ════════════════════════
+    No position on startup  → ALWAYS Step 1. Period. DB ignored.
+                              (DB state is from PREVIOUS session, irrelevant now)
+    Position already open   → Use the step that matches live lot size.
+                              After position closes, load DB state for next step.
+
+    WHY: When no position is open, the bot needs to start fresh at Step 1.
+    The DB state saved is the NEXT step AFTER the last trade — which is only
+    relevant if the bot crashes MID-TRADE and restarts with a live position.
+    If no live position exists, that DB state is stale and must be ignored.
+    The bot loop itself will load/sync DB before each subsequent order.
     """
     global LAST_CLOSE_TIMESTAMP
-
-    # ------------------------------------------------------------------
-    # FIX 6: fresh_start flag - True means "we decided Step 1 at startup,
-    # do NOT let load_bot_state_from_db() override it before first order"
-    # ------------------------------------------------------------------
-    fresh_start = False
 
     print("🤖 Auto Trading Bot Started (OPTIMIZED - DB VERIFIED - ORDER COMPLETION GUARDED)")
 
@@ -1799,29 +1583,25 @@ def auto_trading_bot_main():
     if product_id:
         current_pos = check_position_realtime(product_id)
         if abs(current_pos.get('size', 0)) > 0.001:
+            # ─────────────────────────────────────────────────────────────
+            # EXISTING POSITION FOUND
+            # Use live lot to determine step. DB state used for NEXT step
+            # after this position closes (normal DB load path handles it).
+            # ─────────────────────────────────────────────────────────────
             print(f"🚨 EXISTING POSITION FOUND: {current_pos.get('size', 0)} lots")
             print(f"📊 Entry Price: {current_pos.get('entry_price', 0)}")
 
             current_lot   = abs(current_pos.get('size', 0))
             detected_step = detect_current_step_from_lot(current_lot)
 
-            if BOT_STATE['current_step'] != detected_step:
-                print(f"🔄 Syncing: DB step={BOT_STATE['current_step']} → Live step={detected_step}")
-                BOT_STATE['current_step'] = detected_step
-                BOT_STATE['current_lot']  = current_lot
-            else:
-                print(f"✅ DB step matches live position ({detected_step}), no sync needed")
+            BOT_STATE['current_step'] = detected_step
+            BOT_STATE['current_lot']  = current_lot
+            print(f"✅ Step set from live position: Step={detected_step}, Lot={current_lot}")
 
             LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
             LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
             LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
 
-            # An existing live position means there IS a pending order from
-            # a previous session. We don't have the order ID, so we set
-            # order_completed=False to force proper closure detection before
-            # the next order. check_position_and_detect_closure() will handle
-            # the fill matching and call _mark_order_complete() when done.
-            # We use a sentinel order_id of 'RESUMED' for logging clarity.
             BOT_STATE['last_placed_order_id'] = 'RESUMED'
             BOT_STATE['order_completed']      = False
             log_system(f"TRACKING ORDER: RESUMED (existing position, step={detected_step}, lot={current_lot})")
@@ -1836,22 +1616,29 @@ def auto_trading_bot_main():
                 return
 
             print("✅ Existing position closed, continuing...")
-            # Existing position was found and closed - DB sequence continues
-            # fresh_start remains False, load_bot_state_from_db() will run normally
+            # Position closed — from here the normal bot loop will call
+            # load_bot_state_from_db() + verify_and_sync_step_from_db()
+            # before placing the next order. That is correct behaviour.
+
         else:
-            # -----------------------------------------------------------------
-            # FIX 5 + FIX 6: No existing live position on startup
-            # → ALWAYS reset to Step 1
-            # → Set fresh_start = True so the PRE-ORDER DB CHECK in the main
-            #    loop does NOT call load_bot_state_from_db() and undo this reset
-            # -----------------------------------------------------------------
-            print("✅ No existing position found...")
-            print(f"   ✅ Fresh start - Step 1")
+            # ─────────────────────────────────────────────────────────────
+            # NO EXISTING POSITION — ALWAYS START FRESH AT STEP 1
+            #
+            # The DB may have a saved state (e.g. Step 3 from last session)
+            # but that state is the next step IF the last trade was a loss.
+            # Since there is no live position, we have no idea whether the
+            # last trade PnL was already accounted for or not. The safest
+            # and correct behaviour is: fresh start = Step 1.
+            #
+            # The bot loop will load DB + sync BEFORE every new order, so
+            # after the first trade result the correct step will be applied.
+            # ─────────────────────────────────────────────────────────────
+            print("✅ No existing position found — FRESH START at Step 1")
             BOT_STATE['current_step']         = 1
             BOT_STATE['current_lot']          = LOT_STEPS[1]
-            BOT_STATE['order_completed']      = True   # No pending order
+            BOT_STATE['order_completed']      = True
             BOT_STATE['last_placed_order_id'] = None
-            fresh_start = True  # FIX 6: protect Step 1 from DB overwrite
+            log_system("No position on startup → Step 1 (fresh start, DB state ignored for first order)")
 
     while BOT_STATE['running']:
         try:
@@ -1864,29 +1651,17 @@ def auto_trading_bot_main():
             global WAITING_FOR_FILL, TRADE_COMPLETED
 
             # =====================================================================
-            # FIX 8: ORDER COMPLETION GUARD
-            # If the current order is not yet fully processed (pair not found,
-            # trade not saved, or state not saved), we MUST NOT proceed to DB load,
-            # DB sync, or new order placement.
-            #
-            # check_position_and_detect_closure() runs below and will detect the
-            # position close, find fills, save trade, save state, and finally call
-            # _mark_order_complete() which sets order_completed=True.
-            #
-            # We allow check_position_and_detect_closure() to run on every loop
-            # iteration so it can detect the closure. But we skip the DB load,
-            # DB sync, and order placement sections entirely until order_completed.
+            # ORDER COMPLETION GUARD
+            # If the current order is not yet fully processed, block until done.
             # =====================================================================
             if not BOT_STATE['order_completed']:
                 pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
                 log_system(f"BLOCKING NEXT ORDER - CURRENT ORDER NOT FINISHED: {pending_order_id}")
 
-                # Run closure detection so we can detect the close and process fills
                 has_position, was_closed, pnl = check_position_and_detect_closure()
 
                 if was_closed:
                     print(f"🎯 Position closed during order-guard wait! PnL: {pnl}")
-                    # order_completed is now True (set by _mark_order_complete inside closure detection)
                     if pnl > 0 and BOT_STATE['stop_at_win']:
                         print(f"🏆 PROFIT - STOP AT WIN ACTIVATED!")
                         BOT_STATE['running']     = False
@@ -1902,20 +1677,11 @@ def auto_trading_bot_main():
                     time.sleep(0.5)
                     continue
                 else:
-                    # No position and not closed in this cycle - still waiting for fills
                     if not BOT_STATE['order_completed']:
                         print(f"⏳ Order guard: waiting for fill processing to complete for order {pending_order_id}...")
                         time.sleep(0.5)
                         continue
-                # If order is now complete, fall through to normal loop logic below
 
-            # =====================================================================
-            # FIX 4: WAITING_FOR_FILL loop - do NOT call find_latest_closed_pair()
-            # here. Step progression is already done inside
-            # check_position_and_detect_closure(). Calling find_latest_closed_pair()
-            # again here was causing a second closure detection and double
-            # _apply_step_progression() call on the same trade.
-            # =====================================================================
             if WAITING_FOR_FILL:
                 if TRADE_COMPLETED:
                     WAITING_FOR_FILL = False
@@ -1960,9 +1726,7 @@ def auto_trading_bot_main():
                 BOT_STATE['running'] = False
                 continue
 
-            # -----------------------------------------------------------------
-            # FIX 2: COOLDOWN CHECK
-            # -----------------------------------------------------------------
+            # COOLDOWN CHECK
             elapsed = time.time() - LAST_CLOSE_TIMESTAMP
             if elapsed < COOLDOWN_SECONDS and LAST_CLOSE_TIMESTAMP > 0:
                 remaining = COOLDOWN_SECONDS - elapsed
@@ -1970,13 +1734,17 @@ def auto_trading_bot_main():
                 time.sleep(remaining)
                 continue
 
-            # -----------------------------------------------------------------
-            # FIX 3 + FIX 6 + FIX 8: DB VERIFICATION BEFORE EVERY ORDER
-            #
-            # GUARD: order_completed MUST be True here. If it is False for any
-            # reason (race condition), block immediately with a log message.
-            # This is the absolute last line of defense before order placement.
-            # -----------------------------------------------------------------
+            # ─────────────────────────────────────────────────────────────
+            # PRE-ORDER DB CHECK
+            # order_completed is True here (guarded above).
+            # ALWAYS load DB state before placing a new order so the step
+            # is correct after any trade result.
+            # Exception: first order after fresh startup (no position found)
+            # uses Step 1 set above — but we still call load+sync to let DB
+            # confirm. If DB has no state or says Step 1, no change. If DB
+            # says a different step (impossible on fresh start but defensive),
+            # we keep Step 1 because fresh_no_position was set.
+            # ─────────────────────────────────────────────────────────────
             if not BOT_STATE['order_completed']:
                 pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
                 log_error(f"DB SYNC BLOCKED - CURRENT ORDER NOT FINISHED: {pending_order_id}")
@@ -1985,19 +1753,21 @@ def auto_trading_bot_main():
 
             print(f"\n🔍 [PRE-ORDER DB CHECK] Loading latest state from database...")
 
-            if fresh_start:
-                print(f"   ⚡ Fresh start session - skipping DB load to protect Step 1 reset")
-                print(f"   ✅ DB Step: {BOT_STATE['current_step']} (startup override)")
-                print(f"   ✅ DB Lot : {BOT_STATE['current_lot']} (startup override)")
-                fresh_start = False  # FIX 6: only skip once, normal DB sync from next trade onwards
+            # ── THE KEY FIX ──────────────────────────────────────────────
+            # Only load DB state if this is NOT the very first order of a
+            # fresh-start session (no position on boot).
+            # BOT_STATE['_fresh_no_position'] is set once on startup when
+            # no position is found, and cleared after the first order.
+            # ─────────────────────────────────────────────────────────────
+            if BOT_STATE.get('_fresh_no_position'):
+                # First order of fresh session — stay at Step 1, skip DB load
+                print(f"   ⚡ Fresh start (no position on boot) — keeping Step 1, skipping DB load")
+                print(f"   ✅ Step: {BOT_STATE['current_step']} | Lot: {BOT_STATE['current_lot']}")
+                BOT_STATE.pop('_fresh_no_position', None)  # Clear flag — normal DB sync from next trade onwards
             else:
-                # ALWAYS trust DB before every new order (normal path)
-                # order_completed is True here (checked above), safe to load
+                # Normal path — always trust DB before every new order
                 load_bot_state_from_db()
-
-                # Optional verification
                 verify_and_sync_step_from_db()
-
                 print(f"   ✅ DB Step: {BOT_STATE['current_step']}")
                 print(f"   ✅ DB Lot : {BOT_STATE['current_lot']}")
 
@@ -2031,10 +1801,7 @@ def auto_trading_bot_main():
                     LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
                     continue
 
-            # -----------------------------------------------------------------
-            # FIX 8: Final guard before order - if order_completed is False for
-            # any reason at this exact point, abort this cycle.
-            # -----------------------------------------------------------------
+            # Final guard before order
             if not BOT_STATE['order_completed']:
                 pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
                 log_error(f"BLOCKING NEXT ORDER - CURRENT ORDER NOT FINISHED: {pending_order_id} (pre-placement final guard)")
@@ -2043,10 +1810,8 @@ def auto_trading_bot_main():
 
             print(f"🎯 PLACING ORDER: {side.upper()} {next_lot} lots")
 
-            # Mark order as pending BEFORE placing, so if placement partially
-            # succeeds but response parsing fails, we don't lose track.
             BOT_STATE['order_completed']      = False
-            BOT_STATE['last_placed_order_id'] = None  # Will be set after success
+            BOT_STATE['last_placed_order_id'] = None
 
             order_response = place_order_with_bracket(
                 BOT_STATE['symbol'],
@@ -2062,26 +1827,14 @@ def auto_trading_bot_main():
                 log_trade(f"ORDER PLACED | {side.upper()} | Lot={next_lot} | OrderID={placed_order_id}")
                 log_trade(f"TRACKING ORDER: {placed_order_id}")
 
-                # ---------------------------------------------------------
-                # FIX 7 + FIX 8: Save exact order ID so find_trade_by_order_id()
-                # matches ONLY this order. order_completed stays False until
-                # _mark_order_complete() is called after pair+save+state.
-                # ---------------------------------------------------------
                 BOT_STATE['last_placed_order_id'] = placed_order_id
                 print(f"   🎯 Tracking order ID: {placed_order_id}")
 
-                # ---------------------------------------------------------
-                # FIX 9: POSITION CONFIRMATION BLOCK
-                #
-                # Fast-poll for up to 2 seconds to confirm the position
-                # opened. If found: update LAST_POSITION_STATE normally.
-                # If NOT found after timeout: perform ONE final authoritative
-                # REST check to determine the true state.
-                # ---------------------------------------------------------
+                # POSITION CONFIRMATION BLOCK
                 print("⚡ Confirming position...")
-                max_wait_time    = 2
-                wait_start       = time.time()
-                position_found   = False
+                max_wait_time  = 2
+                wait_start     = time.time()
+                position_found = False
 
                 while time.time() - wait_start < max_wait_time:
                     time.sleep(0.05)
@@ -2096,31 +1849,24 @@ def auto_trading_bot_main():
                         break
 
                 if not position_found:
-                    # Fast-poll timed out. Do ONE final authoritative check.
                     print("⚠️ Position not confirmed in fast-poll — doing final authoritative check...")
                     final_pos = check_position_realtime(product_id)
 
                     if final_pos.get('error'):
-                        # API failure — cannot determine state, skip update
                         print("⚠️ API error on final position check — skipping state update")
                     elif abs(final_pos.get('size', 0)) > 0.001:
-                        # Position IS open (just slow to appear)
                         print(f"✅ Final check: position confirmed {final_pos.get('size', 0)} lots")
                         LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
                         LAST_POSITION_STATE['size']        = final_pos.get('size', 0)
                         LAST_POSITION_STATE['entry_price'] = final_pos.get('entry_price', 0)
                         BOT_STATE['current_lot']           = abs(final_pos.get('size', 0))
                     else:
-                        # Position NOT found — possible micro-close.
-                        # LAST_POSITION_STATE stays at size=0.
-                        # Step 4 (dead reckoning) handles this via fill lookup.
                         print(f"ℹ️ Final check: no position found for order {placed_order_id}")
                         print(f"ℹ️ Possible micro-close — dead reckoning will detect via fills")
 
             else:
                 print("❌ Order failed!")
                 print(f"📋 Response: {order_response}")
-                # Reset order_completed to True since no order was actually placed
                 BOT_STATE['order_completed']      = True
                 BOT_STATE['last_placed_order_id'] = None
                 time.sleep(0.5)
@@ -2139,11 +1885,7 @@ def auto_trading_bot_main():
 # ========== TRADE COMPLETION MANAGEMENT ==========
 
 def wait_for_complete_trade(symbol, max_wait=15):
-    """
-    Wait up to max_wait seconds for a complete entry+exit pair.
-    Uses the optimised find_trade_by_order_id which fetches only 5 fills.
-    Called AFTER the 10-second post-closure sleep.
-    """
+    """Wait up to max_wait seconds for a complete entry+exit pair."""
     target_order_id = BOT_STATE.get('last_placed_order_id')
     if not target_order_id:
         log_error("wait_for_complete_trade: no last_placed_order_id set")
@@ -2161,10 +1903,7 @@ def wait_for_complete_trade(symbol, max_wait=15):
 
 
 def get_trade_with_retry(symbol, retries=5):
-    """
-    Get trade data with retry logic using only 5 fills per attempt.
-    Delegates to wait_for_trade_fills.
-    """
+    """Get trade data with retry logic."""
     target_order_id = BOT_STATE.get('last_placed_order_id')
     return wait_for_trade_fills(symbol, target_order_id, max_retries=retries, retry_delay=2)
 
@@ -2181,20 +1920,11 @@ def get_entry_exit_from_fills():
     return entry_exit_data
 
 
-# =====================================================================
-# _apply_step_progression
-#
-# WIN  (pnl > 0) → reset to Step 1 (lot = 1)
-# LOSS (pnl <= 0) → advance one step; if beyond max, reset to Step 1
-#
-# This is called immediately when a trade closes (before next order).
-# After calling this, save_bot_state_to_db() is called to persist.
-# Then verify_and_sync_step_from_db() cross-checks before each order.
-# =====================================================================
 def _apply_step_progression(pnl):
     """
     Apply martingale step progression immediately when trade result is known.
-    Called right after fill detection - BEFORE next trade is placed.
+    WIN  → reset to Step 1
+    LOSS → advance one step; if beyond max, reset to Step 1
     """
     global BOT_STATE
 
@@ -2205,17 +1935,14 @@ def _apply_step_progression(pnl):
     log_trade(f"POSITION CLOSED | PnL={pnl:.5f} | Result={result_type}")
 
     if pnl > 0:
-        # WIN → Reset to Step 1
         next_step = 1
         next_lot  = LOT_STEPS[next_step]
         BOT_STATE['current_step'] = next_step
         BOT_STATE['current_lot']  = next_lot
         log_state(f"STEP UPDATED | WIN → Step {next_step} | LOT UPDATED | Lot={next_lot}")
     else:
-        # LOSS → Advance to next step
         next_step = current_step + 1
         if next_step > BOT_STATE['max_steps']:
-            # Max step reached → reset to Step 1
             next_step = 1
             next_lot  = LOT_STEPS[next_step]
             BOT_STATE['current_step'] = next_step
@@ -2231,23 +1958,21 @@ def _apply_step_progression(pnl):
 
 
 # ========== WEBSOCKET FILL ENGINE (GLOBAL STATE) ==========
-# These globals are shared between the WS thread and the main bot thread.
 
-WS_FILL_QUEUE          = []          # Raw fill messages pushed by WS on_message
+WS_FILL_QUEUE          = []
 WS_FILL_QUEUE_LOCK     = Lock()
 
-WS_POSITION_QUEUE      = []          # Raw position messages pushed by WS on_message
+WS_POSITION_QUEUE      = []
 WS_POSITION_QUEUE_LOCK = Lock()
 
-WS_APP             = None        # The websocket.WebSocketApp instance
-WS_THREAD          = None        # The daemon thread running ws.run_forever()
-WS_AUTHENTICATED   = False       # Set True after "Authenticated" message received
-WS_RUNNING         = False       # Set False to stop the WS reconnect loop
-WS_RECONNECT_DELAY = 3           # Seconds between reconnect attempts
+WS_APP             = None
+WS_THREAD          = None
+WS_AUTHENTICATED   = False
+WS_RUNNING         = False
+WS_RECONNECT_DELAY = 3
 
 
 def _ws_generate_signature(secret, message):
-    """Generate HMAC-SHA256 signature for WebSocket auth (same algo as REST)"""
     return hmac.new(
         secret.encode('utf-8'),
         message.encode('utf-8'),
@@ -2256,7 +1981,6 @@ def _ws_generate_signature(secret, message):
 
 
 def _ws_send_auth(ws):
-    """Send authentication payload over WebSocket"""
     method    = 'GET'
     timestamp = str(int(time.time()))
     path      = '/live'
@@ -2276,7 +2000,6 @@ def _ws_send_auth(ws):
 
 
 def _ws_subscribe(ws, channel, symbols):
-    """Subscribe to a private channel after authentication"""
     sub_msg = {
         "type": "subscribe",
         "payload": {
@@ -2298,37 +2021,22 @@ def _ws_on_open(ws):
 
 
 def _ws_on_message(ws, message):
-    """
-    Handle all incoming WebSocket messages.
-
-    - On 'Authenticated': subscribe to v2/user_trades and positions
-    - On 'v2/user_trades': push fill into WS_FILL_QUEUE
-    - On 'positions': push position update into WS_POSITION_QUEUE
-    """
     global WS_AUTHENTICATED
 
     try:
         msg      = json.loads(message)
         msg_type = msg.get('type', '')
 
-        # ── Authentication success ──────────────────────────────────────────
         if msg_type == 'success' and msg.get('message') == 'Authenticated':
             WS_AUTHENTICATED = True
             print("[WS] Authenticated successfully")
 
             symbol = BOT_STATE.get('symbol', 'ETHUSD')
-
-            # v2/user_trades is faster than user_trades and has no commission data
-            # but gives us fill_id, order_id, side, size, price instantly
             _ws_subscribe(ws, 'v2/user_trades', [symbol])
             _ws_subscribe(ws, 'positions',      [symbol])
             return
 
-        # ── Fill update (v2/user_trades) ────────────────────────────────────
         if msg_type == 'v2/user_trades':
-            # v2/user_trades payload fields:
-            #   sy=symbol, f=fill_id, o=order_id, S=side,
-            #   s=size, p=price, po=position_after_fill, t=timestamp_us
             fill = {
                 'fill_id':             msg.get('f'),
                 'order_id':            str(msg.get('o', '')),
@@ -2349,11 +2057,9 @@ def _ws_on_message(ws, message):
                   f"| order_id={fill['order_id']}")
             return
 
-        # ── Position update ─────────────────────────────────────────────────
         if msg_type == 'positions':
             action = msg.get('action', '')
 
-            # Snapshot comes as result list; incremental comes as flat fields
             if action == 'snapshot':
                 for pos in msg.get('result', []):
                     sym = pos.get('product_symbol') or pos.get('symbol', '')
@@ -2400,11 +2106,6 @@ def _ws_on_close(ws, close_status_code, close_msg):
 
 
 def _ws_reconnect_loop():
-    """
-    Persistent WebSocket loop with auto-reconnect.
-    Runs in a daemon thread. Reconnects every WS_RECONNECT_DELAY seconds
-    if the connection drops.
-    """
     global WS_APP, WS_RUNNING, WS_AUTHENTICATED
 
     print("[WS] Reconnect loop started")
@@ -2422,8 +2123,6 @@ def _ws_reconnect_loop():
                 on_close   = _ws_on_close
             )
 
-            # run_forever blocks until connection drops
-            # ping_interval keeps the connection alive (Delta may drop idle sockets)
             WS_APP.run_forever(ping_interval=20, ping_timeout=10)
 
         except Exception as e:
@@ -2437,10 +2136,6 @@ def _ws_reconnect_loop():
 
 
 def start_websocket_engine():
-    """
-    Start the WebSocket engine in a background daemon thread.
-    Call this once when the bot starts (inside start_auto_trading_bot).
-    """
     global WS_THREAD, WS_RUNNING
 
     if WS_RUNNING and WS_THREAD and WS_THREAD.is_alive():
@@ -2454,10 +2149,6 @@ def start_websocket_engine():
 
 
 def stop_websocket_engine():
-    """
-    Stop the WebSocket engine cleanly.
-    Call this inside stop_auto_trading_bot.
-    """
     global WS_RUNNING, WS_APP, WS_AUTHENTICATED
 
     WS_RUNNING       = False
@@ -2474,13 +2165,8 @@ def stop_websocket_engine():
 
 
 def _drain_ws_fill_queue(symbol):
-    """
-    Drain all pending fills from WS_FILL_QUEUE for the given symbol.
-    Returns list of fill dicts sorted oldest-first by timestamp_us.
-    """
     with WS_FILL_QUEUE_LOCK:
         symbol_fills = [f for f in WS_FILL_QUEUE if f.get('symbol') == symbol]
-        # Keep fills for other symbols in the queue
         WS_FILL_QUEUE[:] = [f for f in WS_FILL_QUEUE if f.get('symbol') != symbol]
 
     symbol_fills.sort(key=lambda x: x.get('timestamp_us', 0))
@@ -2488,51 +2174,31 @@ def _drain_ws_fill_queue(symbol):
 
 
 def _drain_ws_position_queue(symbol):
-    """
-    Drain all pending position updates from WS_POSITION_QUEUE for the given symbol.
-    Returns the LATEST position update (highest timestamp / last in list).
-    """
     with WS_POSITION_QUEUE_LOCK:
         symbol_pos = [p for p in WS_POSITION_QUEUE if p.get('symbol') == symbol]
         WS_POSITION_QUEUE[:] = [p for p in WS_POSITION_QUEUE if p.get('symbol') != symbol]
 
     if not symbol_pos:
         return None
-    # Return the most recent one
     return symbol_pos[-1]
 
 
 def _pair_ws_fills(fills, symbol):
     """
     Pair WS fills into entry+exit trades.
-    Groups by order_id (handles split fills), then pairs opposite-side orders.
     Only processes fills related to BOT_STATE['last_placed_order_id'].
-
-    DUPLICATE FIX: Checks PROCESSED_ORDER_IDS at the very start, and marks
-    the entry order_id in PROCESSED_ORDER_IDS atomically before returning a
-    completed trade. This ensures the WS path and the REST/dead-reckoning
-    path cannot both process the same entry order.
-
-    Returns list of completed trade dicts:
-    {
-        'side', 'entry_price', 'exit_price', 'quantity',
-        'entry_time', 'exit_time', 'pnl',
-        'entry_order_id', 'exit_order_id'
-    }
     """
     if not fills:
         return []
 
     target_order_id = str(BOT_STATE.get('last_placed_order_id', ''))
 
-    # ── DUPLICATE CHECK: if target order is already processed, skip all WS work
     if target_order_id and target_order_id != 'RESUMED':
         with PROCESSED_ORDER_IDS_LOCK:
             if target_order_id in PROCESSED_ORDER_IDS:
                 log_trade(f"WS PAIR SKIPPED | order {target_order_id} already in PROCESSED_ORDER_IDS")
                 return []
 
-    # Group fills by order_id
     order_groups = {}
     for fill in fills:
         oid   = fill['order_id']
@@ -2565,7 +2231,6 @@ def _pair_ws_fills(fills, symbol):
 
     sorted_orders = sorted(order_groups.values(), key=lambda x: x['timestamp_us'])
 
-    # If we have a target order ID, only pair fills involving that order
     if target_order_id and target_order_id != 'RESUMED':
         entry_order = order_groups.get(target_order_id)
         if not entry_order:
@@ -2611,8 +2276,6 @@ def _pair_ws_fills(fills, symbol):
         log_trade(f"PNL CALCULATED | {entry_side.upper()} | Entry={entry_price:.6f} | Exit={exit_price:.6f} | PnL={pnl:.6f}")
         log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
 
-        # ── ATOMIC MARK: add to PROCESSED_ORDER_IDS and USED_FILL_IDS before
-        # returning, so no second path can re-pair this order ────────────────
         with PROCESSED_ORDER_IDS_LOCK:
             PROCESSED_ORDER_IDS.add(target_order_id)
 
@@ -2632,7 +2295,7 @@ def _pair_ws_fills(fills, symbol):
             'exit_order_id':  exit_order['order_id']
         }]
 
-    # Fallback: no target order ID - pair all (FIFO, same as before)
+    # Fallback: no target order ID - pair all (FIFO)
     completed_trades = []
     pending_entries  = []
 
@@ -2647,7 +2310,6 @@ def _pair_ws_fills(fills, symbol):
             entry_order = pending_entries.pop()
             exit_order  = order
 
-            # Skip if already processed
             with PROCESSED_ORDER_IDS_LOCK:
                 if entry_order['order_id'] in PROCESSED_ORDER_IDS:
                     continue
@@ -2702,47 +2364,23 @@ def check_position_and_detect_closure():
     Hybrid WebSocket + REST polling + Dead-Reckoning position tracker.
 
     Detection priority:
-      1. WebSocket v2/user_trades fills  → catches micro-second open+close trades
-      2. WebSocket positions channel     → catches close even if fills are delayed.
-      3. REST polling fallback           → safety net if WS is disconnected.
-      4. DEAD RECKONING                  → when order_completed=False, no position
-                                           found anywhere, but fills exist on exchange.
-                                           This handles the "position timeout" case
-                                           where LAST_POSITION_STATE['size'] stayed 0.
-
-    DUPLICATE FIX: Every closure path now passes entry_order_id through to
-    save_closed_position(). Combined with PROCESSED_ORDER_IDS checks in
-    find_trade_by_order_id() and _pair_ws_fills(), and the DB UNIQUE KEY on
-    entry_order_id, it is impossible for the same trade to be processed twice.
-
-    On close detected:
-      1. Record LAST_CLOSE_TIMESTAMP (FIX 2: cooldown)
-      2. Immediately zero out LAST_POSITION_STATE size (prevents double-detection)
-      3. Wait exactly 10 seconds for fills to propagate (REST/WS-POS paths only)
-      4. Fetch only the 5 most recent fills (never 100)
-      5. Match entry+exit using BOT_STATE['last_placed_order_id']
-      6. Retry up to 5 times with 2-second gaps if fill not found
-      7. Apply step progression
-      8. Save to DB and verify
-      9. Call _mark_order_complete() so bot loop unblocks
+      1. WebSocket v2/user_trades fills
+      2. WebSocket positions channel
+      3. REST polling fallback
+      4. DEAD RECKONING
     """
-    # ── ALL global declarations at the very top ──────────────────────────────
     global LAST_POSITION_STATE, LAST_CLOSE_TIMESTAMP
     global WAITING_FOR_FILL, TRADE_COMPLETED, CURRENT_SIGNAL
-    # ────────────────────────────────────────────────────────────────────────
 
     try:
         symbol = BOT_STATE['symbol']
 
-        # ──────────────────────────────────────────────────────────────────
         # STEP 1: Drain WebSocket fill queue
-        # ──────────────────────────────────────────────────────────────────
         ws_fills = _drain_ws_fill_queue(symbol)
 
         if ws_fills:
             print(f"[WS] {len(ws_fills)} new fill(s) drained from WS queue")
 
-            # Filter out already-used fill order_ids
             with USED_FILL_IDS_LOCK:
                 fresh_fills = [
                     f for f in ws_fills
@@ -2753,14 +2391,12 @@ def check_position_and_detect_closure():
                 completed_trades = _pair_ws_fills(fresh_fills, symbol)
 
                 if completed_trades:
-                    # Process ALL completed trades found in this batch
                     for trade in completed_trades:
                         print(f"[WS] Processing WS-detected trade: "
                               f"{trade['side'].upper()} PnL={trade['pnl']:.6f}")
 
                         completed_order_id = trade.get('entry_order_id', BOT_STATE.get('last_placed_order_id'))
 
-                        # Record close timestamp and zero position state
                         LAST_CLOSE_TIMESTAMP               = time.time()
                         prev_size                          = LAST_POSITION_STATE['size']
                         LAST_POSITION_STATE['size']        = 0
@@ -2778,7 +2414,6 @@ def check_position_and_detect_closure():
                             'exit_order_id':  trade.get('exit_order_id')
                         }
 
-                        # Update memory
                         LAST_TRADE_RESULT['profit_loss'] = pnl
                         LAST_TRADE_RESULT['timestamp']   = datetime.now().isoformat()
                         LAST_TRADE_RESULT['lot_used']    = trade['quantity']
@@ -2787,14 +2422,11 @@ def check_position_and_detect_closure():
                         BOT_STATE['last_result'] = 'PROFIT' if pnl > 0 else 'LOSS'
                         BOT_STATE['last_pnl']    = pnl
 
-                        # Apply step progression
                         _apply_step_progression(pnl)
 
-                        # Save state
                         save_bot_state_to_db()
                         log_state(f"STATE SAVED FOR ORDER: {completed_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
-                        # Save trade to DB — pass entry_order_id for dedup
                         save_closed_position({
                             'symbol':          symbol,
                             'side':            entry_exit_data['side'],
@@ -2819,10 +2451,8 @@ def check_position_and_detect_closure():
                         TRADE_COMPLETED  = True
                         log_system("Trade paired (WS)")
 
-                        # FIX 8: Mark order complete so bot loop unblocks
                         _mark_order_complete(completed_order_id)
 
-                    # After processing all WS trades, sync position state
                     ws_pos = _drain_ws_position_queue(symbol)
                     if ws_pos:
                         LAST_POSITION_STATE = {
@@ -2845,9 +2475,7 @@ def check_position_and_detect_closure():
 
                     return has_position, True, completed_trades[-1]['pnl']
 
-        # ──────────────────────────────────────────────────────────────────
         # STEP 2: Check WebSocket position queue for closure signal
-        # ──────────────────────────────────────────────────────────────────
         ws_pos = _drain_ws_position_queue(symbol)
 
         if ws_pos:
@@ -2856,14 +2484,12 @@ def check_position_and_detect_closure():
 
             prev_size = LAST_POSITION_STATE['size']
 
-            # Update LAST_POSITION_STATE from WS
             LAST_POSITION_STATE = {
                 'symbol':      symbol,
                 'size':        ws_pos['size'],
                 'entry_price': ws_pos['entry_price']
             }
 
-            # Detect closure via WS position channel
             if abs(prev_size) > 0.001 and abs(ws_pos['size']) <= 0.001:
                 log_trade("POSITION CLOSED | Detected via WS positions channel")
 
@@ -2875,7 +2501,6 @@ def check_position_and_detect_closure():
                 target_order_id = BOT_STATE.get('last_placed_order_id')
                 log_trade(f"TRACKING ORDER: {target_order_id}")
 
-                # Wait 10s then fetch only 5 fills
                 print("⏳ Waiting 10 seconds for fills to propagate...")
                 time.sleep(10)
 
@@ -2922,11 +2547,9 @@ def check_position_and_detect_closure():
                     TRADE_COMPLETED  = True
                     log_system("Trade paired (WS-POS)")
 
-                    # FIX 8: Mark order complete so bot loop unblocks
                     _mark_order_complete(target_order_id)
 
                 else:
-                    # Fallback: fills not found after all retries
                     log_error(f"Fills not found after retries for order {target_order_id} - using fallback")
                     pnl = 0
 
@@ -2966,7 +2589,6 @@ def check_position_and_detect_closure():
                     WAITING_FOR_FILL = True
                     TRADE_COMPLETED  = True
 
-                    # FIX 8: Mark order complete even in fallback path
                     _mark_order_complete(target_order_id)
 
                 has_position = abs(ws_pos['size']) > 0.001
@@ -2975,9 +2597,7 @@ def check_position_and_detect_closure():
             has_position = abs(ws_pos['size']) > 0.001
             return has_position, False, 0
 
-        # ──────────────────────────────────────────────────────────────────
         # STEP 3: REST polling fallback
-        # ──────────────────────────────────────────────────────────────────
         product_id = get_product_id(symbol)
         if not product_id:
             return False, False, 0
@@ -3006,7 +2626,6 @@ def check_position_and_detect_closure():
             target_order_id = BOT_STATE.get('last_placed_order_id')
             log_trade(f"TRACKING ORDER: {target_order_id}")
 
-            # Wait 10s then fetch only 5 fills
             print("⏳ Waiting 10 seconds for fills to propagate...")
             time.sleep(10)
 
@@ -3051,7 +2670,6 @@ def check_position_and_detect_closure():
                 TRADE_COMPLETED = True
                 log_system("Trade paired (REST)")
 
-                # FIX 8: Mark order complete so bot loop unblocks
                 _mark_order_complete(target_order_id)
 
             else:
@@ -3091,15 +2709,9 @@ def check_position_and_detect_closure():
                 log_trade(f"TRADE SAVED FOR ORDER: {target_order_id} (fallback)")
                 TRADE_COMPLETED = True
 
-                # FIX 8: Mark order complete even in fallback path
                 _mark_order_complete(target_order_id)
 
-        # ──────────────────────────────────────────────────────────────────
         # STEP 4: DEAD RECKONING
-        # Handles the case where position confirmation timed out after order
-        # placement, leaving LAST_POSITION_STATE['size']=0, so Step 3's
-        # closure check can never fire (requires prev size > 0).
-        # ──────────────────────────────────────────────────────────────────
         if (not was_closed
                 and not BOT_STATE['order_completed']
                 and BOT_STATE.get('last_placed_order_id')
@@ -3111,7 +2723,6 @@ def check_position_and_detect_closure():
             log_trade(f"DEAD RECKONING CHECK | No position found but order pending: {target_order_id}")
             log_trade(f"TRACKING ORDER: {target_order_id}")
 
-            # Attempt fill lookup immediately — no pre-sleep
             pnl, entry_exit_data = wait_for_trade_fills(
                 symbol, target_order_id, max_retries=5, retry_delay=2
             )
@@ -3166,9 +2777,7 @@ def check_position_and_detect_closure():
 
             log_trade(f"DEAD RECKONING: fills not found yet for order {target_order_id} - will retry next cycle")
 
-        # ──────────────────────────────────────────────────────────────────
         # Normal path: update position state from REST and return
-        # ──────────────────────────────────────────────────────────────────
         LAST_POSITION_STATE = {
             'symbol':      symbol,
             'size':        current_pos.get('size', 0),
@@ -3208,6 +2817,7 @@ def get_trading_signal():
     except Exception as e:
         log_error(f"Getting signal: {e}")
         return None, None
+
 
 def start_signal_bot():
     """Start the signal bot"""
@@ -3270,7 +2880,6 @@ def calculate_next_lot():
 
     LOT_CALCULATION_LOCK = True
     try:
-        # Verify lot matches step
         expected_lot = LOT_STEPS.get(BOT_STATE['current_step'], LOT_STEPS[1])
         if BOT_STATE['current_lot'] != expected_lot:
             BOT_STATE['current_lot'] = expected_lot
@@ -3287,8 +2896,8 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
         PRODUCT_CONFIG = {
             "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},
             "BTCUSD": {"id": 84,    "tick": Decimal("0.5")},
-            "ETHUSD": {"id": 3136,  "tick": Decimal("0.05")},
-            # "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
+            # "ETHUSD": {"id": 3136,  "tick": Decimal("0.05")},
+            "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
         }
 
         config = PRODUCT_CONFIG.get(symbol)
@@ -3410,7 +3019,6 @@ def start_auto_trading_bot():
         'entry_price': 0
     }
 
-    # Reset cooldown on fresh start
     LAST_CLOSE_TIMESTAMP = 0.0
 
     BOT_STATE['stop_at_win']          = False
@@ -3418,7 +3026,7 @@ def start_auto_trading_bot():
     BOT_STATE['force_stop']           = False
     BOT_STATE['session_start_time']   = datetime.now().isoformat()
     BOT_STATE['session_total_pnl']    = 0.0
-    BOT_STATE['order_completed']      = True   # No pending order on fresh start
+    BOT_STATE['order_completed']      = True
     BOT_STATE['last_placed_order_id'] = None
     log_system(f"Session started at {BOT_STATE['session_start_time']}")
 
@@ -3457,7 +3065,6 @@ def clear_stuck_trade_result():
         'processed': False
     }
 
-    # Also reset order completion flag so bot can proceed
     BOT_STATE['order_completed']      = True
     BOT_STATE['last_placed_order_id'] = None
 
@@ -3544,6 +3151,20 @@ def get_system_ip():
 
 @app.route('/api/start-bot', methods=['POST'])
 def start_bot():
+    """
+    Start the bot.
+
+    STARTUP STEP LOGIC:
+    ══════════════════
+    1. Check for live position first.
+    2. If position EXISTS  → use live lot to determine step (DB irrelevant for current step).
+    3. If NO position      → set Step 1 immediately. Do NOT load DB state.
+                             DB state is from previous session and must be ignored.
+                             The bot loop will load+sync DB before EACH subsequent order.
+
+    This guarantees: fresh start always = Step 1.
+    Position open on restart = correct step from live lot.
+    """
     try:
         data = request.get_json()
         if not data:
@@ -3573,9 +3194,9 @@ def start_bot():
         BOT_STATE['max_steps']  = max_steps
         BOT_STATE['symbol']     = symbol.upper()
 
-        log_system("LOADING SAVED BOT STATE FROM DATABASE...")
-        state_loaded = load_bot_state_from_db()
-
+        # ── STEP DETERMINATION ──────────────────────────────────────────
+        # Check live position FIRST, before any DB load.
+        # ────────────────────────────────────────────────────────────────
         log_system("CHECKING FOR EXISTING LIVE POSITION...")
         product_id            = get_product_id(symbol)
         has_existing_position = False
@@ -3583,29 +3204,33 @@ def start_bot():
         if product_id:
             current_pos = check_position_realtime(product_id)
             if abs(current_pos.get('size', 0)) > 0.001:
+                # ── EXISTING POSITION: load DB to get correct NEXT step ──
                 has_existing_position = True
                 current_lot   = abs(current_pos.get('size', 0))
                 detected_step = detect_current_step_from_lot(current_lot)
 
-                if state_loaded and BOT_STATE['current_step'] != detected_step:
-                    log_system(f"Step mismatch: DB={BOT_STATE['current_step']} vs live={detected_step}. Using LIVE.")
-                    BOT_STATE['current_step'] = detected_step
-                    BOT_STATE['current_lot']  = current_lot
-                elif not state_loaded:
-                    BOT_STATE['current_step'] = detected_step
-                    BOT_STATE['current_lot']  = current_lot
+                # Also load DB state so we know the next step after this position closes
+                log_system("EXISTING POSITION FOUND — loading DB state for step continuity...")
+                load_bot_state_from_db()
 
+                # Live position's lot is authoritative for CURRENT step
+                BOT_STATE['current_step'] = detected_step
+                BOT_STATE['current_lot']  = current_lot
                 log_system(f"EXISTING POSITION: {current_lot} lots = Step {detected_step}")
+
             else:
-                if not state_loaded:
-                    BOT_STATE['current_step'] = 1
-                    BOT_STATE['current_lot']  = LOT_STEPS[1]
-                else:
-                    log_system(f"No position - using DB state: Step {BOT_STATE['current_step']}, Lot {BOT_STATE['current_lot']}")
+                # ── NO POSITION: always Step 1, skip DB load entirely ───
+                log_system("No existing position — FRESH START at Step 1 (DB state ignored)")
+                BOT_STATE['current_step']       = 1
+                BOT_STATE['current_lot']        = LOT_STEPS[1]
+                # Signal auto_trading_bot_main to skip first DB load as well
+                BOT_STATE['_fresh_no_position'] = True
         else:
-            if not state_loaded:
-                BOT_STATE['current_step'] = 1
-                BOT_STATE['current_lot']  = LOT_STEPS[1]
+            # Could not get product_id — safe default is Step 1
+            log_system("Could not check position (no product_id) — defaulting to Step 1")
+            BOT_STATE['current_step']       = 1
+            BOT_STATE['current_lot']        = LOT_STEPS[1]
+            BOT_STATE['_fresh_no_position'] = True
 
         log_system(f"BOT STARTING: Step={BOT_STATE['current_step']}, Lot={BOT_STATE['current_lot']}, TP={BOT_STATE['tp_percent']}%, SL={BOT_STATE['sl_percent']}%")
 
@@ -3722,6 +3347,7 @@ def reset_bot_state():
         BOT_STATE['order_completed']      = True
         BOT_STATE['last_placed_order_id'] = None
         BOT_STATE.pop('last_pnl', None)
+        BOT_STATE.pop('_fresh_no_position', None)
 
         LAST_TRADE_RESULT = {
             'profit_loss': None,
@@ -3827,6 +3453,7 @@ def get_logs():
             })
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/wallet-balance', methods=['GET'])
 def wallet_balance():
