@@ -178,9 +178,9 @@ WS_URL ="wss://testnet-socket.india.delta.exchange"
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
-# ---------- LIVE POSITION TP/SL CONFIGURATION ----------
-LIVE_TP_PERCENTAGE = 1.5   # Take Profit %
-LIVE_SL_PERCENTAGE = 0.6  # Stop Loss %
+# # ---------- LIVE POSITION TP/SL CONFIGURATION ----------
+# LIVE_TP_PERCENTAGE = 1.5   # Take Profit %
+# LIVE_SL_PERCENTAGE = 0.6  # Stop Loss %
 
 processing_lock = threading.Lock()
 last_processed = {}
@@ -3537,14 +3537,200 @@ def delete_trades():
         return jsonify({'success': False, 'message': f'Error: {str(e)}'})
 
 
+# # ========== TP/SL GUARDIAN ==========
+# def auto_tp_sl_guardian():
+#     """
+#     🛡️ SAFE TP/SL GUARDIAN
+#     - Runs every 2 seconds
+#     - Edits wrong TP/SL (no deletion)
+#     - Places missing TP/SL immediately
+#     - Uses dynamic tolerance to avoid constant editing
+#     """
+#     while True:
+#         try:
+#             time.sleep(2)
+
+#             positions_response = make_api_request('GET', '/positions/margined')
+#             if not positions_response or not positions_response.get('success'):
+#                 continue
+
+#             active_positions = [
+#                 p for p in positions_response.get('result', [])
+#                 if abs(float(p.get('size', 0))) > 0.0001
+#             ]
+
+#             if not active_positions:
+#                 continue
+
+#             for pos in active_positions:
+#                 try:
+#                     symbol     = pos.get("product_symbol") or pos.get("symbol")
+#                     size       = float(pos.get("size", 0))
+#                     entry      = float(pos.get("entry_price", 0))
+#                     product_id = pos.get("product_id")
+
+#                     if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
+#                         continue
+
+#                     if size > 0:  # LONG
+#                         expected_tp = entry * (1 + LIVE_TP_PERCENTAGE / 100)
+#                         expected_sl = entry * (1 - LIVE_SL_PERCENTAGE / 100)
+#                     else:  # SHORT
+#                         expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
+#                         expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
+
+#                     dynamic_tolerance = entry * 0.0005
+
+#                     orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
+#                     if not orders_response or not orders_response.get('success'):
+#                         continue
+
+#                     orders       = orders_response.get("result", [])
+#                     tp_orders    = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "take_profit_order"]
+#                     sl_orders    = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
+
+#                     tp_valid        = False
+#                     sl_valid        = False
+#                     wrong_tp_orders = []
+#                     wrong_sl_orders = []
+
+#                     for tp_order in tp_orders:
+#                         stop_price = float(tp_order.get("stop_price", 0))
+#                         if abs(stop_price - expected_tp) < dynamic_tolerance:
+#                             tp_valid = True
+#                         else:
+#                             wrong_tp_orders.append(tp_order)
+
+#                     for sl_order in sl_orders:
+#                         stop_price = float(sl_order.get("stop_price", 0))
+#                         if abs(stop_price - expected_sl) < dynamic_tolerance:
+#                             sl_valid = True
+#                         else:
+#                             wrong_sl_orders.append(sl_order)
+
+#                     tp_edited = False
+#                     sl_edited = False
+
+#                     if wrong_tp_orders and not tp_valid:
+#                         for tp_order in wrong_tp_orders:
+#                             order_id     = tp_order.get("id")
+#                             log_system(f"EDITING TP order {order_id}...")
+#                             edit_payload = {
+#                                 "id": order_id,
+#                                 "product_id": int(product_id),
+#                                 "order_type": "market_order",
+#                                 "stop_price": "{:.6f}".format(expected_tp),
+#                                 "size": abs(int(size))
+#                             }
+#                             edit_body = json.dumps(edit_payload)
+#                             try:
+#                                 edit_res = requests.put(
+#                                     BASE_URL + "/v2/orders",
+#                                     headers=sign_request("PUT", "/v2/orders", edit_body),
+#                                     data=edit_body,
+#                                     timeout=10
+#                                 )
+#                                 if edit_res.status_code == 200:
+#                                     log_system(f"TP EDITED")
+#                                     tp_edited = True
+#                                     break
+#                             except:
+#                                 pass
+
+#                     if wrong_sl_orders and not sl_valid:
+#                         for sl_order in wrong_sl_orders:
+#                             order_id     = sl_order.get("id")
+#                             log_system(f"EDITING SL order {order_id}...")
+#                             edit_payload = {
+#                                 "id": order_id,
+#                                 "product_id": int(product_id),
+#                                 "order_type": "market_order",
+#                                 "stop_price": "{:.6f}".format(expected_sl),
+#                                 "size": abs(int(size))
+#                             }
+#                             edit_body = json.dumps(edit_payload)
+#                             try:
+#                                 edit_res = requests.put(
+#                                     BASE_URL + "/v2/orders",
+#                                     headers=sign_request("PUT", "/v2/orders", edit_body),
+#                                     data=edit_body,
+#                                     timeout=10
+#                                 )
+#                                 if edit_res.status_code == 200:
+#                                     log_system(f"SL EDITED")
+#                                     sl_edited = True
+#                                     break
+#                             except:
+#                                 pass
+
+#                     need_tp = not tp_valid and not tp_edited
+#                     need_sl = not sl_valid and not sl_edited
+
+#                     if need_tp or need_sl:
+#                         ticker = make_api_request('GET', f'/tickers/{symbol}')
+#                         if ticker:
+#                             curr_price = float(ticker['result']['close'])
+#                             is_safe    = True
+#                             if size > 0:
+#                                 if expected_tp <= curr_price or expected_sl >= curr_price:
+#                                     is_safe = False
+#                             else:
+#                                 if expected_tp >= curr_price or expected_sl <= curr_price:
+#                                     is_safe = False
+
+#                             if not is_safe:
+#                                 continue
+
+#                         log_system(f"Placing missing TP/SL for {symbol}")
+#                         payload = {
+#                             "product_id": int(product_id),
+#                             "take_profit_order": {
+#                                 "order_type": "market_order",
+#                                 "stop_price": "{:.6f}".format(expected_tp)
+#                             },
+#                             "stop_loss_order": {
+#                                 "order_type": "market_order",
+#                                 "stop_price": "{:.6f}".format(expected_sl)
+#                             }
+#                         }
+#                         body = json.dumps(payload)
+#                         try:
+#                             res = requests.post(
+#                                 BASE_URL + "/v2/orders/bracket",
+#                                 headers=sign_request("POST", "/v2/orders/bracket", body),
+#                                 data=body,
+#                                 timeout=10
+#                             )
+#                             if res.status_code == 200:
+#                                 log_system(f"Bracket placed for {symbol}")
+#                         except:
+#                             pass
+
+#                     time.sleep(0.3)
+
+#                 except Exception as e:
+#                     pass
+
+#         except Exception as e:
+#             time.sleep(2)
+
+
+
+# ========== CONFIG ==========
+LIVE_TP_PERCENTAGE        = 1.3   # Take Profit %
+LIVE_SL_PERCENTAGE        = 0.6    # Stop Loss %
+LIQUIDATION_PROTECTION    = "Y"    # Y/N - Liquidation Protection
+LIQUIDATION_BUFFER        = 0.25   # Distance from liquidation price for protected SL
+
 # ========== TP/SL GUARDIAN ==========
 def auto_tp_sl_guardian():
     """
-    🛡️ SAFE TP/SL GUARDIAN
+    SAFE TP/SL GUARDIAN
     - Runs every 2 seconds
     - Edits wrong TP/SL (no deletion)
     - Places missing TP/SL immediately
     - Uses dynamic tolerance to avoid constant editing
+    - Optional liquidation protection as final SL validation layer
     """
     while True:
         try:
@@ -3572,6 +3758,7 @@ def auto_tp_sl_guardian():
                     if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
                         continue
 
+                    # ── ORIGINAL TP/SL CALCULATION (unchanged) ──────────────────
                     if size > 0:  # LONG
                         expected_tp = entry * (1 + LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 - LIVE_SL_PERCENTAGE / 100)
@@ -3579,21 +3766,71 @@ def auto_tp_sl_guardian():
                         expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
 
+                    # ── LIQUIDATION PROTECTION: FINAL SL VALIDATION LAYER ────────
+                    # This is an independent layer. It only adjusts final_sl when
+                    # the original SL is on the wrong side of liquidation price.
+                    # TP is never touched. Original logic above is never changed.
+                    final_sl = expected_sl  # default: use original SL as-is
+
+                    if str(LIQUIDATION_PROTECTION).strip().upper() == "Y":
+                        try:
+                            liquidation_price_raw = pos.get("liquidation_price")
+                            if liquidation_price_raw is not None:
+                                liquidation_price = float(liquidation_price_raw)
+
+                                if size > 0:
+                                    # LONG position:
+                                    # SL must be ABOVE liquidation price.
+                                    # If original SL is at or below liquidation, protect it.
+                                    if expected_sl <= liquidation_price:
+                                        final_sl = liquidation_price + LIQUIDATION_BUFFER
+                                        log_system(
+                                            f"[LIQ PROTECT] LONG {symbol}: "
+                                            f"original_sl={expected_sl:.6f} is at/below "
+                                            f"liquidation={liquidation_price:.6f} -> "
+                                            f"protected_sl={final_sl:.6f}"
+                                        )
+                                    # else: original SL is already safer, no change needed
+
+                                else:
+                                    # SHORT position:
+                                    # SL must be BELOW liquidation price.
+                                    # If original SL is at or above liquidation, protect it.
+                                    if expected_sl >= liquidation_price:
+                                        final_sl = liquidation_price - LIQUIDATION_BUFFER
+                                        log_system(
+                                            f"[LIQ PROTECT] SHORT {symbol}: "
+                                            f"original_sl={expected_sl:.6f} is at/above "
+                                            f"liquidation={liquidation_price:.6f} -> "
+                                            f"protected_sl={final_sl:.6f}"
+                                        )
+                                    # else: original SL is already safer, no change needed
+
+                        except Exception as liq_err:
+                            log_system(f"[LIQ PROTECT] Error for {symbol}: {liq_err} - using original SL")
+                            final_sl = expected_sl  # fallback to original on any error
+
+                    # From this point forward, all SL references use final_sl.
+                    # expected_tp is always the original TP, never modified.
+
+                    # ── DYNAMIC TOLERANCE (unchanged) ───────────────────────────
                     dynamic_tolerance = entry * 0.0005
 
+                    # ── FETCH OPEN ORDERS (unchanged) ───────────────────────────
                     orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
                     if not orders_response or not orders_response.get('success'):
                         continue
 
-                    orders       = orders_response.get("result", [])
-                    tp_orders    = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "take_profit_order"]
-                    sl_orders    = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
+                    orders    = orders_response.get("result", [])
+                    tp_orders = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "take_profit_order"]
+                    sl_orders = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
 
                     tp_valid        = False
                     sl_valid        = False
                     wrong_tp_orders = []
                     wrong_sl_orders = []
 
+                    # ── VALIDATE EXISTING TP ORDERS (unchanged) ─────────────────
                     for tp_order in tp_orders:
                         stop_price = float(tp_order.get("stop_price", 0))
                         if abs(stop_price - expected_tp) < dynamic_tolerance:
@@ -3601,9 +3838,10 @@ def auto_tp_sl_guardian():
                         else:
                             wrong_tp_orders.append(tp_order)
 
+                    # ── VALIDATE EXISTING SL ORDERS (uses final_sl) ─────────────
                     for sl_order in sl_orders:
                         stop_price = float(sl_order.get("stop_price", 0))
-                        if abs(stop_price - expected_sl) < dynamic_tolerance:
+                        if abs(stop_price - final_sl) < dynamic_tolerance:
                             sl_valid = True
                         else:
                             wrong_sl_orders.append(sl_order)
@@ -3611,6 +3849,7 @@ def auto_tp_sl_guardian():
                     tp_edited = False
                     sl_edited = False
 
+                    # ── EDIT WRONG TP ORDERS (unchanged) ────────────────────────
                     if wrong_tp_orders and not tp_valid:
                         for tp_order in wrong_tp_orders:
                             order_id     = tp_order.get("id")
@@ -3637,6 +3876,7 @@ def auto_tp_sl_guardian():
                             except:
                                 pass
 
+                    # ── EDIT WRONG SL ORDERS (uses final_sl) ────────────────────
                     if wrong_sl_orders and not sl_valid:
                         for sl_order in wrong_sl_orders:
                             order_id     = sl_order.get("id")
@@ -3645,7 +3885,7 @@ def auto_tp_sl_guardian():
                                 "id": order_id,
                                 "product_id": int(product_id),
                                 "order_type": "market_order",
-                                "stop_price": "{:.6f}".format(expected_sl),
+                                "stop_price": "{:.6f}".format(final_sl),
                                 "size": abs(int(size))
                             }
                             edit_body = json.dumps(edit_payload)
@@ -3666,16 +3906,17 @@ def auto_tp_sl_guardian():
                     need_tp = not tp_valid and not tp_edited
                     need_sl = not sl_valid and not sl_edited
 
+                    # ── PLACE MISSING TP/SL (uses final_sl) ─────────────────────
                     if need_tp or need_sl:
                         ticker = make_api_request('GET', f'/tickers/{symbol}')
                         if ticker:
                             curr_price = float(ticker['result']['close'])
                             is_safe    = True
                             if size > 0:
-                                if expected_tp <= curr_price or expected_sl >= curr_price:
+                                if expected_tp <= curr_price or final_sl >= curr_price:
                                     is_safe = False
                             else:
-                                if expected_tp >= curr_price or expected_sl <= curr_price:
+                                if expected_tp >= curr_price or final_sl <= curr_price:
                                     is_safe = False
 
                             if not is_safe:
@@ -3690,7 +3931,7 @@ def auto_tp_sl_guardian():
                             },
                             "stop_loss_order": {
                                 "order_type": "market_order",
-                                "stop_price": "{:.6f}".format(expected_sl)
+                                "stop_price": "{:.6f}".format(final_sl)
                             }
                         }
                         body = json.dumps(payload)
@@ -3713,6 +3954,7 @@ def auto_tp_sl_guardian():
 
         except Exception as e:
             time.sleep(2)
+
 
 
 # ========== MAIN ==========
