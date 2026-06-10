@@ -977,6 +977,11 @@ def generate_smart_signal(reason="trade_decision"):
     else:             layer = 'WEAK_BUY'      if direction=='BUY' else 'WEAK_SELL'
 
     print(f"   Confidence={confidence}%  Layer={layer}")
+    # Reverse final signal
+    if direction == "BUY":
+        direction = "SELL"
+    elif direction == "SELL":
+        direction = "BUY"
 
     return _make_signal(direction, confidence, layer,
                         r15m['net'], reason, r4h or {}, r1h, r15m, candles_15m)
