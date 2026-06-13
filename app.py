@@ -2901,8 +2901,8 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
         PRODUCT_CONFIG = {
             "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},
             "BTCUSD": {"id": 84,    "tick": Decimal("0.5")},
-            # "ETHUSD": {"id": 3136,  "tick": Decimal("0.05")},
-            "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
+            "ETHUSD": {"id": 3136,  "tick": Decimal("0.05")},
+            # "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
         }
 
         config = PRODUCT_CONFIG.get(symbol)
