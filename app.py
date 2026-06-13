@@ -169,11 +169,11 @@ def cleanup_old_trades(target_size_mb=8.5):
         return False
 
 # API Configuration
-BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-# BASE_URL = "https://api.india.delta.exchange"
+# BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+BASE_URL = "https://api.india.delta.exchange"
 
-# WS_URL = "wss://socket.india.delta.exchange"
-WS_URL ="wss://testnet-socket.india.delta.exchange"
+WS_URL = "wss://socket.india.delta.exchange"
+# WS_URL ="wss://testnet-socket.india.delta.exchange"
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
@@ -199,8 +199,8 @@ LOT_STEPS = {
     4: 8,
     5: 16,
     6: 32,
-    7: 64,
-    8: 128,
+    # 7: 64,
+    # 8: 128,
     # 9: 256,
     # 10: 512,
     # 11: 1056
