@@ -11,6 +11,8 @@ import sys
 from datetime import datetime
 from dotenv import load_dotenv
 import pymysql
+from pymysql import OperationalError, InterfaceError
+from dbutils.pooled_db import PooledDB
 from math import isfinite
 import subprocess
 from decimal import Decimal, ROUND_HALF_UP
@@ -20,8 +22,6 @@ from datetime import datetime
 import websocket
 
 # ========== LOGGING CONFIGURATION ==========
-# server.log: Saare logs (Debug + Info)
-# trade.log: Sirf important Trade/State/Error logs
 class Logger(object):
     def __init__(self, filename="server.log", secondary_file="trade.log"):
         self.terminal = sys.stdout
@@ -55,7 +55,6 @@ class Logger(object):
         self.log.flush()
         self.trade_log_file.flush()
 
-# Initialize Logger
 custom_logger = Logger("server.log", "trade.log")
 sys.stdout = custom_logger
 sys.stderr = custom_logger
@@ -65,15 +64,12 @@ def log_state(msg): custom_logger.trade_write("STATE", msg)
 def log_error(msg): custom_logger.trade_write("ERROR", msg)
 def log_system(msg): custom_logger.trade_write("SYSTEM", msg)
 
-# Silence Flask/Werkzeug logs
 import logging
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-# Load environment variables
 load_dotenv()
 
-# Import keepalive functionality
 from keepalive import start_keep_alive
 
 app = Flask(__name__)
@@ -81,28 +77,49 @@ app.secret_key = os.urandom(24)
 
 LAST_SAVED_TRADE_KEY = None
 
-# ========== MYSQL CONNECTION MANAGER ==========
+# ========== MYSQL CONNECTION POOL ==========
+# Using a connection pool instead of opening a brand-new connection on every
+# query. This is the root fix for:
+#   (1226, "User '...' has exceeded the 'max_user_connections' resource (current value: 5)")
+#
+# maxconnections is kept LOW (well under the server's max_user_connections=5)
+# so we never hit the limit even with multiple threads
+# (main bot loop + websocket engine + TP/SL guardian) hitting the DB at once.
+#
+# blocking=True means if all pooled connections are busy, a caller will WAIT
+# for one to free up instead of opening a new one / failing immediately.
+MYSQL_POOL = PooledDB(
+    creator=pymysql,
+    maxconnections=4,       # stay safely under server limit of 5
+    mincached=1,
+    maxcached=4,
+    maxshared=0,
+    blocking=True,          # wait for a free connection instead of erroring
+    maxusage=None,          # recycle connection indefinitely (no forced close after N uses)
+    setsession=[],
+    ping=1,                 # ping connection before use; reconnect if stale (fixes "Lost connection")
+    host=os.getenv('MYSQL_HOST', 'bmh1rsh5f0sjmncv6ydc-mysql.services.clever-cloud.com'),
+    port=int(os.getenv('MYSQL_PORT', 3306)),
+    user=os.getenv('MYSQL_USER', 'ujokhsx1defubkot'),
+    password=os.getenv('MYSQL_PASSWORD', 'hILZGFpJ60exq4oGj2hv'),
+    database=os.getenv('MYSQL_DB', 'bmh1rsh5f0sjmncv6ydc'),
+    charset='utf8mb4',
+    cursorclass=pymysql.cursors.DictCursor,
+    autocommit=False,
+    ssl={}
+)
+
+
 def get_mysql_connection():
-    """Create and return a MySQL connection"""
     try:
-        connection = pymysql.connect(
-            host=os.getenv('MYSQL_HOST', 'bmh1rsh5f0sjmncv6ydc-mysql.services.clever-cloud.com'),
-            port=int(os.getenv('MYSQL_PORT', 3306)),
-            user=os.getenv('MYSQL_USER', 'ujokhsx1defubkot'),
-            password=os.getenv('MYSQL_PASSWORD', 'hILZGFpJ60exq4oGj2hv'),
-            database=os.getenv('MYSQL_DB', 'bmh1rsh5f0sjmncv6ydc'),
-            charset='utf8mb4',
-            cursorclass=pymysql.cursors.DictCursor,
-            autocommit=False,
-            ssl={}
-        )
+        connection = MYSQL_POOL.connection()
         return connection
     except Exception as e:
         log_error(f"MySQL connection failed: {e}")
         raise
 
+
 def execute_mysql_query(query, params=None, fetch_one=False, fetch_all=False, commit=False):
-    """Execute MySQL query with proper error handling"""
     connection = None
     try:
         connection = get_mysql_connection()
@@ -119,14 +136,16 @@ def execute_mysql_query(query, params=None, fetch_one=False, fetch_all=False, co
                 return True
     except Exception as e:
         if connection:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except Exception:
+                pass
         raise
     finally:
         if connection:
             connection.close()
 
 def get_database_size():
-    """Get current database size in MB"""
     try:
         query = """
         SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS db_size_mb
@@ -139,14 +158,11 @@ def get_database_size():
         return 0
 
 def cleanup_old_trades(target_size_mb=8.5):
-    """Remove oldest trades to keep database under target size"""
     try:
         current_size = get_database_size()
         if current_size <= target_size_mb:
             return True
-
         log_system(f"Cleanup: DB size {current_size}MB > {target_size_mb}MB limit. Starting cleanup...")
-
         while current_size > target_size_mb:
             count_query = "SELECT COUNT(*) as total_rows FROM closed_positions"
             total_result = execute_mysql_query(count_query, fetch_one=True)
@@ -161,7 +177,6 @@ def cleanup_old_trades(target_size_mb=8.5):
             """
             execute_mysql_query(delete_query, (rows_to_delete,), commit=True)
             current_size = get_database_size()
-
         log_system(f"Cleanup completed. Final size: {current_size}MB")
         return True
     except Exception as e:
@@ -169,28 +184,20 @@ def cleanup_old_trades(target_size_mb=8.5):
         return False
 
 # API Configuration
-# BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 BASE_URL = "https://api.india.delta.exchange"
-
 WS_URL = "wss://socket.india.delta.exchange"
+# BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 # WS_URL ="wss://testnet-socket.india.delta.exchange"
+
 
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
-
-# # ---------- LIVE POSITION TP/SL CONFIGURATION ----------
-# LIVE_TP_PERCENTAGE = 1.5   # Take Profit %
-# LIVE_SL_PERCENTAGE = 0.6  # Stop Loss %
 
 processing_lock = threading.Lock()
 last_processed = {}
 
 # =====================================================================
 # Step-Based Lot Progression System
-# Rule:
-#   WIN  (any step) → reset to Step 1 (lot = 1)
-#   LOSS (any step) → advance to next step
-#   Max step reached → reset to Step 1
 # =====================================================================
 LOT_STEPS = {
     1: 1,
@@ -199,27 +206,7 @@ LOT_STEPS = {
     4: 8,
     5: 16,
     6: 32,
-    # 7: 64,
-    # 8: 128,
-    # 9: 256,
-    # 10: 512,
-    # 11: 1056
 }
-
-
-# LOT_STEPS = {
-#     1: 100,
-#     2: 200,
-#     3: 400,
-#     4: 800,
-#     5: 1600,
-#     6: 3200,
-#     7: 6400,
-#     8: 12800,
-#     9: 25600,
-#     10: 51200,
-#     11: 102400
-# }
 
 # Bot State
 BOT_STATE = {
@@ -239,23 +226,15 @@ BOT_STATE = {
     'force_stop': False,
     'session_start_time': None,
     'session_total_pnl': 0.0,
-    # =====================================================================
-    # ORDER COMPLETION TRACKING
-    # last_placed_order_id: The order ID of the most recently placed order.
-    # order_completed: True only after pair found + trade saved + state saved.
-    #                  MUST be True before DB load, DB sync, or new order.
-    # =====================================================================
     'last_placed_order_id': None,
-    'order_completed': True,   # True at boot (no pending order)
+    'order_completed': True,
 }
 
-# Trading Configuration - Market Specific Lot Sizes
 LOT_SIZES = {
     'ETHUSD': 0.01,
 }
 LOT_SIZE_DEFAULT = 1
 
-# Trade Result Memory
 LAST_TRADE_RESULT = {
     'profit_loss': None,
     'timestamp': None,
@@ -266,57 +245,36 @@ LAST_TRADE_RESULT = {
 LOT_CALCULATION_LOCK = False
 LAST_PROCESSED_TRADE_ID = None
 
-# =====================================================================
-# FIX 1: FILL DEDUPLICATION
-# Every fill order_id used as entry OR exit is stored here so the same
-# fill is NEVER processed as part of two different trades.
-# =====================================================================
 USED_FILL_IDS = set()
 USED_FILL_IDS_LOCK = Lock()
 
-# =====================================================================
-# DUPLICATE TRADE FIX: PROCESSED_ORDER_IDS
-# =====================================================================
-PROCESSED_ORDER_IDS      = set()
+PROCESSED_ORDER_IDS = set()
 PROCESSED_ORDER_IDS_LOCK = Lock()
 
-# =====================================================================
-# FIX 2: COOLDOWN
-# =====================================================================
 LAST_CLOSE_TIMESTAMP = 0.0
 COOLDOWN_SECONDS = 15
 
-# Recovery System
 PROCESSED_EXIT_FILL_IDS = set()
 LAST_PROCESSED_EXIT_FILL_IDS = set()
 
-# Trade Completion Management
 WAITING_FOR_FILL = False
 TRADE_COMPLETED = False
 
-# Position State Tracking
 LAST_POSITION_STATE = {
     'symbol': None,
     'size': 0,
     'entry_price': 0
 }
 
-# Product ID Cache
 PRODUCT_ID_CACHE = {}
-
-# Database Thread Lock
 db_lock = Lock()
-
-# Bot Process Management
 BOT_PROCESS = None
 bot_process_lock = Lock()
-
 LAST_SAVED_TRADE_KEY = None
 
 
 # ========== DATABASE ==========
 def init_database():
-    """Initialize MySQL database - preserves existing data"""
     try:
         create_table_query = '''
             CREATE TABLE IF NOT EXISTS closed_positions (
@@ -375,6 +333,31 @@ def init_database():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         '''
         execute_mysql_query(create_state_table_query, commit=True)
+
+        # =====================================================================
+        # TABLE: recent_fills_cache
+        # Stores the last 2 verified entry+exit fill pairs for the current symbol.
+        # Used by pre_order_fill_verification() as ground truth for lot size.
+        # =====================================================================
+        create_fills_cache_query = '''
+            CREATE TABLE IF NOT EXISTS recent_fills_cache (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                symbol VARCHAR(50) NOT NULL,
+                entry_order_id VARCHAR(100) NOT NULL,
+                exit_order_id VARCHAR(100) NOT NULL,
+                entry_side VARCHAR(10) NOT NULL,
+                entry_price DECIMAL(20, 8) NOT NULL,
+                exit_price DECIMAL(20, 8) NOT NULL,
+                lot_size DECIMAL(20, 8) NOT NULL,
+                pnl DECIMAL(20, 8),
+                entry_time VARCHAR(100) NOT NULL,
+                exit_time VARCHAR(100) NOT NULL,
+                saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_fill_pair (entry_order_id, exit_order_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        '''
+        execute_mysql_query(create_fills_cache_query, commit=True)
+
         print("✅ MySQL tables ready (existing data preserved)")
     except Exception as e:
         print(f"❌ Failed to initialize MySQL database: {e}")
@@ -383,10 +366,6 @@ def init_database():
 
 # ========== PERSISTENT STATE FUNCTIONS ==========
 def save_bot_state_to_db():
-    """
-    Save current step, lot, and last PnL to database so restart resumes correctly.
-    Called after EVERY trade result is processed.
-    """
     try:
         state_data = {
             'current_step': BOT_STATE['current_step'],
@@ -407,13 +386,6 @@ def save_bot_state_to_db():
 
 
 def load_bot_state_from_db():
-    """
-    Load last saved step/lot/PnL from database on restart.
-    Returns True if state was loaded, False if no state found (fresh start).
-
-    SAFETY: Caller MUST check BOT_STATE['order_completed'] == True before calling.
-    This function does NOT check it itself; the guard is in auto_trading_bot_main().
-    """
     global LAST_TRADE_RESULT
     try:
         result = execute_mysql_query(
@@ -447,7 +419,6 @@ def load_bot_state_from_db():
 
 
 def clear_bot_state_from_db():
-    """Clear saved bot state from DB (called when bot is fully reset)"""
     try:
         execute_mysql_query(
             "DELETE FROM bot_state WHERE state_key = %s",
@@ -460,15 +431,6 @@ def clear_bot_state_from_db():
 
 
 def verify_and_sync_step_from_db():
-    """
-    Read the most recent trade from DB.
-    Recompute BOT_STATE step/lot from actual DB PnL.
-    Returns True if synced OK, False if no trades in DB yet.
-
-    DB is ground truth. Memory is just cache.
-
-    SAFETY: Caller MUST check BOT_STATE['order_completed'] == True before calling.
-    """
     try:
         query = '''
             SELECT pnl, side, entry_time, exit_time, quantity
@@ -534,6 +496,436 @@ def verify_and_sync_step_from_db():
         import traceback
         traceback.print_exc()
         return False
+
+
+# =====================================================================
+# INDEPENDENT PRE-ORDER FILL VERIFICATION
+# =====================================================================
+# Purpose:
+#   Before placing ANY new order, this function:
+#   1. Waits 15 seconds for fills to propagate (called after position close)
+#   2. Fetches the last 5 fills from official API
+#   3. Finds the last valid entry+exit fill PAIR for this symbol
+#   4. Validates: exit_time >= entry_time, opposite sides, correct symbol
+#   5. Saves the verified pair to recent_fills_cache table (keeps last 2)
+#   6. Extracts real lot_size from the fill pair
+#   7. Determines the correct NEXT step/lot from real last trade result
+#   8. Corrects BOT_STATE['current_step'] and BOT_STATE['current_lot'] in memory
+#   9. Updates bot_state DB with corrected values
+#
+# This function is COMPLETELY INDEPENDENT of:
+#   - position closure detection logic
+#   - WS fill queue
+#   - LAST_POSITION_STATE
+#   - BOT_STATE['last_result']
+#   - Any other in-memory state
+#
+# It ONLY trusts: official fills API + DB recent_fills_cache
+# =====================================================================
+
+def save_fill_pair_to_cache(symbol, entry_order_id, exit_order_id,
+                             entry_side, entry_price, exit_price,
+                             lot_size, pnl, entry_time, exit_time):
+    """
+    Save a verified entry+exit fill pair to recent_fills_cache.
+    Keeps only the last 2 pairs per symbol (older ones deleted).
+    """
+    try:
+        insert_query = '''
+            INSERT IGNORE INTO recent_fills_cache
+            (symbol, entry_order_id, exit_order_id, entry_side,
+             entry_price, exit_price, lot_size, pnl, entry_time, exit_time)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        '''
+        execute_mysql_query(
+            insert_query,
+            (symbol, str(entry_order_id), str(exit_order_id),
+             entry_side, entry_price, exit_price,
+             lot_size, pnl, entry_time, exit_time),
+            commit=True
+        )
+
+        # Keep only last 2 rows per symbol
+        cleanup_query = '''
+            DELETE FROM recent_fills_cache
+            WHERE symbol = %s AND id NOT IN (
+                SELECT id FROM (
+                    SELECT id FROM recent_fills_cache
+                    WHERE symbol = %s
+                    ORDER BY saved_at DESC
+                    LIMIT 2
+                ) AS keep_ids
+            )
+        '''
+        execute_mysql_query(cleanup_query, (symbol, symbol), commit=True)
+
+        log_system(f"[FILL CACHE] Saved pair: entry={entry_order_id} exit={exit_order_id} lot={lot_size} pnl={pnl:.5f}")
+    except Exception as e:
+        log_error(f"[FILL CACHE] Error saving pair: {e}")
+
+
+def get_cached_fill_pairs(symbol, limit=2):
+    """
+    Get the last N verified fill pairs from recent_fills_cache for a symbol.
+    Returns list of dicts, newest first.
+    """
+    try:
+        query = '''
+            SELECT * FROM recent_fills_cache
+            WHERE symbol = %s
+            ORDER BY saved_at DESC
+            LIMIT %s
+        '''
+        result = execute_mysql_query(query, (symbol, limit), fetch_all=True)
+        return result if result else []
+    except Exception as e:
+        log_error(f"[FILL CACHE] Error fetching cached pairs: {e}")
+        return []
+
+
+def pre_order_fill_verification(symbol, wait_seconds=15):
+    """
+    ══════════════════════════════════════════════════════════════════
+    INDEPENDENT PRE-ORDER FILL VERIFICATION
+    ══════════════════════════════════════════════════════════════════
+ 
+    Call this BEFORE placing every new order.
+    It is completely independent — ignores all in-memory state.
+ 
+    Flow:
+      1. Wait wait_seconds for fills to propagate from exchange
+      2. Fetch last 5 fills from official API
+      3. Find latest valid entry+exit pair for this symbol
+         Rule: exit_time >= entry_time, opposite sides, same symbol
+      4. Check if this pair is already in recent_fills_cache
+         (avoid double processing)
+      5. If new pair found:
+         a. Save to recent_fills_cache
+         b. Compute PnL from real fills
+         c. Detect last_step from ACTUAL lot_size in fills (not BOT_STATE)
+         d. Determine next step: WIN→Step1, LOSS→last_step+1
+         e. Update BOT_STATE['current_step'] and ['current_lot']
+         f. Save to bot_state DB
+      6. If no new pair found:
+         a. Read last cached pair from recent_fills_cache
+         b. Use its lot_size to derive correct next step independently
+      7. Log everything for debugging
+ 
+    KEY DIFFERENCE FROM OLD VERSION:
+      - NEVER uses BOT_STATE['current_step'] to calculate next step
+      - ALWAYS derives last_step from actual lot_size in fills/cache
+      - This prevents double-increment bug where _apply_step_progression()
+        already incremented step, and verify incremented it again
+      - On FRESH START (no trades this session yet), skips fill-based
+        override entirely and trusts Step 1 from bot startup
+ 
+    Returns:
+      dict with keys:
+        'verified': bool - whether verification succeeded
+        'lot_used': float - lot size of last real trade (0 if unknown)
+        'pnl': float - PnL of last real trade (0 if unknown)
+        'next_step': int - correct next step to use
+        'next_lot': float - correct next lot to place
+        'source': str - 'fresh_fills' | 'cache' | 'fresh_start' | 'fallback'
+        'pair_found': bool - whether a valid entry+exit pair was found
+    """
+    log_system(f"[PRE-ORDER VERIFY] Starting verification for {symbol}")
+    log_system(f"[PRE-ORDER VERIFY] Waiting {wait_seconds}s for fills to propagate...")
+ 
+    time.sleep(wait_seconds)
+ 
+    result = {
+        'verified': False,
+        'lot_used': 0.0,
+        'pnl': 0.0,
+        'next_step': BOT_STATE['current_step'],
+        'next_lot': BOT_STATE['current_lot'],
+        'source': 'fallback',
+        'pair_found': False
+    }
+ 
+    # ══════════════════════════════════════════════════════════════════
+    # FRESH START GUARD
+    # If this is a brand new session (no trades closed yet this session),
+    # skip all fill-based overrides. The bot already set Step=1 on startup.
+    # We do NOT want old fills from a previous session to change the step.
+    # LAST_CLOSE_TIMESTAMP == 0.0 means no position has closed this session.
+    # ══════════════════════════════════════════════════════════════════
+    if LAST_CLOSE_TIMESTAMP == 0.0:
+        log_system("[PRE-ORDER VERIFY] Fresh session detected (no closes this session) — skipping fill-based override, using Step 1")
+        result['next_step'] = BOT_STATE['current_step']
+        result['next_lot']  = BOT_STATE['current_lot']
+        result['source']    = 'fresh_start'
+        result['verified']  = True
+        return result
+ 
+    # ── HELPER: derive next step purely from lot_size (no BOT_STATE dependency) ──
+    def get_next_step_from_lot(lot_size, pnl):
+        """
+        Given the actual lot_size used in the last trade and its PnL,
+        return the correct (next_step, next_lot) independently.
+ 
+        Steps:
+          - Find which step corresponds to lot_size
+          - If WIN  → next_step = 1
+          - If LOSS → next_step = last_step + 1 (wraps to 1 at max)
+        """
+        # Find the step that matches this lot size exactly
+        last_step = None
+        for step, lot in LOT_STEPS.items():
+            if lot == lot_size:
+                last_step = step
+                break
+ 
+        # If no exact match, find nearest step (safety fallback)
+        if last_step is None:
+            closest_step = 1
+            closest_diff = float('inf')
+            for step, lot in LOT_STEPS.items():
+                diff = abs(lot - lot_size)
+                if diff < closest_diff:
+                    closest_diff = diff
+                    closest_step = step
+            last_step = closest_step
+            log_system(f"[PRE-ORDER VERIFY] No exact lot match for {lot_size} — closest step={last_step}")
+ 
+        if pnl > 0:
+            # WIN → reset to Step 1
+            next_step = 1
+            next_lot  = LOT_STEPS[next_step]
+            log_system(f"[PRE-ORDER VERIFY] WIN (lot={lot_size} was step={last_step}) → Next Step={next_step} Lot={next_lot}")
+        else:
+            # LOSS → advance to next step based on ACTUAL last step from fills
+            next_step = last_step + 1
+            if next_step > BOT_STATE['max_steps']:
+                next_step = 1
+            next_lot = LOT_STEPS[next_step]
+            log_system(f"[PRE-ORDER VERIFY] LOSS (lot={lot_size} was step={last_step}) → Next Step={next_step} Lot={next_lot}")
+ 
+        return next_step, next_lot
+ 
+    # ── STEP 1: Fetch official fills ─────────────────────────────────
+    try:
+        fills_response = make_api_request('GET', '/fills?page_size=5')
+        if not fills_response or not fills_response.get('result'):
+            log_error("[PRE-ORDER VERIFY] Could not fetch fills from API")
+            fills = []
+        else:
+            fills = fills_response.get('result', [])
+    except Exception as e:
+        log_error(f"[PRE-ORDER VERIFY] Exception fetching fills: {e}")
+        fills = []
+ 
+    # ── STEP 2: Filter by symbol ──────────────────────────────────────
+    symbol_fills = [f for f in fills if f.get('product_symbol') == symbol]
+ 
+    log_system(f"[PRE-ORDER VERIFY] Total fills fetched: {len(fills)} | Symbol fills: {len(symbol_fills)}")
+ 
+    if not symbol_fills:
+        log_system("[PRE-ORDER VERIFY] No fills for symbol — checking cache")
+    else:
+        # ── STEP 3: Group fills by order_id ──────────────────────────
+        order_groups = {}
+        for fill in symbol_fills:
+            oid       = str(fill.get('order_id') or fill.get('id', ''))
+            side      = fill.get('side', '').lower()
+            size      = float(fill.get('size', 0))
+            price     = float(fill.get('price', 0))
+            created   = fill.get('created_at', '')
+ 
+            if not oid or size <= 0 or price <= 0:
+                continue
+ 
+            if oid not in order_groups:
+                order_groups[oid] = {
+                    'order_id':    oid,
+                    'side':        side,
+                    'total_size':  0.0,
+                    'total_value': 0.0,
+                    'avg_price':   0.0,
+                    'timestamp':   created,
+                    'fills_count': 0
+                }
+ 
+            grp = order_groups[oid]
+            grp['total_size']  += size
+            grp['total_value'] += price * size
+            grp['fills_count'] += 1
+            # Keep earliest timestamp as order time
+            if created < grp['timestamp']:
+                grp['timestamp'] = created
+ 
+        for grp in order_groups.values():
+            if grp['total_size'] > 0:
+                grp['avg_price'] = grp['total_value'] / grp['total_size']
+ 
+        # Sort by timestamp ascending (oldest first)
+        sorted_orders = sorted(order_groups.values(), key=lambda x: x['timestamp'])
+ 
+        log_system(f"[PRE-ORDER VERIFY] Unique orders in fills: {len(sorted_orders)}")
+        for o in sorted_orders:
+            log_system(f"  → OrderID={o['order_id']} side={o['side']} size={o['total_size']} price={o['avg_price']:.4f} time={o['timestamp']}")
+ 
+        # ── STEP 4: Find latest valid entry+exit pair ─────────────────
+        # Rule: exit_time >= entry_time, opposite sides
+        # Search from newest to oldest for exit, pair with nearest older entry
+        found_pair = None
+ 
+        for i in range(len(sorted_orders) - 1, 0, -1):
+            potential_exit  = sorted_orders[i]
+            potential_entry = sorted_orders[i - 1]
+ 
+            # Must be opposite sides
+            if potential_exit['side'] == potential_entry['side']:
+                continue
+ 
+            # exit_time must be >= entry_time (cannot be older)
+            if potential_exit['timestamp'] < potential_entry['timestamp']:
+                continue
+ 
+            found_pair = (potential_entry, potential_exit)
+            log_system(f"[PRE-ORDER VERIFY] Pair found: entry={potential_entry['order_id']} ({potential_entry['side']}) exit={potential_exit['order_id']} ({potential_exit['side']})")
+            break
+ 
+        # ── STEP 5: Process found pair ────────────────────────────────
+        if found_pair:
+            entry_order = found_pair[0]
+            exit_order  = found_pair[1]
+ 
+            entry_oid   = entry_order['order_id']
+            exit_oid    = exit_order['order_id']
+ 
+            # Check if this pair is already in cache (avoid reprocessing)
+            cached_pairs = get_cached_fill_pairs(symbol, limit=2)
+            already_cached = any(
+                str(cp.get('entry_order_id')) == entry_oid and
+                str(cp.get('exit_order_id'))  == exit_oid
+                for cp in cached_pairs
+            )
+ 
+            entry_side  = entry_order['side']
+            entry_price = entry_order['avg_price']
+            exit_price  = exit_order['avg_price']
+            # lot_size = actual number of contracts traded (e.g. 1, 2, 4, 8, 16, 32)
+            lot_size    = min(entry_order['total_size'], exit_order['total_size'])
+ 
+            lot_multiplier  = LOT_SIZES.get(symbol, LOT_SIZE_DEFAULT)
+            actual_quantity = lot_size * lot_multiplier
+ 
+            if entry_side == 'buy':
+                pnl = (exit_price - entry_price) * actual_quantity
+            else:
+                pnl = (entry_price - exit_price) * actual_quantity
+ 
+            result['lot_used']   = lot_size
+            result['pnl']        = pnl
+            result['pair_found'] = True
+ 
+            log_system(f"[PRE-ORDER VERIFY] Last trade: {entry_side.upper()} lot={lot_size} entry={entry_price:.4f} exit={exit_price:.4f} pnl={pnl:.5f} result={'PROFIT' if pnl > 0 else 'LOSS'}")
+            log_system(f"[PRE-ORDER VERIFY] Already cached: {already_cached}")
+ 
+            if not already_cached:
+                # Save to cache
+                save_fill_pair_to_cache(
+                    symbol=symbol,
+                    entry_order_id=entry_oid,
+                    exit_order_id=exit_oid,
+                    entry_side=entry_side,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    lot_size=lot_size,
+                    pnl=pnl,
+                    entry_time=entry_order['timestamp'],
+                    exit_time=exit_order['timestamp']
+                )
+ 
+                # ── KEY FIX: Derive next step from ACTUAL lot_size in fills ──
+                # NEVER use BOT_STATE['current_step'] here — it may already be
+                # incremented by _apply_step_progression() causing double-increment
+                next_step, next_lot = get_next_step_from_lot(lot_size, pnl)
+ 
+                # Correct BOT_STATE in memory
+                old_step = BOT_STATE['current_step']
+                old_lot  = BOT_STATE['current_lot']
+                BOT_STATE['current_step'] = next_step
+                BOT_STATE['current_lot']  = next_lot
+                BOT_STATE['last_result']  = 'PROFIT' if pnl > 0 else 'LOSS'
+ 
+                log_system(f"[PRE-ORDER VERIFY] BOT_STATE corrected: Step {old_step}→{next_step} | Lot {old_lot}→{next_lot}")
+ 
+                # Save corrected state to DB
+                save_bot_state_to_db()
+ 
+                result['source'] = 'fresh_fills'
+            else:
+                # ── Pair already cached ───────────────────────────────
+                # Still re-derive from lot_size independently — don't trust BOT_STATE
+                next_step, next_lot = get_next_step_from_lot(lot_size, pnl)
+ 
+                old_step = BOT_STATE['current_step']
+                old_lot  = BOT_STATE['current_lot']
+ 
+                if old_step != next_step or old_lot != next_lot:
+                    BOT_STATE['current_step'] = next_step
+                    BOT_STATE['current_lot']  = next_lot
+                    BOT_STATE['last_result']  = 'PROFIT' if pnl > 0 else 'LOSS'
+                    log_system(f"[PRE-ORDER VERIFY] Cached pair — BOT_STATE re-aligned: Step {old_step}→{next_step} | Lot {old_lot}→{next_lot}")
+                    save_bot_state_to_db()
+                else:
+                    log_system(f"[PRE-ORDER VERIFY] Cached pair — BOT_STATE already correct: Step={old_step} Lot={old_lot}")
+ 
+                result['source'] = 'cache'
+ 
+            result['next_step'] = BOT_STATE['current_step']
+            result['next_lot']  = BOT_STATE['current_lot']
+            result['verified']  = True
+            return result
+ 
+    # ── STEP 6: No fresh pair found — check cache ─────────────────────
+    log_system("[PRE-ORDER VERIFY] No fresh pair in API fills — checking recent_fills_cache")
+ 
+    cached_pairs = get_cached_fill_pairs(symbol, limit=2)
+ 
+    if cached_pairs:
+        last_cached = cached_pairs[0]  # Most recent
+        cached_lot  = float(last_cached.get('lot_size', 0))
+        cached_pnl  = float(last_cached.get('pnl', 0))
+ 
+        log_system(f"[PRE-ORDER VERIFY] Cache hit: entry={last_cached.get('entry_order_id')} lot={cached_lot} pnl={cached_pnl:.5f}")
+ 
+        result['lot_used']   = cached_lot
+        result['pnl']        = cached_pnl
+        result['pair_found'] = True
+        result['source']     = 'cache'
+ 
+        # ── KEY FIX: Derive next step from cached lot_size independently ──
+        # Again: NEVER rely on BOT_STATE['current_step'] here
+        next_step, next_lot = get_next_step_from_lot(cached_lot, cached_pnl)
+ 
+        old_step = BOT_STATE['current_step']
+        old_lot  = BOT_STATE['current_lot']
+ 
+        if old_step != next_step or old_lot != next_lot:
+            BOT_STATE['current_step'] = next_step
+            BOT_STATE['current_lot']  = next_lot
+            BOT_STATE['last_result']  = 'PROFIT' if cached_pnl > 0 else 'LOSS'
+            log_system(f"[PRE-ORDER VERIFY] Cache-only — BOT_STATE corrected: Step {old_step}→{next_step} | Lot {old_lot}→{next_lot}")
+            save_bot_state_to_db()
+        else:
+            log_system(f"[PRE-ORDER VERIFY] Cache-only — BOT_STATE already correct: Step={old_step} Lot={old_lot}")
+ 
+        result['next_step'] = BOT_STATE['current_step']
+        result['next_lot']  = BOT_STATE['current_lot']
+        result['verified']  = True
+        return result
+ 
+    # ── STEP 7: No fills, no cache — pure fallback ────────────────────
+    log_system("[PRE-ORDER VERIFY] No fills and no cache — using current BOT_STATE as fallback")
+    result['next_step'] = BOT_STATE['current_step']
+    result['next_lot']  = BOT_STATE['current_lot']
+    result['source']    = 'fallback'
+    result['verified']  = True  # Still return True so bot doesn't block forever
+    return result
 
 
 # ========== SIGNAL GENERATION — v7 (FULL INDICATOR SUITE) ==========
@@ -1027,11 +1419,7 @@ def _make_wait_signal(reason, why):
 
 
 def save_closed_position(trade_data):
-    """
-    Save closed trade to MySQL database with strong duplicate protection.
-    """
     global LAST_SAVED_TRADE_KEY
-
     try:
         with db_lock:
             trade_key = (
@@ -1114,23 +1502,18 @@ def save_closed_position(trade_data):
 
 # ========== OPTIMIZED POSITION TRACKING ==========
 def get_product_id(symbol):
-    """Get product_id for a symbol (cached)"""
     global PRODUCT_ID_CACHE
-
     if symbol in PRODUCT_ID_CACHE:
         return PRODUCT_ID_CACHE[symbol]
-
     try:
         products = make_api_request('GET', '/products')
         if not products or not products.get('result'):
             return None
-
         for product in products.get('result', []):
             if product.get('symbol') == symbol:
                 product_id = product.get('id')
                 PRODUCT_ID_CACHE[symbol] = product_id
                 return product_id
-
         return None
     except Exception as e:
         log_error(f"Error getting product_id: {e}")
@@ -1138,7 +1521,6 @@ def get_product_id(symbol):
 
 
 def check_position_realtime(product_id):
-    """Check position with real-time endpoint"""
     try:
         response = make_api_request('GET', f'/positions/margined?product_id={product_id}')
         if not response or not response.get('success'):
@@ -1146,7 +1528,6 @@ def check_position_realtime(product_id):
             return {'error': True}
 
         response = make_api_request('GET', f'/positions?product_id={product_id}')
-
         if response and response.get('success') and response.get('result'):
             result      = response['result']
             size        = float(result.get('size', 0))
@@ -1156,9 +1537,7 @@ def check_position_realtime(product_id):
                 'size': size,
                 'entry_price': entry_price
             }
-
         return {'has_position': False, 'size': 0, 'entry_price': 0}
-
     except Exception as e:
         print(f"❌ Error checking position: {e}")
         return {'has_position': False, 'size': 0, 'entry_price': 0}
@@ -1166,7 +1545,6 @@ def check_position_realtime(product_id):
 
 # ========== API FUNCTIONS ==========
 def get_server_time():
-    """Get server timestamp from Delta Exchange"""
     try:
         response = requests.get(f"{BASE_URL}/v2/time", timeout=5)
         if response.status_code == 200:
@@ -1178,7 +1556,6 @@ def get_server_time():
 
 
 def sign_request(method, path, body=""):
-    """Generate API signature using Delta Exchange format"""
     ts      = get_server_time()
     payload = method + ts + path + body
     signature = hmac.new(
@@ -1195,7 +1572,6 @@ def sign_request(method, path, body=""):
 
 
 def safe_float(value, fallback=0.0):
-    """Convert value to float safely"""
     try:
         if value is None or value == "":
             return fallback
@@ -1208,12 +1584,10 @@ def safe_float(value, fallback=0.0):
 
 
 def make_api_request(method, endpoint, data=None):
-    """Make authenticated API request using Delta Exchange format"""
     path = f"/v2{endpoint}"
     body = json.dumps(data) if data else ""
     headers = sign_request(method, path, body)
     url = f"{BASE_URL}{path}"
-
     try:
         if method == 'GET':
             response = requests.get(url, headers=headers, timeout=10)
@@ -1243,7 +1617,6 @@ def make_api_request(method, endpoint, data=None):
 
 
 def place_order(symbol, side, quantity, order_type='market_order'):
-    """Place order with correct Delta Exchange parameters"""
     order_data = {
         'product_symbol': symbol,
         'side': side,
@@ -1255,28 +1628,22 @@ def place_order(symbol, side, quantity, order_type='market_order'):
 
 
 def set_leverage(symbol, leverage):
-    """Set leverage using correct Delta Exchange endpoint"""
     products = make_api_request('GET', '/products')
     if not products or not products.get('result'):
         return None
-
     product_id = None
     for product in products.get('result', []):
         if product.get('symbol') == symbol:
             product_id = product.get('id')
             break
-
     if not product_id:
         return None
-
     return make_api_request('POST', f'/products/{product_id}/orders/leverage', {'leverage': str(leverage)})
 
 
 def get_wallet_balance():
-    """Get wallet balance from Delta Exchange API"""
     try:
         response = make_api_request('GET', '/wallet/balances')
-
         if response and response.get("success") and response.get("result"):
             balances = response["result"]
             if not isinstance(balances, list):
@@ -1323,7 +1690,6 @@ def get_wallet_balance():
             'margin_used': 1500.0,
             'currency': 'USDT'
         }
-
     except Exception as e:
         print(f"Wallet balance error: {e}")
         return {
@@ -1336,9 +1702,7 @@ def get_wallet_balance():
 
 
 # ========== OPTIMIZED FILL RETRIEVAL ENGINE ==========
-
 def get_fills_page(page_size=5):
-    """Fetch only the most recent fills from API. Hard cap at 5."""
     try:
         safe_page_size = min(page_size, 5)
         fills = make_api_request('GET', f'/fills?page_size={safe_page_size}')
@@ -1351,12 +1715,6 @@ def get_fills_page(page_size=5):
 
 
 def find_trade_by_order_id(symbol, target_order_id):
-    """
-    Fetch the 5 most recent fills and find the entry fill matching
-    target_order_id, then find its paired exit fill.
-
-    Returns: (pnl, entry_exit_data) or (0, None) if not found / duplicate.
-    """
     if not target_order_id:
         log_error("find_trade_by_order_id called with no target_order_id")
         return 0, None
@@ -1468,11 +1826,6 @@ def find_trade_by_order_id(symbol, target_order_id):
 
 
 def wait_for_trade_fills(symbol, target_order_id, max_retries=5, retry_delay=2):
-    """
-    After post-closure wait, attempt to find the closed trade.
-    Retries up to max_retries times with retry_delay seconds between each.
-    Returns (pnl, entry_exit_data) or (0, None) if not found after all retries.
-    """
     if not target_order_id:
         log_error("wait_for_trade_fills: no target_order_id set - cannot retrieve fills")
         return 0, None
@@ -1487,29 +1840,21 @@ def wait_for_trade_fills(symbol, target_order_id, max_retries=5, retry_delay=2):
             print(f"⏳ Fill not found yet (attempt {attempt}/{max_retries}) - retrying in {retry_delay}s...")
             time.sleep(retry_delay)
 
-    log_error(f"Fill not found after {max_retries} retries for order {target_order_id} - stopping trade processing")
+    log_error(f"Fill not found after {max_retries} retries for order {target_order_id}")
     return 0, None
 
 
-# =====================================================================
-# LEGACY COMPATIBILITY WRAPPERS
-# =====================================================================
-
 def group_fills_by_order(fills, symbol):
-    """Legacy wrapper - kept for compatibility."""
     symbol_fills = [f for f in fills if f.get('product_symbol') == symbol]
     order_groups = {}
-
     for fill in symbol_fills:
         order_id   = str(fill.get('order_id') or fill.get('id', ''))
         side       = fill.get('side', '')
         size       = float(fill.get('size', 0))
         price      = float(fill.get('price', 0))
         created_at = fill.get('created_at', '')
-
         if not order_id or size <= 0 or price <= 0:
             continue
-
         if order_id not in order_groups:
             order_groups[order_id] = {
                 'order_id':    order_id,
@@ -1520,160 +1865,134 @@ def group_fills_by_order(fills, symbol):
                 'timestamp':   created_at,
                 'fills_count': 0
             }
-
         grp = order_groups[order_id]
         grp['total_size']  += size
         grp['total_value'] += price * size
         grp['fills_count'] += 1
         if created_at < grp['timestamp']:
             grp['timestamp'] = created_at
-
     for order_id, grp in order_groups.items():
         if grp['total_size'] > 0:
             grp['avg_price'] = grp['total_value'] / grp['total_size']
-
     sorted_orders = sorted(order_groups.values(), key=lambda x: x['timestamp'])
     return sorted_orders
 
 
 def find_latest_closed_pair(symbol):
-    """Legacy wrapper - delegates to find_trade_by_order_id."""
     target_order_id = BOT_STATE.get('last_placed_order_id', None)
     if not target_order_id:
         log_error("find_latest_closed_pair: no last_placed_order_id - cannot match trade")
         return 0, None
-
     return find_trade_by_order_id(symbol, target_order_id)
 
 
 def _mark_order_complete(order_id):
-    """
-    Mark the current tracked order as fully processed.
-    Must be called only after pair found + trade saved + state saved.
-    """
     BOT_STATE['order_completed'] = True
     BOT_STATE['last_placed_order_id'] = None
     log_trade(f"ORDER COMPLETED: {order_id}")
 
 
+# ========== MAIN BOT LOOP ==========
 def auto_trading_bot_main():
     """
     Main bot loop.
-
-    STARTUP LOGIC (THE FIX):
-    ════════════════════════
-    No position on startup  → ALWAYS Step 1. Period. DB ignored.
-                              (DB state is from PREVIOUS session, irrelevant now)
-    Position already open   → Use the step that matches live lot size.
-                              After position closes, load DB state for next step.
-
-    WHY: When no position is open, the bot needs to start fresh at Step 1.
-    The DB state saved is the NEXT step AFTER the last trade — which is only
-    relevant if the bot crashes MID-TRADE and restarts with a live position.
-    If no live position exists, that DB state is stale and must be ignored.
-    The bot loop itself will load/sync DB before each subsequent order.
+ 
+    Key change: BEFORE placing each new order, call pre_order_fill_verification()
+    which independently checks official fills, finds last real entry+exit pair,
+    verifies lot_size, corrects BOT_STATE step/lot, and saves to DB.
+ 
+    This ensures the correct lot is always placed regardless of any state corruption.
     """
     global LAST_CLOSE_TIMESTAMP
-
-    print("🤖 Auto Trading Bot Started (OPTIMIZED - DB VERIFIED - ORDER COMPLETION GUARDED)")
-
+ 
+    print("🤖 Auto Trading Bot Started")
+ 
     print(f"⚡ Setting leverage: {BOT_STATE['leverage']}x")
     leverage_result = set_leverage(BOT_STATE['symbol'], BOT_STATE['leverage'])
     if not leverage_result:
         print("❌ Failed to set initial leverage, stopping bot")
         return
-
+ 
     print(f"\n🔍 CHECKING FOR EXISTING LIVE POSITION...")
     product_id = get_product_id(BOT_STATE['symbol'])
     if product_id:
         current_pos = check_position_realtime(product_id)
         if abs(current_pos.get('size', 0)) > 0.001:
-            # ─────────────────────────────────────────────────────────────
-            # EXISTING POSITION FOUND
-            # Use live lot to determine step. DB state used for NEXT step
-            # after this position closes (normal DB load path handles it).
-            # ─────────────────────────────────────────────────────────────
             print(f"🚨 EXISTING POSITION FOUND: {current_pos.get('size', 0)} lots")
             print(f"📊 Entry Price: {current_pos.get('entry_price', 0)}")
-
+ 
             current_lot   = abs(current_pos.get('size', 0))
             detected_step = detect_current_step_from_lot(current_lot)
-
+ 
             BOT_STATE['current_step'] = detected_step
             BOT_STATE['current_lot']  = current_lot
             print(f"✅ Step set from live position: Step={detected_step}, Lot={current_lot}")
-
+ 
             LAST_POSITION_STATE['symbol']      = BOT_STATE['symbol']
             LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
             LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
-
+ 
             BOT_STATE['last_placed_order_id'] = 'RESUMED'
             BOT_STATE['order_completed']      = False
             log_system(f"TRACKING ORDER: RESUMED (existing position, step={detected_step}, lot={current_lot})")
-
+ 
             print("⏳ Waiting for existing position to close...")
             while BOT_STATE['running'] and abs(current_pos.get('size', 0)) > 0.001:
                 time.sleep(1)
                 current_pos = check_position_realtime(product_id)
                 print(f"📊 Position Status: {current_pos.get('size', 0)} lots")
-
+ 
             if not BOT_STATE['running']:
                 return
-
+ 
             print("✅ Existing position closed, continuing...")
-            # Position closed — from here the normal bot loop will call
-            # load_bot_state_from_db() + verify_and_sync_step_from_db()
-            # before placing the next order. That is correct behaviour.
-
+ 
         else:
-            # ─────────────────────────────────────────────────────────────
-            # NO EXISTING POSITION — ALWAYS START FRESH AT STEP 1
-            #
-            # The DB may have a saved state (e.g. Step 3 from last session)
-            # but that state is the next step IF the last trade was a loss.
-            # Since there is no live position, we have no idea whether the
-            # last trade PnL was already accounted for or not. The safest
-            # and correct behaviour is: fresh start = Step 1.
-            #
-            # The bot loop will load DB + sync BEFORE every new order, so
-            # after the first trade result the correct step will be applied.
-            # ─────────────────────────────────────────────────────────────
             print("✅ No existing position found — FRESH START at Step 1")
             BOT_STATE['current_step']         = 1
             BOT_STATE['current_lot']          = LOT_STEPS[1]
             BOT_STATE['order_completed']      = True
             BOT_STATE['last_placed_order_id'] = None
-            log_system("No position on startup → Step 1 (fresh start, DB state ignored for first order)")
-
+            log_system("No position on startup → Step 1 (fresh start)")
+ 
+            # ══════════════════════════════════════════════════════════
+            # FRESH START: Reset LAST_CLOSE_TIMESTAMP to 0.0 so that
+            # pre_order_fill_verification() knows this is a fresh session
+            # and will NOT read old fills to override Step 1.
+            # Also clear in-memory fill tracking sets so old order IDs
+            # from previous session don't block new fill detection.
+            # ══════════════════════════════════════════════════════════
+            LAST_CLOSE_TIMESTAMP = 0.0
+            with USED_FILL_IDS_LOCK:
+                USED_FILL_IDS.clear()
+            with PROCESSED_ORDER_IDS_LOCK:
+                PROCESSED_ORDER_IDS.clear()
+            log_system("FRESH START: LAST_CLOSE_TIMESTAMP reset, fill ID sets cleared")
+ 
     while BOT_STATE['running']:
         try:
             if BOT_STATE['force_stop']:
-                print("🛑 Force Stop triggered - Stopping bot immediately!")
+                print("🛑 Force Stop triggered!")
                 BOT_STATE['running']    = False
                 BOT_STATE['force_stop'] = False
                 break
-
+ 
             global WAITING_FOR_FILL, TRADE_COMPLETED
-
-            # =====================================================================
+ 
             # ORDER COMPLETION GUARD
-            # If the current order is not yet fully processed, block until done.
-            # =====================================================================
             if not BOT_STATE['order_completed']:
                 pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
                 log_system(f"BLOCKING NEXT ORDER - CURRENT ORDER NOT FINISHED: {pending_order_id}")
-
+ 
                 has_position, was_closed, pnl = check_position_and_detect_closure()
-
+ 
                 if was_closed:
                     print(f"🎯 Position closed during order-guard wait! PnL: {pnl}")
                     if pnl > 0 and BOT_STATE['stop_at_win']:
-                        print(f"🏆 PROFIT - STOP AT WIN ACTIVATED!")
                         BOT_STATE['running']     = False
                         BOT_STATE['stop_at_win'] = False
                         continue
                     if pnl < 0 and BOT_STATE['current_step'] == 1 and BOT_STATE['stop_at_max_step']:
-                        print(f"🚨 MAX STEP HIT! - STOP AT MAX STEP ACTIVATED!")
                         BOT_STATE['running']          = False
                         BOT_STATE['stop_at_max_step'] = False
                         continue
@@ -1683,10 +2002,10 @@ def auto_trading_bot_main():
                     continue
                 else:
                     if not BOT_STATE['order_completed']:
-                        print(f"⏳ Order guard: waiting for fill processing to complete for order {pending_order_id}...")
+                        print(f"⏳ Order guard: waiting for fill processing for order {pending_order_id}...")
                         time.sleep(0.5)
                         continue
-
+ 
             if WAITING_FOR_FILL:
                 if TRADE_COMPLETED:
                     WAITING_FOR_FILL = False
@@ -1696,41 +2015,35 @@ def auto_trading_bot_main():
                     print("⏳ Waiting for trade save to complete...")
                     time.sleep(0.5)
                     continue
-
+ 
             print(f"\n{'='*50}")
             print(f"🔍 BOT LOOP - Symbol: {BOT_STATE['symbol']}")
             print(f"📊 Running: {BOT_STATE['running']}, Step: {BOT_STATE['current_step']}, Lot: {BOT_STATE['current_lot']}")
             print(f"{'='*50}")
-
+ 
             has_position, was_closed, pnl = check_position_and_detect_closure()
-
+ 
             if was_closed:
                 print(f"🎯 Position closed! PnL: {pnl}")
                 print(f"📊 Result: {'PROFIT ✅' if pnl > 0 else 'LOSS ❌'}")
-                print(f"💰 Next Step: {BOT_STATE['current_step']}, Lot: {BOT_STATE['current_lot']}")
-
                 if pnl > 0 and BOT_STATE['stop_at_win']:
-                    print(f"🏆 PROFIT - STOP AT WIN ACTIVATED!")
                     BOT_STATE['running']     = False
                     BOT_STATE['stop_at_win'] = False
                     continue
-
                 if pnl < 0 and BOT_STATE['current_step'] == 1 and BOT_STATE['stop_at_max_step']:
-                    print(f"🚨 MAX STEP HIT! - STOP AT MAX STEP ACTIVATED!")
                     BOT_STATE['running']          = False
                     BOT_STATE['stop_at_max_step'] = False
                     continue
-
+ 
             if has_position:
                 print("⏳ Active position - waiting for closure...")
                 time.sleep(0.5)
                 continue
-
+ 
             if BOT_STATE['force_stop']:
-                print("🛑 FORCE STOP ACTIVE")
                 BOT_STATE['running'] = False
                 continue
-
+ 
             # COOLDOWN CHECK
             elapsed = time.time() - LAST_CLOSE_TIMESTAMP
             if elapsed < COOLDOWN_SECONDS and LAST_CLOSE_TIMESTAMP > 0:
@@ -1738,63 +2051,66 @@ def auto_trading_bot_main():
                 print(f"⏱️ COOLDOWN: {remaining:.1f}s remaining before next order")
                 time.sleep(remaining)
                 continue
-
-            # ─────────────────────────────────────────────────────────────
-            # PRE-ORDER DB CHECK
-            # order_completed is True here (guarded above).
-            # ALWAYS load DB state before placing a new order so the step
-            # is correct after any trade result.
-            # Exception: first order after fresh startup (no position found)
-            # uses Step 1 set above — but we still call load+sync to let DB
-            # confirm. If DB has no state or says Step 1, no change. If DB
-            # says a different step (impossible on fresh start but defensive),
-            # we keep Step 1 because fresh_no_position was set.
-            # ─────────────────────────────────────────────────────────────
+ 
+            # ================================================================
+            # PRE-ORDER FILL VERIFICATION (INDEPENDENT)
+            # ================================================================
+            # This replaces the previous DB load + sync logic.
+            # It independently verifies the last real fill pair from official
+            # API and corrects step/lot in BOT_STATE before every new order.
+            #
+            # NOTE: On fresh session start (LAST_CLOSE_TIMESTAMP == 0.0),
+            # pre_order_fill_verification() will immediately return with
+            # source='fresh_start' and will NOT read old fills.
+            # This prevents old session fills from overriding Step 1.
+            # ================================================================
             if not BOT_STATE['order_completed']:
                 pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
-                log_error(f"DB SYNC BLOCKED - CURRENT ORDER NOT FINISHED: {pending_order_id}")
+                log_error(f"BLOCKED - ORDER NOT FINISHED: {pending_order_id}")
                 time.sleep(0.5)
                 continue
-
-            print(f"\n🔍 [PRE-ORDER DB CHECK] Loading latest state from database...")
-
-            # ── THE KEY FIX ──────────────────────────────────────────────
-            # Only load DB state if this is NOT the very first order of a
-            # fresh-start session (no position on boot).
-            # BOT_STATE['_fresh_no_position'] is set once on startup when
-            # no position is found, and cleared after the first order.
-            # ─────────────────────────────────────────────────────────────
-            if BOT_STATE.get('_fresh_no_position'):
-                # First order of fresh session — stay at Step 1, skip DB load
-                print(f"   ⚡ Fresh start (no position on boot) — keeping Step 1, skipping DB load")
-                print(f"   ✅ Step: {BOT_STATE['current_step']} | Lot: {BOT_STATE['current_lot']}")
-                BOT_STATE.pop('_fresh_no_position', None)  # Clear flag — normal DB sync from next trade onwards
-            else:
-                # Normal path — always trust DB before every new order
-                load_bot_state_from_db()
-                verify_and_sync_step_from_db()
-                print(f"   ✅ DB Step: {BOT_STATE['current_step']}")
-                print(f"   ✅ DB Lot : {BOT_STATE['current_lot']}")
-
+ 
+            print(f"\n🔍 [PRE-ORDER VERIFY] Running independent fill verification...")
+ 
+            # ─── KEY DIFFERENCE FROM ORIGINAL ───────────────────────────────
+            # Instead of load_bot_state_from_db() + verify_and_sync_step_from_db()
+            # we call pre_order_fill_verification() which:
+            # 1. Returns immediately if LAST_CLOSE_TIMESTAMP == 0.0 (fresh start)
+            # 2. Waits for fills only if position closed recently this session
+            # 3. Fetches real fills from API
+            # 4. Finds last entry+exit pair
+            # 5. Corrects step/lot from REAL lot_size, not from BOT_STATE
+            # ─────────────────────────────────────────────────────────────────
+            elapsed_since_close = time.time() - LAST_CLOSE_TIMESTAMP if LAST_CLOSE_TIMESTAMP > 0 else 9999
+            # If position just closed (within last 30s), wait for fills to propagate
+            # Otherwise no wait needed (fills from previous trade already propagated)
+            verify_wait = 0 if elapsed_since_close > 30 else max(0, 15 - elapsed_since_close)
+ 
+            verify_result = pre_order_fill_verification(BOT_STATE['symbol'], wait_seconds=int(verify_wait))
+ 
+            print(f"   ✅ Verify result: source={verify_result['source']} | pair_found={verify_result['pair_found']}")
+            print(f"   ✅ Last lot_used={verify_result['lot_used']} | pnl={verify_result['pnl']:.5f}")
+            print(f"   ✅ Next step={verify_result['next_step']} | Next lot={verify_result['next_lot']}")
+ 
             if BOT_STATE['stop_at_win']:
                 print("🎯 STOP AT WIN ACTIVE - Will stop after next profit")
-
+ 
             next_lot = calculate_next_lot()
             print(f"\n💰 PLACING ORDER - Step: {BOT_STATE['current_step']}, Lot: {next_lot}")
-
+ 
             LAST_TRADE_RESULT['processed'] = False
-
+ 
             signal_result = get_trading_signal()
             side          = signal_result[0] if signal_result else 'buy'
             signal_data   = signal_result[1] if signal_result and len(signal_result) > 1 else {}
-
+ 
             if side is None:
                 print("⏳ No signal - skipping this cycle")
                 time.sleep(1)
                 continue
-
+ 
             print(f"📈 Signal: {side.upper()} | Lot: {next_lot}")
-
+ 
             # Safety check: confirm no real position before placing order
             product_id = get_product_id(BOT_STATE['symbol'])
             if product_id:
@@ -1805,19 +2121,19 @@ def auto_trading_bot_main():
                     LAST_POSITION_STATE['size']        = current_pos.get('size', 0)
                     LAST_POSITION_STATE['entry_price'] = current_pos.get('entry_price', 0)
                     continue
-
+ 
             # Final guard before order
             if not BOT_STATE['order_completed']:
                 pending_order_id = BOT_STATE.get('last_placed_order_id', 'UNKNOWN')
-                log_error(f"BLOCKING NEXT ORDER - CURRENT ORDER NOT FINISHED: {pending_order_id} (pre-placement final guard)")
+                log_error(f"BLOCKING NEXT ORDER - ORDER NOT FINISHED: {pending_order_id}")
                 time.sleep(0.5)
                 continue
-
+ 
             print(f"🎯 PLACING ORDER: {side.upper()} {next_lot} lots")
-
+ 
             BOT_STATE['order_completed']      = False
             BOT_STATE['last_placed_order_id'] = None
-
+ 
             order_response = place_order_with_bracket(
                 BOT_STATE['symbol'],
                 side,
@@ -1826,21 +2142,21 @@ def auto_trading_bot_main():
                 BOT_STATE['tp_percent'],
                 BOT_STATE['sl_percent']
             )
-
+ 
             if order_response and order_response.get('success'):
                 placed_order_id = order_response.get('result', {}).get('id')
                 log_trade(f"ORDER PLACED | {side.upper()} | Lot={next_lot} | OrderID={placed_order_id}")
                 log_trade(f"TRACKING ORDER: {placed_order_id}")
-
+ 
                 BOT_STATE['last_placed_order_id'] = placed_order_id
                 print(f"   🎯 Tracking order ID: {placed_order_id}")
-
-                # POSITION CONFIRMATION BLOCK
+ 
+                # POSITION CONFIRMATION
                 print("⚡ Confirming position...")
                 max_wait_time  = 2
                 wait_start     = time.time()
                 position_found = False
-
+ 
                 while time.time() - wait_start < max_wait_time:
                     time.sleep(0.05)
                     current_pos = check_position_realtime(product_id)
@@ -1852,11 +2168,11 @@ def auto_trading_bot_main():
                         BOT_STATE['current_lot']           = abs(current_pos.get('size', 0))
                         position_found = True
                         break
-
+ 
                 if not position_found:
                     print("⚠️ Position not confirmed in fast-poll — doing final authoritative check...")
                     final_pos = check_position_realtime(product_id)
-
+ 
                     if final_pos.get('error'):
                         print("⚠️ API error on final position check — skipping state update")
                     elif abs(final_pos.get('size', 0)) > 0.001:
@@ -1868,14 +2184,14 @@ def auto_trading_bot_main():
                     else:
                         print(f"ℹ️ Final check: no position found for order {placed_order_id}")
                         print(f"ℹ️ Possible micro-close — dead reckoning will detect via fills")
-
+ 
             else:
                 print("❌ Order failed!")
                 print(f"📋 Response: {order_response}")
                 BOT_STATE['order_completed']      = True
                 BOT_STATE['last_placed_order_id'] = None
                 time.sleep(0.5)
-
+ 
         except Exception as e:
             print(f"🚨 BOT ERROR: {e}")
             import traceback
@@ -1883,14 +2199,13 @@ def auto_trading_bot_main():
             print("🔄 Retrying in 5 seconds...")
             time.sleep(5)
             continue
-
+ 
     print("🤖 Auto Trading Bot Stopped")
+ 
 
 
 # ========== TRADE COMPLETION MANAGEMENT ==========
-
 def wait_for_complete_trade(symbol, max_wait=15):
-    """Wait up to max_wait seconds for a complete entry+exit pair."""
     target_order_id = BOT_STATE.get('last_placed_order_id')
     if not target_order_id:
         log_error("wait_for_complete_trade: no last_placed_order_id set")
@@ -1908,29 +2223,21 @@ def wait_for_complete_trade(symbol, max_wait=15):
 
 
 def get_trade_with_retry(symbol, retries=5):
-    """Get trade data with retry logic."""
     target_order_id = BOT_STATE.get('last_placed_order_id')
     return wait_for_trade_fills(symbol, target_order_id, max_retries=retries, retry_delay=2)
 
 
 def get_pnl_from_fills():
-    """Get PnL from fills using the optimised engine"""
     pnl, _ = find_latest_closed_pair(BOT_STATE['symbol'])
     return pnl
 
 
 def get_entry_exit_from_fills():
-    """Get entry/exit data using the optimised engine"""
     _, entry_exit_data = find_latest_closed_pair(BOT_STATE['symbol'])
     return entry_exit_data
 
 
 def _apply_step_progression(pnl):
-    """
-    Apply martingale step progression immediately when trade result is known.
-    WIN  → reset to Step 1
-    LOSS → advance one step; if beyond max, reset to Step 1
-    """
     global BOT_STATE
 
     current_step = BOT_STATE['current_step']
@@ -1962,14 +2269,11 @@ def _apply_step_progression(pnl):
     log_state(f"Next Trade => {BOT_STATE['symbol']} {BOT_STATE['current_lot']} Lots")
 
 
-# ========== WEBSOCKET FILL ENGINE (GLOBAL STATE) ==========
-
+# ========== WEBSOCKET FILL ENGINE ==========
 WS_FILL_QUEUE          = []
 WS_FILL_QUEUE_LOCK     = Lock()
-
 WS_POSITION_QUEUE      = []
 WS_POSITION_QUEUE_LOCK = Lock()
-
 WS_APP             = None
 WS_THREAD          = None
 WS_AUTHENTICATED   = False
@@ -1991,7 +2295,6 @@ def _ws_send_auth(ws):
     path      = '/live'
     sig_data  = method + timestamp + path
     signature = _ws_generate_signature(DELTA_API_SECRET, sig_data)
-
     auth_msg = {
         "type": "auth",
         "payload": {
@@ -2008,12 +2311,7 @@ def _ws_subscribe(ws, channel, symbols):
     sub_msg = {
         "type": "subscribe",
         "payload": {
-            "channels": [
-                {
-                    "name":    channel,
-                    "symbols": symbols
-                }
-            ]
+            "channels": [{"name": channel, "symbols": symbols}]
         }
     }
     ws.send(json.dumps(sub_msg))
@@ -2027,7 +2325,6 @@ def _ws_on_open(ws):
 
 def _ws_on_message(ws, message):
     global WS_AUTHENTICATED
-
     try:
         msg      = json.loads(message)
         msg_type = msg.get('type', '')
@@ -2035,7 +2332,6 @@ def _ws_on_message(ws, message):
         if msg_type == 'success' and msg.get('message') == 'Authenticated':
             WS_AUTHENTICATED = True
             print("[WS] Authenticated successfully")
-
             symbol = BOT_STATE.get('symbol', 'ETHUSD')
             _ws_subscribe(ws, 'v2/user_trades', [symbol])
             _ws_subscribe(ws, 'positions',      [symbol])
@@ -2064,7 +2360,6 @@ def _ws_on_message(ws, message):
 
         if msg_type == 'positions':
             action = msg.get('action', '')
-
             if action == 'snapshot':
                 for pos in msg.get('result', []):
                     sym = pos.get('product_symbol') or pos.get('symbol', '')
@@ -2078,8 +2373,7 @@ def _ws_on_message(ws, message):
                         }
                         with WS_POSITION_QUEUE_LOCK:
                             WS_POSITION_QUEUE.append(update)
-                        print(f"[WS] POSITION snapshot: size={update['size']} "
-                              f"entry={update['entry_price']}")
+                        print(f"[WS] POSITION snapshot: size={update['size']} entry={update['entry_price']}")
             else:
                 sym = msg.get('symbol', '')
                 if sym == BOT_STATE.get('symbol'):
@@ -2092,8 +2386,7 @@ def _ws_on_message(ws, message):
                     }
                     with WS_POSITION_QUEUE_LOCK:
                         WS_POSITION_QUEUE.append(update)
-                    print(f"[WS] POSITION update ({action}): "
-                          f"size={update['size']} entry={update['entry_price']}")
+                    print(f"[WS] POSITION update ({action}): size={update['size']} entry={update['entry_price']}")
             return
 
     except Exception as e:
@@ -2112,14 +2405,11 @@ def _ws_on_close(ws, close_status_code, close_msg):
 
 def _ws_reconnect_loop():
     global WS_APP, WS_RUNNING, WS_AUTHENTICATED
-
     print("[WS] Reconnect loop started")
-
     while WS_RUNNING:
         try:
             print(f"[WS] Connecting to {WS_URL} ...")
             WS_AUTHENTICATED = False
-
             WS_APP = websocket.WebSocketApp(
                 WS_URL,
                 on_open    = _ws_on_open,
@@ -2127,26 +2417,20 @@ def _ws_reconnect_loop():
                 on_error   = _ws_on_error,
                 on_close   = _ws_on_close
             )
-
             WS_APP.run_forever(ping_interval=20, ping_timeout=10)
-
         except Exception as e:
             print(f"[WS] run_forever exception: {e}")
-
         if WS_RUNNING:
             print(f"[WS] Reconnecting in {WS_RECONNECT_DELAY}s ...")
             time.sleep(WS_RECONNECT_DELAY)
-
     print("[WS] Reconnect loop exited")
 
 
 def start_websocket_engine():
     global WS_THREAD, WS_RUNNING
-
     if WS_RUNNING and WS_THREAD and WS_THREAD.is_alive():
         print("[WS] Engine already running")
         return
-
     WS_RUNNING = True
     WS_THREAD  = threading.Thread(target=_ws_reconnect_loop, daemon=True, name="WS-Engine")
     WS_THREAD.start()
@@ -2155,17 +2439,14 @@ def start_websocket_engine():
 
 def stop_websocket_engine():
     global WS_RUNNING, WS_APP, WS_AUTHENTICATED
-
     WS_RUNNING       = False
     WS_AUTHENTICATED = False
-
     if WS_APP:
         try:
             WS_APP.close()
         except Exception:
             pass
         WS_APP = None
-
     print("[WS] Engine stopped")
 
 
@@ -2173,7 +2454,6 @@ def _drain_ws_fill_queue(symbol):
     with WS_FILL_QUEUE_LOCK:
         symbol_fills = [f for f in WS_FILL_QUEUE if f.get('symbol') == symbol]
         WS_FILL_QUEUE[:] = [f for f in WS_FILL_QUEUE if f.get('symbol') != symbol]
-
     symbol_fills.sort(key=lambda x: x.get('timestamp_us', 0))
     return symbol_fills
 
@@ -2182,17 +2462,12 @@ def _drain_ws_position_queue(symbol):
     with WS_POSITION_QUEUE_LOCK:
         symbol_pos = [p for p in WS_POSITION_QUEUE if p.get('symbol') == symbol]
         WS_POSITION_QUEUE[:] = [p for p in WS_POSITION_QUEUE if p.get('symbol') != symbol]
-
     if not symbol_pos:
         return None
     return symbol_pos[-1]
 
 
 def _pair_ws_fills(fills, symbol):
-    """
-    Pair WS fills into entry+exit trades.
-    Only processes fills related to BOT_STATE['last_placed_order_id'].
-    """
     if not fills:
         return []
 
@@ -2271,12 +2546,8 @@ def _pair_ws_fills(fills, symbol):
         else:
             pnl = (entry_price - exit_price) * actual_quantity
 
-        entry_ts_iso = datetime.utcfromtimestamp(
-            entry_order['timestamp_us'] / 1_000_000
-        ).isoformat() + 'Z'
-        exit_ts_iso  = datetime.utcfromtimestamp(
-            exit_order['timestamp_us'] / 1_000_000
-        ).isoformat() + 'Z'
+        entry_ts_iso = datetime.utcfromtimestamp(entry_order['timestamp_us'] / 1_000_000).isoformat() + 'Z'
+        exit_ts_iso  = datetime.utcfromtimestamp(exit_order['timestamp_us'] / 1_000_000).isoformat() + 'Z'
 
         log_trade(f"PNL CALCULATED | {entry_side.upper()} | Entry={entry_price:.6f} | Exit={exit_price:.6f} | PnL={pnl:.6f}")
         log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
@@ -2300,7 +2571,7 @@ def _pair_ws_fills(fills, symbol):
             'exit_order_id':  exit_order['order_id']
         }]
 
-    # Fallback: no target order ID - pair all (FIFO)
+    # Fallback: FIFO pairing
     completed_trades = []
     pending_entries  = []
 
@@ -2332,12 +2603,8 @@ def _pair_ws_fills(fills, symbol):
             else:
                 pnl = (entry_price - exit_price) * actual_quantity
 
-            entry_ts_iso = datetime.utcfromtimestamp(
-                entry_order['timestamp_us'] / 1_000_000
-            ).isoformat() + 'Z'
-            exit_ts_iso  = datetime.utcfromtimestamp(
-                exit_order['timestamp_us'] / 1_000_000
-            ).isoformat() + 'Z'
+            entry_ts_iso = datetime.utcfromtimestamp(entry_order['timestamp_us'] / 1_000_000).isoformat() + 'Z'
+            exit_ts_iso  = datetime.utcfromtimestamp(exit_order['timestamp_us'] / 1_000_000).isoformat() + 'Z'
 
             with PROCESSED_ORDER_IDS_LOCK:
                 PROCESSED_ORDER_IDS.add(entry_order['order_id'])
@@ -2363,17 +2630,8 @@ def _pair_ws_fills(fills, symbol):
     return completed_trades
 
 
-# ========== IMPROVED POSITION TRACKING (WEBSOCKET + POLLING HYBRID) ==========
+# ========== POSITION TRACKING (WEBSOCKET + POLLING HYBRID) ==========
 def check_position_and_detect_closure():
-    """
-    Hybrid WebSocket + REST polling + Dead-Reckoning position tracker.
-
-    Detection priority:
-      1. WebSocket v2/user_trades fills
-      2. WebSocket positions channel
-      3. REST polling fallback
-      4. DEAD RECKONING
-    """
     global LAST_POSITION_STATE, LAST_CLOSE_TIMESTAMP
     global WAITING_FOR_FILL, TRADE_COMPLETED, CURRENT_SIGNAL
 
@@ -2387,23 +2645,18 @@ def check_position_and_detect_closure():
             print(f"[WS] {len(ws_fills)} new fill(s) drained from WS queue")
 
             with USED_FILL_IDS_LOCK:
-                fresh_fills = [
-                    f for f in ws_fills
-                    if f['order_id'] not in USED_FILL_IDS
-                ]
+                fresh_fills = [f for f in ws_fills if f['order_id'] not in USED_FILL_IDS]
 
             if fresh_fills:
                 completed_trades = _pair_ws_fills(fresh_fills, symbol)
 
                 if completed_trades:
                     for trade in completed_trades:
-                        print(f"[WS] Processing WS-detected trade: "
-                              f"{trade['side'].upper()} PnL={trade['pnl']:.6f}")
+                        print(f"[WS] Processing WS-detected trade: {trade['side'].upper()} PnL={trade['pnl']:.6f}")
 
                         completed_order_id = trade.get('entry_order_id', BOT_STATE.get('last_placed_order_id'))
 
                         LAST_CLOSE_TIMESTAMP               = time.time()
-                        prev_size                          = LAST_POSITION_STATE['size']
                         LAST_POSITION_STATE['size']        = 0
                         LAST_POSITION_STATE['entry_price'] = 0
 
@@ -2428,20 +2681,19 @@ def check_position_and_detect_closure():
                         BOT_STATE['last_pnl']    = pnl
 
                         _apply_step_progression(pnl)
-
                         save_bot_state_to_db()
                         log_state(f"STATE SAVED FOR ORDER: {completed_order_id} | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
                         save_closed_position({
-                            'symbol':          symbol,
-                            'side':            entry_exit_data['side'],
-                            'entry_price':     entry_exit_data['entry_price'],
-                            'exit_price':      entry_exit_data['exit_price'],
-                            'quantity':        entry_exit_data['quantity'],
-                            'pnl':             pnl,
-                            'entry_time':      entry_exit_data['entry_time'],
-                            'exit_time':       entry_exit_data['exit_time'],
-                            'entry_order_id':  entry_exit_data.get('entry_order_id')
+                            'symbol':         symbol,
+                            'side':           entry_exit_data['side'],
+                            'entry_price':    entry_exit_data['entry_price'],
+                            'exit_price':     entry_exit_data['exit_price'],
+                            'quantity':       entry_exit_data['quantity'],
+                            'pnl':            pnl,
+                            'entry_time':     entry_exit_data['entry_time'],
+                            'exit_time':      entry_exit_data['exit_time'],
+                            'entry_order_id': entry_exit_data.get('entry_order_id')
                         })
                         log_trade(f"TRADE SAVED FOR ORDER: {completed_order_id}")
 
@@ -2480,15 +2732,13 @@ def check_position_and_detect_closure():
 
                     return has_position, True, completed_trades[-1]['pnl']
 
-        # STEP 2: Check WebSocket position queue for closure signal
+        # STEP 2: Check WebSocket position queue
         ws_pos = _drain_ws_position_queue(symbol)
 
         if ws_pos:
-            print(f"[WS] Position update from WS: size={ws_pos['size']} "
-                  f"entry={ws_pos['entry_price']} action={ws_pos['action']}")
+            print(f"[WS] Position update from WS: size={ws_pos['size']} entry={ws_pos['entry_price']} action={ws_pos['action']}")
 
             prev_size = LAST_POSITION_STATE['size']
-
             LAST_POSITION_STATE = {
                 'symbol':      symbol,
                 'size':        ws_pos['size'],
@@ -2506,12 +2756,10 @@ def check_position_and_detect_closure():
                 target_order_id = BOT_STATE.get('last_placed_order_id')
                 log_trade(f"TRACKING ORDER: {target_order_id}")
 
-                print("⏳ Waiting 10 seconds for fills to propagate...")
-                time.sleep(10)
+                print("⏳ Waiting 15 seconds for fills to propagate...")
+                time.sleep(15)
 
-                pnl, entry_exit_data = wait_for_trade_fills(
-                    symbol, target_order_id, max_retries=5, retry_delay=2
-                )
+                pnl, entry_exit_data = wait_for_trade_fills(symbol, target_order_id, max_retries=5, retry_delay=2)
 
                 if entry_exit_data:
                     log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
@@ -2568,7 +2816,6 @@ def check_position_and_detect_closure():
 
                     _apply_step_progression(pnl)
                     save_bot_state_to_db()
-                    log_state(f"STATE SAVED FOR ORDER: {target_order_id} (fallback) | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
                     fallback_data = {
                         'side':        'buy' if prev_size > 0 else 'sell',
@@ -2589,7 +2836,6 @@ def check_position_and_detect_closure():
                         'exit_time':      fallback_data['exit_time'],
                         'entry_order_id': str(target_order_id) if target_order_id else None
                     })
-                    log_trade(f"TRADE SAVED FOR ORDER: {target_order_id} (fallback)")
 
                     WAITING_FOR_FILL = True
                     TRADE_COMPLETED  = True
@@ -2631,12 +2877,10 @@ def check_position_and_detect_closure():
             target_order_id = BOT_STATE.get('last_placed_order_id')
             log_trade(f"TRACKING ORDER: {target_order_id}")
 
-            print("⏳ Waiting 10 seconds for fills to propagate...")
-            time.sleep(10)
+            print("⏳ Waiting 15 seconds for fills to propagate...")
+            time.sleep(15)
 
-            pnl, entry_exit_data = wait_for_trade_fills(
-                symbol, target_order_id, max_retries=5, retry_delay=2
-            )
+            pnl, entry_exit_data = wait_for_trade_fills(symbol, target_order_id, max_retries=5, retry_delay=2)
 
             if entry_exit_data:
                 log_trade(f"PAIR FOUND FOR ORDER: {target_order_id}")
@@ -2690,7 +2934,6 @@ def check_position_and_detect_closure():
 
                 _apply_step_progression(pnl)
                 save_bot_state_to_db()
-                log_state(f"STATE SAVED FOR ORDER: {target_order_id} (fallback) | Step={BOT_STATE['current_step']} | Lot={BOT_STATE['current_lot']}")
 
                 fallback_data = {
                     'side':        'buy' if prev_size > 0 else 'sell',
@@ -2711,9 +2954,7 @@ def check_position_and_detect_closure():
                     'exit_time':      fallback_data['exit_time'],
                     'entry_order_id': str(target_order_id) if target_order_id else None
                 })
-                log_trade(f"TRADE SAVED FOR ORDER: {target_order_id} (fallback)")
                 TRADE_COMPLETED = True
-
                 _mark_order_complete(target_order_id)
 
         # STEP 4: DEAD RECKONING
@@ -2726,11 +2967,8 @@ def check_position_and_detect_closure():
 
             target_order_id = BOT_STATE['last_placed_order_id']
             log_trade(f"DEAD RECKONING CHECK | No position found but order pending: {target_order_id}")
-            log_trade(f"TRACKING ORDER: {target_order_id}")
 
-            pnl, entry_exit_data = wait_for_trade_fills(
-                symbol, target_order_id, max_retries=5, retry_delay=2
-            )
+            pnl, entry_exit_data = wait_for_trade_fills(symbol, target_order_id, max_retries=5, retry_delay=2)
 
             if entry_exit_data:
                 log_trade(f"DEAD RECKONING: PAIR FOUND FOR ORDER: {target_order_id}")
@@ -2780,9 +3018,8 @@ def check_position_and_detect_closure():
 
                 return False, True, pnl
 
-            log_trade(f"DEAD RECKONING: fills not found yet for order {target_order_id} - will retry next cycle")
+            log_trade(f"DEAD RECKONING: fills not found yet for order {target_order_id}")
 
-        # Normal path: update position state from REST and return
         LAST_POSITION_STATE = {
             'symbol':      symbol,
             'size':        current_pos.get('size', 0),
@@ -2804,7 +3041,6 @@ CURRENT_SIGNAL = None
 
 
 def get_trading_signal():
-    """Generate completely new unbiased trading signal on every call"""
     global CURRENT_SIGNAL
     try:
         CURRENT_SIGNAL = generate_smart_signal(reason="trade_decision")
@@ -2815,7 +3051,7 @@ def get_trading_signal():
         elif signal.upper() == "SELL":
             return 'sell', CURRENT_SIGNAL
         else:
-            print(f"⏳ Signal WAIT — 30s sleep before retry...")
+            print(f"⏳ Signal WAIT — sleeping before retry...")
             time.sleep(10)
             return None, CURRENT_SIGNAL
 
@@ -2825,7 +3061,6 @@ def get_trading_signal():
 
 
 def start_signal_bot():
-    """Start the signal bot"""
     try:
         print("🤖 Signal bot ready - will generate unbiased random signals on demand")
         return True
@@ -2835,7 +3070,6 @@ def start_signal_bot():
 
 
 def stop_signal_bot():
-    """Stop the signal bot"""
     try:
         print("🛑 Signal bot stopped")
     except Exception as e:
@@ -2843,7 +3077,6 @@ def stop_signal_bot():
 
 
 def detect_current_step_from_lot(lot_size):
-    """Detect current step based on lot size"""
     lot_size = abs(lot_size)
     for step, lot in LOT_STEPS.items():
         if lot == lot_size:
@@ -2855,7 +3088,6 @@ def detect_current_step_from_lot(lot_size):
 
 
 def detect_current_step_from_live_position():
-    """Detect current step from live position lot size"""
     try:
         has_position = abs(LAST_POSITION_STATE['size']) > 0.001
         if has_position:
@@ -2872,12 +3104,6 @@ def detect_current_step_from_live_position():
 
 
 def calculate_next_lot():
-    """
-    Calculate next lot to use.
-    Step progression is already applied in _apply_step_progression()
-    and verified by verify_and_sync_step_from_db().
-    This function just reads the pre-calculated value.
-    """
     global LOT_CALCULATION_LOCK
 
     if LOT_CALCULATION_LOCK:
@@ -2901,7 +3127,8 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
         PRODUCT_CONFIG = {
             "ADAUSD": {"id": 16614, "tick": Decimal("0.00001")},
             "BTCUSD": {"id": 84,    "tick": Decimal("0.5")},
-            "ETHUSD": {"id": 3136,  "tick": Decimal("0.05")},
+        
+             "ETHUSD": {"id": 3136,  "tick": Decimal("0.05")},
             # "ETHUSD": {"id": 1699,  "tick": Decimal("0.05")},
         }
 
@@ -2938,15 +3165,11 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
         min_gap   = tick * MIN_TICKS
 
         if side == 'buy':
-            if tp_dec <= base_dec:
-                tp_dec = base_dec + min_gap
-            if sl_dec >= base_dec:
-                sl_dec = base_dec - min_gap
+            if tp_dec <= base_dec: tp_dec = base_dec + min_gap
+            if sl_dec >= base_dec: sl_dec = base_dec - min_gap
         else:
-            if tp_dec >= base_dec:
-                tp_dec = base_dec - min_gap
-            if sl_dec <= base_dec:
-                sl_dec = base_dec + min_gap
+            if tp_dec >= base_dec: tp_dec = base_dec - min_gap
+            if sl_dec <= base_dec: sl_dec = base_dec + min_gap
 
         tp_price = str(tp_dec)
         sl_price = str(sl_dec)
@@ -2966,7 +3189,7 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
         response = make_api_request('POST', '/orders', order_data)
 
         if response and response.get('success') and 'result' in response:
-            oid     = response['result'].get('id')
+            oid = response['result'].get('id')
             actual_entry = float(
                 response['result'].get('average_fill_price') or
                 response['result'].get('limit_price') or
@@ -3013,7 +3236,6 @@ def place_order_with_bracket(symbol, side, size, leverage, tp_pct, sl_pct):
 
 
 def start_auto_trading_bot():
-    """Start the bot"""
     if BOT_STATE['running']:
         return False
 
@@ -3042,7 +3264,6 @@ def start_auto_trading_bot():
 
 
 def stop_auto_trading_bot():
-    """Stop the bot"""
     if not BOT_STATE['running']:
         return False
     BOT_STATE['running'] = False
@@ -3058,29 +3279,22 @@ def stop_auto_trading_bot():
 
 
 def clear_stuck_trade_result():
-    """Clear stuck trade result to fix bot"""
     global LAST_TRADE_RESULT
-
     log_system("CLEARING STUCK TRADE RESULT...")
-
     LAST_TRADE_RESULT = {
         'profit_loss': None,
         'timestamp': None,
         'lot_used': None,
         'processed': False
     }
-
     BOT_STATE['order_completed']      = True
     BOT_STATE['last_placed_order_id'] = None
-
     log_system("Trade result cleared")
     return True
 
 
 def reconcile_stuck_trades_from_database():
-    """Check MySQL database for trades that might be stuck and auto-clear them"""
     global LAST_TRADE_RESULT
-
     try:
         query = '''
             SELECT symbol, side, entry_price, exit_price, quantity, pnl,
@@ -3121,7 +3335,6 @@ def index():
 
 @app.route('/ping')
 def ping():
-    """Health check endpoint for keepalive services"""
     return jsonify({
         'status': 'alive',
         'timestamp': datetime.now().isoformat(),
@@ -3132,7 +3345,6 @@ def ping():
 
 @app.route('/api/system-ip', methods=['GET'])
 def get_system_ip():
-    """Get current system IP address"""
     try:
         import socket
         try:
@@ -3156,20 +3368,6 @@ def get_system_ip():
 
 @app.route('/api/start-bot', methods=['POST'])
 def start_bot():
-    """
-    Start the bot.
-
-    STARTUP STEP LOGIC:
-    ══════════════════
-    1. Check for live position first.
-    2. If position EXISTS  → use live lot to determine step (DB irrelevant for current step).
-    3. If NO position      → set Step 1 immediately. Do NOT load DB state.
-                             DB state is from previous session and must be ignored.
-                             The bot loop will load+sync DB before EACH subsequent order.
-
-    This guarantees: fresh start always = Step 1.
-    Position open on restart = correct step from live lot.
-    """
     try:
         data = request.get_json()
         if not data:
@@ -3183,13 +3381,10 @@ def start_bot():
 
         if not isinstance(leverage, int) or leverage < 1 or leverage > 200:
             return jsonify({'success': False, 'message': 'Leverage must be integer between 1-200'}), 400
-
         if not isinstance(tp_percent, (int, float)) or tp_percent < 0.1 or tp_percent > 50:
             return jsonify({'success': False, 'message': 'TP percent must be between 0.1-50'}), 400
-
         if not isinstance(sl_percent, (int, float)) or sl_percent < 0.1 or sl_percent > 50:
             return jsonify({'success': False, 'message': 'SL percent must be between 0.1-50'}), 400
-
         if not isinstance(symbol, str) or len(symbol) < 1 or len(symbol) > 20:
             return jsonify({'success': False, 'message': 'Symbol must be string between 1-20 characters'}), 400
 
@@ -3199,9 +3394,6 @@ def start_bot():
         BOT_STATE['max_steps']  = max_steps
         BOT_STATE['symbol']     = symbol.upper()
 
-        # ── STEP DETERMINATION ──────────────────────────────────────────
-        # Check live position FIRST, before any DB load.
-        # ────────────────────────────────────────────────────────────────
         log_system("CHECKING FOR EXISTING LIVE POSITION...")
         product_id            = get_product_id(symbol)
         has_existing_position = False
@@ -3209,33 +3401,24 @@ def start_bot():
         if product_id:
             current_pos = check_position_realtime(product_id)
             if abs(current_pos.get('size', 0)) > 0.001:
-                # ── EXISTING POSITION: load DB to get correct NEXT step ──
                 has_existing_position = True
                 current_lot   = abs(current_pos.get('size', 0))
                 detected_step = detect_current_step_from_lot(current_lot)
 
-                # Also load DB state so we know the next step after this position closes
                 log_system("EXISTING POSITION FOUND — loading DB state for step continuity...")
                 load_bot_state_from_db()
 
-                # Live position's lot is authoritative for CURRENT step
                 BOT_STATE['current_step'] = detected_step
                 BOT_STATE['current_lot']  = current_lot
                 log_system(f"EXISTING POSITION: {current_lot} lots = Step {detected_step}")
-
             else:
-                # ── NO POSITION: always Step 1, skip DB load entirely ───
                 log_system("No existing position — FRESH START at Step 1 (DB state ignored)")
-                BOT_STATE['current_step']       = 1
-                BOT_STATE['current_lot']        = LOT_STEPS[1]
-                # Signal auto_trading_bot_main to skip first DB load as well
-                BOT_STATE['_fresh_no_position'] = True
+                BOT_STATE['current_step'] = 1
+                BOT_STATE['current_lot']  = LOT_STEPS[1]
         else:
-            # Could not get product_id — safe default is Step 1
             log_system("Could not check position (no product_id) — defaulting to Step 1")
-            BOT_STATE['current_step']       = 1
-            BOT_STATE['current_lot']        = LOT_STEPS[1]
-            BOT_STATE['_fresh_no_position'] = True
+            BOT_STATE['current_step'] = 1
+            BOT_STATE['current_lot']  = LOT_STEPS[1]
 
         log_system(f"BOT STARTING: Step={BOT_STATE['current_step']}, Lot={BOT_STATE['current_lot']}, TP={BOT_STATE['tp_percent']}%, SL={BOT_STATE['sl_percent']}%")
 
@@ -3255,7 +3438,6 @@ def start_bot():
 
 @app.route('/api/force-stop', methods=['POST'])
 def force_stop_bot():
-    """Force stop bot immediately"""
     try:
         BOT_STATE['force_stop'] = True
         log_system("FORCE STOP ACTIVATED")
@@ -3266,7 +3448,6 @@ def force_stop_bot():
 
 @app.route('/api/stop-at-win', methods=['POST'])
 def stop_at_win():
-    """Stop bot after next profitable trade"""
     try:
         BOT_STATE['stop_at_win'] = True
         BOT_STATE['force_stop']  = False
@@ -3278,7 +3459,6 @@ def stop_at_win():
 
 @app.route('/api/stop-at-max-streak', methods=['POST'])
 def stop_at_max_streak():
-    """Stop bot when max loss streak is hit"""
     try:
         BOT_STATE['stop_at_max_step'] = True
         BOT_STATE['force_stop']       = False
@@ -3291,7 +3471,6 @@ def stop_at_max_streak():
 
 @app.route('/api/clear-stop-conditions', methods=['POST'])
 def clear_stop_conditions():
-    """Clear all stop conditions"""
     try:
         BOT_STATE['stop_at_win']      = False
         BOT_STATE['stop_at_max_step'] = False
@@ -3304,18 +3483,14 @@ def clear_stop_conditions():
 
 @app.route('/api/update-symbol', methods=['POST'])
 def update_symbol():
-    """Update trading symbol"""
     try:
         data       = request.get_json()
         new_symbol = data.get('symbol')
-
         if not new_symbol:
             return jsonify({'success': False, 'message': 'Symbol is required'}), 400
-
         valid_symbols = ['ETHUSD']
         if new_symbol not in valid_symbols:
             return jsonify({'success': False, 'message': f'Invalid symbol. Valid: {valid_symbols}'}), 400
-
         old_symbol          = BOT_STATE['symbol']
         BOT_STATE['symbol'] = new_symbol
         print(f"📊 Symbol updated: {old_symbol} → {new_symbol}")
@@ -3336,15 +3511,21 @@ def stop_bot():
 
 @app.route('/api/reset-bot-state', methods=['POST'])
 def reset_bot_state():
-    """
-    Reset bot state completely - clear DB state and restart from Step 1.
-    Also clears USED_FILL_IDS and PROCESSED_ORDER_IDS so fills are
-    re-evaluated fresh.
-    """
     try:
         global LAST_TRADE_RESULT, USED_FILL_IDS, LAST_CLOSE_TIMESTAMP
 
         clear_bot_state_from_db()
+
+        # Also clear recent_fills_cache for the current symbol
+        try:
+            execute_mysql_query(
+                "DELETE FROM recent_fills_cache WHERE symbol = %s",
+                (BOT_STATE['symbol'],),
+                commit=True
+            )
+            log_system("recent_fills_cache cleared for symbol")
+        except Exception as e:
+            log_error(f"Could not clear recent_fills_cache: {e}")
 
         BOT_STATE['current_step']         = 1
         BOT_STATE['current_lot']          = LOT_STEPS[1]
@@ -3352,7 +3533,6 @@ def reset_bot_state():
         BOT_STATE['order_completed']      = True
         BOT_STATE['last_placed_order_id'] = None
         BOT_STATE.pop('last_pnl', None)
-        BOT_STATE.pop('_fresh_no_position', None)
 
         LAST_TRADE_RESULT = {
             'profit_loss': None,
@@ -3429,7 +3609,6 @@ def get_bot_status():
 
 @app.route('/api/clear-stuck-result', methods=['POST'])
 def clear_stuck_result():
-    """Clear stuck trade result to fix bot"""
     try:
         if clear_stuck_trade_result():
             return jsonify({'success': True, 'message': 'Stuck trade result cleared'})
@@ -3441,13 +3620,11 @@ def clear_stuck_result():
 
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
-    """Fetch the last N lines from trade.log (clean logs)"""
     try:
         limit = int(request.args.get('limit', 100))
         log_file = "trade.log"
         if not os.path.exists(log_file):
             return jsonify({'success': True, 'logs': 'No trade logs found yet.'})
-
         with open(log_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
             last_lines = lines[-limit:]
@@ -3516,10 +3693,8 @@ def delete_trades():
     try:
         data      = request.get_json()
         trade_ids = data.get('trade_ids', [])
-
         if not trade_ids:
             return jsonify({'success': False, 'message': 'No trade IDs provided'})
-
         numeric_ids = []
         for trade_id in trade_ids:
             try:
@@ -3528,215 +3703,24 @@ def delete_trades():
                 numeric_ids.append(int(trade_id))
             except ValueError:
                 continue
-
         if not numeric_ids:
             return jsonify({'success': False, 'message': 'No valid trade IDs found'})
-
         placeholders = ','.join(['%s'] * len(numeric_ids))
         delete_query = f'DELETE FROM closed_positions WHERE id IN ({placeholders})'
         execute_mysql_query(delete_query, numeric_ids, commit=True)
-
         return jsonify({'success': True, 'message': f'Successfully deleted {len(numeric_ids)} trade(s)'})
-
     except Exception as e:
         return jsonify({'success': False, 'message': f'Error: {str(e)}'})
 
 
-# # ========== TP/SL GUARDIAN ==========
-# def auto_tp_sl_guardian():
-#     """
-#     🛡️ SAFE TP/SL GUARDIAN
-#     - Runs every 2 seconds
-#     - Edits wrong TP/SL (no deletion)
-#     - Places missing TP/SL immediately
-#     - Uses dynamic tolerance to avoid constant editing
-#     """
-#     while True:
-#         try:
-#             time.sleep(2)
-
-#             positions_response = make_api_request('GET', '/positions/margined')
-#             if not positions_response or not positions_response.get('success'):
-#                 continue
-
-#             active_positions = [
-#                 p for p in positions_response.get('result', [])
-#                 if abs(float(p.get('size', 0))) > 0.0001
-#             ]
-
-#             if not active_positions:
-#                 continue
-
-#             for pos in active_positions:
-#                 try:
-#                     symbol     = pos.get("product_symbol") or pos.get("symbol")
-#                     size       = float(pos.get("size", 0))
-#                     entry      = float(pos.get("entry_price", 0))
-#                     product_id = pos.get("product_id")
-
-#                     if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
-#                         continue
-
-#                     if size > 0:  # LONG
-#                         expected_tp = entry * (1 + LIVE_TP_PERCENTAGE / 100)
-#                         expected_sl = entry * (1 - LIVE_SL_PERCENTAGE / 100)
-#                     else:  # SHORT
-#                         expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
-#                         expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
-
-#                     dynamic_tolerance = entry * 0.0005
-
-#                     orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
-#                     if not orders_response or not orders_response.get('success'):
-#                         continue
-
-#                     orders       = orders_response.get("result", [])
-#                     tp_orders    = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "take_profit_order"]
-#                     sl_orders    = [o for o in orders if o.get("reduce_only") and o.get("stop_order_type") == "stop_loss_order"]
-
-#                     tp_valid        = False
-#                     sl_valid        = False
-#                     wrong_tp_orders = []
-#                     wrong_sl_orders = []
-
-#                     for tp_order in tp_orders:
-#                         stop_price = float(tp_order.get("stop_price", 0))
-#                         if abs(stop_price - expected_tp) < dynamic_tolerance:
-#                             tp_valid = True
-#                         else:
-#                             wrong_tp_orders.append(tp_order)
-
-#                     for sl_order in sl_orders:
-#                         stop_price = float(sl_order.get("stop_price", 0))
-#                         if abs(stop_price - expected_sl) < dynamic_tolerance:
-#                             sl_valid = True
-#                         else:
-#                             wrong_sl_orders.append(sl_order)
-
-#                     tp_edited = False
-#                     sl_edited = False
-
-#                     if wrong_tp_orders and not tp_valid:
-#                         for tp_order in wrong_tp_orders:
-#                             order_id     = tp_order.get("id")
-#                             log_system(f"EDITING TP order {order_id}...")
-#                             edit_payload = {
-#                                 "id": order_id,
-#                                 "product_id": int(product_id),
-#                                 "order_type": "market_order",
-#                                 "stop_price": "{:.6f}".format(expected_tp),
-#                                 "size": abs(int(size))
-#                             }
-#                             edit_body = json.dumps(edit_payload)
-#                             try:
-#                                 edit_res = requests.put(
-#                                     BASE_URL + "/v2/orders",
-#                                     headers=sign_request("PUT", "/v2/orders", edit_body),
-#                                     data=edit_body,
-#                                     timeout=10
-#                                 )
-#                                 if edit_res.status_code == 200:
-#                                     log_system(f"TP EDITED")
-#                                     tp_edited = True
-#                                     break
-#                             except:
-#                                 pass
-
-#                     if wrong_sl_orders and not sl_valid:
-#                         for sl_order in wrong_sl_orders:
-#                             order_id     = sl_order.get("id")
-#                             log_system(f"EDITING SL order {order_id}...")
-#                             edit_payload = {
-#                                 "id": order_id,
-#                                 "product_id": int(product_id),
-#                                 "order_type": "market_order",
-#                                 "stop_price": "{:.6f}".format(expected_sl),
-#                                 "size": abs(int(size))
-#                             }
-#                             edit_body = json.dumps(edit_payload)
-#                             try:
-#                                 edit_res = requests.put(
-#                                     BASE_URL + "/v2/orders",
-#                                     headers=sign_request("PUT", "/v2/orders", edit_body),
-#                                     data=edit_body,
-#                                     timeout=10
-#                                 )
-#                                 if edit_res.status_code == 200:
-#                                     log_system(f"SL EDITED")
-#                                     sl_edited = True
-#                                     break
-#                             except:
-#                                 pass
-
-#                     need_tp = not tp_valid and not tp_edited
-#                     need_sl = not sl_valid and not sl_edited
-
-#                     if need_tp or need_sl:
-#                         ticker = make_api_request('GET', f'/tickers/{symbol}')
-#                         if ticker:
-#                             curr_price = float(ticker['result']['close'])
-#                             is_safe    = True
-#                             if size > 0:
-#                                 if expected_tp <= curr_price or expected_sl >= curr_price:
-#                                     is_safe = False
-#                             else:
-#                                 if expected_tp >= curr_price or expected_sl <= curr_price:
-#                                     is_safe = False
-
-#                             if not is_safe:
-#                                 continue
-
-#                         log_system(f"Placing missing TP/SL for {symbol}")
-#                         payload = {
-#                             "product_id": int(product_id),
-#                             "take_profit_order": {
-#                                 "order_type": "market_order",
-#                                 "stop_price": "{:.6f}".format(expected_tp)
-#                             },
-#                             "stop_loss_order": {
-#                                 "order_type": "market_order",
-#                                 "stop_price": "{:.6f}".format(expected_sl)
-#                             }
-#                         }
-#                         body = json.dumps(payload)
-#                         try:
-#                             res = requests.post(
-#                                 BASE_URL + "/v2/orders/bracket",
-#                                 headers=sign_request("POST", "/v2/orders/bracket", body),
-#                                 data=body,
-#                                 timeout=10
-#                             )
-#                             if res.status_code == 200:
-#                                 log_system(f"Bracket placed for {symbol}")
-#                         except:
-#                             pass
-
-#                     time.sleep(0.3)
-
-#                 except Exception as e:
-#                     pass
-
-#         except Exception as e:
-#             time.sleep(2)
+# ========== TP/SL GUARDIAN CONFIG ==========
+LIVE_TP_PERCENTAGE        = 1.3
+LIVE_SL_PERCENTAGE        = 0.6
+LIQUIDATION_PROTECTION    = "Y"
+LIQUIDATION_BUFFER        = 0.25
 
 
-
-# ========== CONFIG ==========
-LIVE_TP_PERCENTAGE        = 1.3   # Take Profit %
-LIVE_SL_PERCENTAGE        = 0.6    # Stop Loss %
-LIQUIDATION_PROTECTION    = "Y"    # Y/N - Liquidation Protection
-LIQUIDATION_BUFFER        = 0.25   # Distance from liquidation price for protected SL
-
-# ========== TP/SL GUARDIAN ==========
 def auto_tp_sl_guardian():
-    """
-    SAFE TP/SL GUARDIAN
-    - Runs every 2 seconds
-    - Edits wrong TP/SL (no deletion)
-    - Places missing TP/SL immediately
-    - Uses dynamic tolerance to avoid constant editing
-    - Optional liquidation protection as final SL validation layer
-    """
     while True:
         try:
             time.sleep(2)
@@ -3763,30 +3747,21 @@ def auto_tp_sl_guardian():
                     if not all([symbol, product_id]) or abs(size) < 0.0001 or entry <= 0:
                         continue
 
-                    # ── ORIGINAL TP/SL CALCULATION (unchanged) ──────────────────
-                    if size > 0:  # LONG
+                    if size > 0:
                         expected_tp = entry * (1 + LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 - LIVE_SL_PERCENTAGE / 100)
-                    else:  # SHORT
+                    else:
                         expected_tp = entry * (1 - LIVE_TP_PERCENTAGE / 100)
                         expected_sl = entry * (1 + LIVE_SL_PERCENTAGE / 100)
 
-                    # ── LIQUIDATION PROTECTION: FINAL SL VALIDATION LAYER ────────
-                    # This is an independent layer. It only adjusts final_sl when
-                    # the original SL is on the wrong side of liquidation price.
-                    # TP is never touched. Original logic above is never changed.
-                    final_sl = expected_sl  # default: use original SL as-is
+                    final_sl = expected_sl
 
                     if str(LIQUIDATION_PROTECTION).strip().upper() == "Y":
                         try:
                             liquidation_price_raw = pos.get("liquidation_price")
                             if liquidation_price_raw is not None:
                                 liquidation_price = float(liquidation_price_raw)
-
                                 if size > 0:
-                                    # LONG position:
-                                    # SL must be ABOVE liquidation price.
-                                    # If original SL is at or below liquidation, protect it.
                                     if expected_sl <= liquidation_price:
                                         final_sl = liquidation_price + LIQUIDATION_BUFFER
                                         log_system(
@@ -3795,12 +3770,7 @@ def auto_tp_sl_guardian():
                                             f"liquidation={liquidation_price:.6f} -> "
                                             f"protected_sl={final_sl:.6f}"
                                         )
-                                    # else: original SL is already safer, no change needed
-
                                 else:
-                                    # SHORT position:
-                                    # SL must be BELOW liquidation price.
-                                    # If original SL is at or above liquidation, protect it.
                                     if expected_sl >= liquidation_price:
                                         final_sl = liquidation_price - LIQUIDATION_BUFFER
                                         log_system(
@@ -3809,19 +3779,12 @@ def auto_tp_sl_guardian():
                                             f"liquidation={liquidation_price:.6f} -> "
                                             f"protected_sl={final_sl:.6f}"
                                         )
-                                    # else: original SL is already safer, no change needed
-
                         except Exception as liq_err:
                             log_system(f"[LIQ PROTECT] Error for {symbol}: {liq_err} - using original SL")
-                            final_sl = expected_sl  # fallback to original on any error
+                            final_sl = expected_sl
 
-                    # From this point forward, all SL references use final_sl.
-                    # expected_tp is always the original TP, never modified.
-
-                    # ── DYNAMIC TOLERANCE (unchanged) ───────────────────────────
                     dynamic_tolerance = entry * 0.0005
 
-                    # ── FETCH OPEN ORDERS (unchanged) ───────────────────────────
                     orders_response = make_api_request('GET', f'/orders?product_id={product_id}&state=open')
                     if not orders_response or not orders_response.get('success'):
                         continue
@@ -3835,7 +3798,6 @@ def auto_tp_sl_guardian():
                     wrong_tp_orders = []
                     wrong_sl_orders = []
 
-                    # ── VALIDATE EXISTING TP ORDERS (unchanged) ─────────────────
                     for tp_order in tp_orders:
                         stop_price = float(tp_order.get("stop_price", 0))
                         if abs(stop_price - expected_tp) < dynamic_tolerance:
@@ -3843,7 +3805,6 @@ def auto_tp_sl_guardian():
                         else:
                             wrong_tp_orders.append(tp_order)
 
-                    # ── VALIDATE EXISTING SL ORDERS (uses final_sl) ─────────────
                     for sl_order in sl_orders:
                         stop_price = float(sl_order.get("stop_price", 0))
                         if abs(stop_price - final_sl) < dynamic_tolerance:
@@ -3854,7 +3815,6 @@ def auto_tp_sl_guardian():
                     tp_edited = False
                     sl_edited = False
 
-                    # ── EDIT WRONG TP ORDERS (unchanged) ────────────────────────
                     if wrong_tp_orders and not tp_valid:
                         for tp_order in wrong_tp_orders:
                             order_id     = tp_order.get("id")
@@ -3881,7 +3841,6 @@ def auto_tp_sl_guardian():
                             except:
                                 pass
 
-                    # ── EDIT WRONG SL ORDERS (uses final_sl) ────────────────────
                     if wrong_sl_orders and not sl_valid:
                         for sl_order in wrong_sl_orders:
                             order_id     = sl_order.get("id")
@@ -3911,7 +3870,6 @@ def auto_tp_sl_guardian():
                     need_tp = not tp_valid and not tp_edited
                     need_sl = not sl_valid and not sl_edited
 
-                    # ── PLACE MISSING TP/SL (uses final_sl) ─────────────────────
                     if need_tp or need_sl:
                         ticker = make_api_request('GET', f'/tickers/{symbol}')
                         if ticker:
@@ -3923,7 +3881,6 @@ def auto_tp_sl_guardian():
                             else:
                                 if expected_tp >= curr_price or final_sl <= curr_price:
                                     is_safe = False
-
                             if not is_safe:
                                 continue
 
@@ -3959,7 +3916,6 @@ def auto_tp_sl_guardian():
 
         except Exception as e:
             time.sleep(2)
-
 
 
 # ========== MAIN ==========
