@@ -1369,11 +1369,11 @@ def generate_smart_signal(reason="trade_decision"):
     else:             layer = 'WEAK_BUY'      if direction=='BUY' else 'WEAK_SELL'
 
     print(f"   Confidence={confidence}%  Layer={layer}")
-    # Reverse final signal
-    if direction == "BUY":
-        direction = "SELL"
-    elif direction == "SELL":
-        direction = "BUY"
+    # # Reverse final signal
+    # if direction == "BUY":
+    #     direction = "SELL"
+    # elif direction == "SELL":
+    #     direction = "BUY"
 
     return _make_signal(direction, confidence, layer,
                         r15m['net'], reason, r4h or {}, r1h, r15m, candles_15m)
@@ -3714,10 +3714,10 @@ def delete_trades():
 
 
 # ========== TP/SL GUARDIAN CONFIG ==========
-LIVE_TP_PERCENTAGE        = 1.3
-LIVE_SL_PERCENTAGE        = 0.6
+LIVE_TP_PERCENTAGE        = 8
+LIVE_SL_PERCENTAGE        = 4
 LIQUIDATION_PROTECTION    = "Y"
-LIQUIDATION_BUFFER        = 0.25
+LIQUIDATION_BUFFER        = 0.15
 
 
 def auto_tp_sl_guardian():
